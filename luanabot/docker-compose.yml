@@ -1,0 +1,78 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: luanabot_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: luanabot
+      POSTGRES_USER: luanabot
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - luanabot_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: luanabot_redis
+    restart: unless-stopped
+    networks:
+      - luanabot_net
+
+  evolution:
+    image: atendai/evolution-api:v2.1.1
+    container_name: luanabot_evolution
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_URL: ${EVOLUTION_SERVER_URL}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      QRCODE_LIMIT: "30"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "true"
+      WEBHOOK_GLOBAL_ENABLED: "true"
+      WEBHOOK_GLOBAL_URL: ${BACKEND_URL}/webhook
+      WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS: "true"
+      WEBHOOK_EVENTS_MESSAGES_UPSERT: "true"
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://luanabot:${DB_PASSWORD}@postgres:5432/evolution
+      DATABASE_CONNECTION_CLIENT_NAME: evolution
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - luanabot_net
+
+  backend:
+    build: ./app
+    container_name: luanabot_backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DATABASE_URL: postgresql://luanabot:${DB_PASSWORD}@postgres:5432/luanabot
+      EVOLUTION_URL: http://evolution:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      EVOLUTION_INSTANCE: luana
+      OWNER_PHONE: ${OWNER_PHONE}
+    depends_on:
+      - postgres
+      - evolution
+    networks:
+      - luanabot_net
+
+volumes:
+  postgres_data:
+
+networks:
+  luanabot_net:
+    driver: bridge
