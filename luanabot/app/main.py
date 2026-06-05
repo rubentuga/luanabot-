@@ -36,33 +36,37 @@ def webhook():
         if not data:
             return jsonify({'status': 'ok'})
 
-        log.info(f"Webhook recebido: {json.dumps(data)[:200]}")
+        log.info(f"Webhook recebido: {json.dumps(data)[:300]}")
 
-        # WAHA envia evento 'message'
         event = data.get('event', '')
-
-        # Ignora eventos que não são mensagens
         if event not in ['message', 'messages.upsert', '']:
             return jsonify({'status': 'ok'})
 
-        # WAHA format
         payload = data.get('payload', data)
 
-        # Ignora mensagens enviadas pelo bot
-        if payload.get('fromMe', False):
+        # Ignora mensagens enviadas pelo bot (fromMe=true ou id começa com true_)
+        from_me = payload.get('fromMe', False)
+        msg_id = payload.get('id', '')
+        if from_me or (isinstance(msg_id, str) and msg_id.startswith('true_')):
             return jsonify({'status': 'ok'})
 
-        # Obtém o número de telefone
+        # Obtém número de telefone
         from_field = payload.get('from', '') or payload.get('chatId', '')
-        phone = from_field.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@g.us', '')
+        if not from_field and isinstance(msg_id, str) and '_' in msg_id:
+            parts = msg_id.split('_')
+            if len(parts) >= 2:
+                from_field = parts[1]
+        phone = from_field.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@g.us', '').split('@')[0]
 
         if not phone:
+            log.warning("Phone vazio — ignorando")
             return jsonify({'status': 'ok'})
 
         if OWNER_PHONE and phone != OWNER_PHONE:
+            log.info(f"Phone {phone} != OWNER {OWNER_PHONE} — ignorando")
             return jsonify({'status': 'ok'})
 
-        # Obtém o texto
+        # Obtém texto
         body = payload.get('body', '')
         if isinstance(body, dict):
             texto = body.get('text', '') or body.get('conversation', '')
@@ -70,10 +74,10 @@ def webhook():
             texto = str(body) if body else ''
 
         if not texto:
-            # Tenta formato alternativo
             texto = payload.get('text', '') or payload.get('content', '')
 
         if not texto:
+            log.info("Mensagem sem texto — ignorando")
             return jsonify({'status': 'ok'})
 
         log.info(f"Mensagem de {phone}: {texto}")
@@ -154,7 +158,7 @@ def processar_despesa(phone, usuario, texto):
     valor = float(matches[0].replace(',', '.')) if matches else 0
 
     if valor == 0:
-        enviar_mensagem(phone, "❓ Não percebi o valor. Exemplo: \"Gastei 25€ Continente\"")
+        enviar_mensagem(phone, "Nao percebi o valor. Exemplo: Gastei 25 euros Continente")
         return
 
     texto_lower = texto.lower()
@@ -164,7 +168,7 @@ def processar_despesa(phone, usuario, texto):
         categoria = 'supermercado'; emoji = '🛒'
     elif any(p in texto_lower for p in ['farmacia', 'farmácia', 'remedio', 'medico', 'saude', 'dentista']):
         categoria = 'saude'; emoji = '💊'
-    elif any(p in texto_lower for p in ['restaurante', 'jantar', 'almoço', 'almoco', 'cafe', 'café', 'pizza', 'sushi', 'kebab', 'burger']):
+    elif any(p in texto_lower for p in ['restaurante', 'jantar', 'almoco', 'cafe', 'pizza', 'sushi', 'kebab', 'burger']):
         categoria = 'restaurante'; emoji = '🍽️'
     elif any(p in texto_lower for p in ['roupa', 'sapatos', 'sapatilhas', 'zara', 'hm', 'shein', 'moda', 'unhas', 'cabelo']):
         categoria = 'pessoal'; emoji = '👗'
@@ -198,9 +202,9 @@ def processar_despesa(phone, usuario, texto):
     if total_ant > 0:
         diff = total_mes - total_ant
         if diff > total_ant * 0.2:
-            comparacao = f'\n⚠️ Já gastaste {total_mes:.0f}€ em {categoria} este mês vs {total_ant:.0f}€ no mês passado!'
+            comparacao = f'\nJa gastaste {total_mes:.0f} euros em {categoria} este mes vs {total_ant:.0f} euros no mes passado!'
         elif diff < -total_ant * 0.2:
-            comparacao = f'\n✅ Gastaste menos em {categoria} que o mês passado. Boa!'
+            comparacao = f'\nGastaste menos em {categoria} que o mes passado. Boa!'
 
     receita_mes = db.session.query(db.func.sum(Receita.valor)).filter(
         Receita.usuario_id == usuario.id,
@@ -215,7 +219,7 @@ def processar_despesa(phone, usuario, texto):
     fixos = (usuario.fixo_carro or 0) + (usuario.fixo_ordem or 0) + (usuario.fixo_unhas or 0) + (usuario.fixo_conjunta or 0)
     disponivel = receita_mes - fixos - total_gastos
 
-    mensagem = f"{emoji} Registado — {valor:.2f}€ ({categoria})\n💳 {categoria.capitalize()} este mês: {total_mes:.2f}€{comparacao}\n💚 Disponível: {disponivel:.2f}€"
+    mensagem = f"{emoji} Registado - {valor:.2f} euros ({categoria})\n{categoria.capitalize()} este mes: {total_mes:.2f} euros{comparacao}\nDisponivel: {disponivel:.2f} euros"
     enviar_mensagem(phone, mensagem)
 
 
@@ -247,11 +251,11 @@ def processar_despesa_combustivel(phone, usuario, texto):
     if total_ant > 0:
         diff = total_mes - total_ant
         if diff > 10:
-            comparacao = f'\n⚠️ Mais {diff:.0f}€ em combustível que o mês passado!'
+            comparacao = f'\nMais {diff:.0f} euros em combustivel que o mes passado!'
         elif diff < -10:
-            comparacao = f'\n✅ Menos {abs(diff):.0f}€ em combustível vs mês passado. Boa!'
+            comparacao = f'\nMenos {abs(diff):.0f} euros em combustivel vs mes passado. Boa!'
 
-    mensagem = f"⛽ Registado — {valor:.2f}€ (combustível)\n🚗 VW Taigo 1.0 gasolina\n⛽ Total este mês: {total_mes:.2f}€{comparacao}\n\n💡 Envia a tua localização para ver o posto mais barato perto de ti!"
+    mensagem = f"Registado - {valor:.2f} euros (combustivel)\nVW Taigo 1.0 gasolina\nTotal combustivel este mes: {total_mes:.2f} euros{comparacao}\n\nEnvia a tua localizacao para ver o posto mais barato perto de ti!"
     enviar_mensagem(phone, mensagem)
 
 
@@ -261,11 +265,11 @@ def processar_receita(phone, usuario, texto):
     valor = float(matches[0].replace(',', '.')) if matches else 0
 
     if valor == 0:
-        enviar_mensagem(phone, "💰 Qual foi o valor exato que recebeste?")
+        enviar_mensagem(phone, "Qual foi o valor exato que recebeste?")
         return
 
     usuario.salario_liquido = valor
-    receita = Receita(usuario_id=usuario.id, valor=valor, descricao='Salário', data=datetime.now())
+    receita = Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=datetime.now())
     db.session.add(receita)
     db.session.commit()
     enviar_plano_salario(phone, usuario, valor)
@@ -296,29 +300,19 @@ def enviar_plano_salario(phone, usuario, salario):
 
     mes_especial = ''
     if mes_atual == 6:
-        mes_especial = '\n\n🌊 Mes do subsidio de ferias! Tens margem extra para roupa de verao ou ferias!'
+        mes_especial = '\n\nMes do subsidio de ferias! Tens margem extra para roupa de verao ou ferias!'
     elif mes_atual == 11:
-        mes_especial = '\n\n🎁 Mes do subsidio de natal! Separa uma parte para prendas e celebracoes.'
+        mes_especial = '\n\nMes do subsidio de natal! Separa uma parte para prendas e celebracoes.'
 
-    mensagem = f"""💰 Recebeste {salario:.2f}€!
-
-📋 Plano do mes:
-🏠 Gastos fixos: {total_fixos:.2f}€
-   Carro: {fixo_carro:.0f}€
-   Ordem assistentes: {fixo_ordem:.0f}€
-   Unhas: {fixo_unhas:.0f}€
-   Conjunta (Ruben): {fixo_conjunta:.0f}€
-🛡️ Fundo emergencia: {fundo_emergencia:.2f}€ mete no Revolut pessoal
-💎 Poupanca: {poupanca:.2f}€
-💳 Para gastar: {para_gastar:.2f}€"""
+    mensagem = f"Recebeste {salario:.2f} euros!\n\nPlano do mes:\nGastos fixos: {total_fixos:.2f} euros\n  Carro: {fixo_carro:.0f} euros\n  Ordem assistentes: {fixo_ordem:.0f} euros\n  Unhas: {fixo_unhas:.0f} euros\n  Conjunta (Ruben): {fixo_conjunta:.0f} euros\nFundo emergencia: {fundo_emergencia:.2f} euros - mete no Revolut pessoal\nPoupanca: {poupanca:.2f} euros\nPara gastar: {para_gastar:.2f} euros"
 
     if total_futuras > 0:
-        mensagem += f"\n📅 Reserva despesas futuras: {total_futuras:.2f}€"
+        mensagem += f"\nReserva despesas futuras: {total_futuras:.2f} euros"
         for df in despesas_futuras:
-            mensagem += f"\n   {df.descricao}: {df.valor_reserva_mensal:.0f}€/mes"
+            mensagem += f"\n  {df.descricao}: {df.valor_reserva_mensal:.0f} euros/mes"
 
     if sobrou_mes_ant > 0:
-        mensagem += f"\n\n💡 No mes passado sobrou-te {sobrou_mes_ant:.2f}€ do fundo — mete em poupanca!"
+        mensagem += f"\n\nNo mes passado sobrou-te {sobrou_mes_ant:.2f} euros do fundo - mete em poupanca!"
         if fundo:
             fundo.sobrou_mes_anterior = 0
             db.session.commit()
@@ -333,7 +327,7 @@ def processar_despesa_futura(phone, usuario, texto):
     valor = float(matches[0].replace(',', '.')) if matches else 0
 
     if valor == 0:
-        enviar_mensagem(phone, "📅 Exemplo: \"Mes que vem tenho dentista 40€\"")
+        enviar_mensagem(phone, "Exemplo: Mes que vem tenho dentista 40 euros")
         return
 
     texto_lower = texto.lower()
@@ -358,7 +352,7 @@ def processar_despesa_futura(phone, usuario, texto):
     db.session.add(despesa_futura)
     db.session.commit()
 
-    mensagem = f"📅 Despesa futura registada!\n\n📌 {desc}: {valor:.2f}€\n📆 Daqui a {meses} mes{'es' if meses > 1 else ''}\n💡 Reserva: {reserva_mensal:.2f}€/mes\n\nVou incluir no proximo plano mensal! ✅"
+    mensagem = f"Despesa futura registada!\n\n{desc}: {valor:.2f} euros\nDaqui a {meses} mes{'es' if meses > 1 else ''}\nReserva: {reserva_mensal:.2f} euros/mes\n\nVou incluir no proximo plano mensal!"
     enviar_mensagem(phone, mensagem)
 
 
@@ -384,14 +378,14 @@ def simular_compra(phone, usuario, texto):
     disponivel = receita_mes - fixos - total_gastos
 
     if valor == 0:
-        enviar_mensagem(phone, f"💚 Tens {disponivel:.2f}€ disponiveis este mes.")
+        enviar_mensagem(phone, f"Tens {disponivel:.2f} euros disponiveis este mes.")
         return
 
     pct = valor / disponivel * 100 if disponivel > 0 else 999
-    if pct <= 30: resp = f"✅ Sim podes! {valor:.2f}€ e so {pct:.0f}% do disponivel ({disponivel:.2f}€). Vai!"
-    elif pct <= 60: resp = f"🟡 Podes mas vai pesar. {valor:.2f}€ de {disponivel:.2f}€ disponiveis ({pct:.0f}%). Tens a certeza?"
-    elif pct <= 100: resp = f"🟠 Tecnicamente sim mas ficavas com so {disponivel-valor:.2f}€ para o resto do mes. Cuidado!"
-    else: resp = f"🔴 Nao aconselho. {valor:.2f}€ e mais do que tens disponivel ({disponivel:.2f}€)."
+    if pct <= 30: resp = f"Sim podes! {valor:.2f} euros e so {pct:.0f}% do disponivel ({disponivel:.2f} euros). Vai!"
+    elif pct <= 60: resp = f"Podes mas vai pesar. {valor:.2f} euros de {disponivel:.2f} euros disponiveis ({pct:.0f}%). Tens a certeza?"
+    elif pct <= 100: resp = f"Tecnicamente sim mas ficavas com so {disponivel-valor:.2f} euros para o resto do mes. Cuidado!"
+    else: resp = f"Nao aconselho. {valor:.2f} euros e mais do que tens disponivel ({disponivel:.2f} euros)."
     enviar_mensagem(phone, resp)
 
 
@@ -419,13 +413,12 @@ def enviar_resumo(phone, usuario):
     disponivel = receita_mes - fixos - total_gastos
     nomes_mes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
 
-    mensagem = f"📊 Resumo — {nomes_mes[mes_atual-1]}\n\n💰 Receita: {receita_mes:.2f}€\n🏠 Fixos: {fixos:.2f}€\n🛒 Gastos: {total_gastos:.2f}€\n💚 Disponivel: {disponivel:.2f}€\n\n📈 Por categoria:"
-    emojis = {'combustivel':'⛽','supermercado':'🛒','gota':'🧃','saude':'💊','restaurante':'🍽️','pessoal':'👗','carro':'🚗','lazer':'🎭','outros':'💳'}
+    mensagem = f"Resumo - {nomes_mes[mes_atual-1]}\n\nReceita: {receita_mes:.2f} euros\nFixos: {fixos:.2f} euros\nGastos: {total_gastos:.2f} euros\nDisponivel: {disponivel:.2f} euros\n\nPor categoria:"
     for cat, total in por_categoria:
-        mensagem += f"\n{emojis.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€"
-    if disponivel < 0: mensagem += "\n\n🔴 Atencao — estas a gastar mais do que recebes!"
-    elif disponivel < 100: mensagem += "\n\n🟠 Pouca margem — cuidado!"
-    else: mensagem += "\n\n🟢 Estas bem!"
+        mensagem += f"\n{cat.capitalize()}: {total:.2f} euros"
+    if disponivel < 0: mensagem += "\n\nAtencao - estas a gastar mais do que recebes!"
+    elif disponivel < 100: mensagem += "\n\nPouca margem - cuidado!"
+    else: mensagem += "\n\nEstas bem!"
     enviar_mensagem(phone, mensagem)
 
 
@@ -433,25 +426,14 @@ def enviar_resumo(phone, usuario):
 def enviar_plano_mes(phone, usuario):
     salario = usuario.salario_liquido or 0
     if salario == 0:
-        enviar_mensagem(phone, "💡 Ainda nao registei o teu salario. Diz-me: \"Recebi X€\"")
+        enviar_mensagem(phone, "Ainda nao registei o teu salario. Diz-me: Recebi X euros")
         return
     enviar_plano_salario(phone, usuario, salario)
 
 
 # ─── BOAS VINDAS ─────────────────────────────────────────────
 def enviar_boas_vindas(phone):
-    mensagem = """👋 Ola Luana! Sou o teu assistente financeiro pessoal.
-
-O que podes fazer:
-Gastei 25€ Continente → registo automatico
-50€ BP → regista combustivel
-Recebi 1200€ → plano do mes completo
-Mes que vem dentista 40€ → guarda despesa futura
-Posso comprar sapatilhas 90€? → simulacao
-Resumo → ver tudo do mes
-Foto de talao → leio automaticamente
-
-Aprendo os teus padroes ao longo do tempo!"""
+    mensagem = "Ola Luana! Sou o teu assistente financeiro pessoal.\n\nO que podes fazer:\nGastei 25 euros Continente - registo automatico\n50 euros BP - regista combustivel\nRecebi 1200 euros - plano do mes completo\nMes que vem dentista 40 euros - guarda despesa futura\nPosso comprar sapatilhas 90 euros? - simulacao\nResumo - ver tudo do mes\n\nAprendo os teus padroes ao longo do tempo!"
     enviar_mensagem(phone, mensagem)
 
 
@@ -465,7 +447,7 @@ def verificar_dia_salario():
         if hoje.day == dia_pagamento.day:
             for u in Usuario.query.all():
                 if u.phone:
-                    enviar_mensagem(u.phone, "💰 Hoje e dia de salario! Quando receberes envia o recibo ou diz \"Recebi X€\"!")
+                    enviar_mensagem(u.phone, "Hoje e dia de salario! Quando receberes envia o recibo ou diz Recebi X euros!")
 
 def resumo_semanal():
     with app.app_context():
@@ -481,7 +463,7 @@ def verificar_despesas_futuras():
             if d.data_prevista and d.data_prevista.date() <= amanha.date():
                 u = Usuario.query.get(d.usuario_id)
                 if u and u.phone:
-                    enviar_mensagem(u.phone, f"⚠️ Lembrete: {d.descricao} — {d.valor_total:.2f}€ previsto para amanha!")
+                    enviar_mensagem(u.phone, f"Lembrete: {d.descricao} - {d.valor_total:.2f} euros previsto para amanha!")
 
 
 # ─── INICIALIZAÇÃO ───────────────────────────────────────────
@@ -495,7 +477,7 @@ scheduler.add_job(verificar_dia_salario, 'cron', hour=12, minute=0)
 scheduler.add_job(resumo_semanal, 'cron', hour=9, minute=30, day_of_week='mon')
 scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8, minute=0)
 scheduler.start()
-log.info("✅ Luana Finance Bot iniciado")
+log.info("Luana Finance Bot iniciado")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
