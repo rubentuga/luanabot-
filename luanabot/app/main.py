@@ -36,7 +36,8 @@ def webhook():
         if not data:
             return jsonify({'status': 'ok'})
 
-        log.info(f"Webhook recebido: {json.dumps(data)[:300]}")
+        log.info(f"Webhook recebido: {json.dumps(data)[:1000]}")
+
 
         event = data.get('event', '')
         if event not in ['message', 'messages.upsert', '']:
