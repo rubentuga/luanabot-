@@ -11,11 +11,10 @@ WAHA_SESSION = os.environ.get('WAHA_SESSION', 'default')
 
 def enviar_mensagem(phone, texto):
     try:
-        # Se já tem @ usa direto, senão adiciona @c.us
         if '@' in str(phone):
             chat_id = phone
         else:
-            chat_id = f"{phone}@c.us"
+            chat_id = f"{phone}@lid"
 
         r = requests.post(
             f'{WAHA_URL}/api/sendText',
@@ -23,7 +22,7 @@ def enviar_mensagem(phone, texto):
             json={'session': WAHA_SESSION, 'chatId': chat_id, 'text': texto},
             timeout=15
         )
-        log.info(f'Enviado para {chat_id}: {r.status_code}')
+        log.info(f'Enviado para {chat_id}: {r.status_code} {r.text[:100]}')
         if r.status_code not in [200, 201]:
             log.error(f'Erro enviar: {r.status_code} {r.text}')
             return False
