@@ -12,6 +12,7 @@ except Exception:
     TZ = None
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import text
 from models import db, Usuario, Despesa, Receita, DespesaFutura, ObjetivoFinanceiro, FundoEmergencia
 from whatsapp import enviar_mensagem, enviar_mensagem_com_botoes
 from claude_ai import processar_mensagem_ia
@@ -185,21 +186,93 @@ EMOJI_CAT = {
 
 def categorizar(texto):
     t = texto.lower()
-    # Procura palavra a palavra (match exato de tokens para abreviações curtas)
-    tokens = re.findall(r"[a-zà-ú&']+", t)
-    # Primeiro tenta match de expressões compostas
+    # 1. Verifica aprendizagens primeiro
+    aprendidas = carregar_aprendidas()
+    tokens_full = re.findall(r"[a-zà-ú&']+", t)
+    for chave, cat in aprendidas.items():
+        if chave in t:
+            emoji = EMOJI_CAT.get(cat, '💳')
+            return (cat, emoji, chave.capitalize())
+    # 2. Expressões compostas
     for chave, val in LOJAS.items():
         if ' ' in chave and chave in t:
             return val
-    # Depois match de tokens
-    for tok in tokens:
+    # 3. Tokens
+    for tok in tokens_full:
         if tok in LOJAS:
             return LOJAS[tok]
-    # Match parcial (palavra contida)
+    # 4. Match parcial
     for chave, val in LOJAS.items():
         if ' ' not in chave and len(chave) > 3 and chave in t:
             return val
     return ('outros', '💳', 'Gasto')
+
+
+# ─── APRENDIZAGEM (guardada na BD) ───────────────────────────
+def criar_tabela_aprendizagem():
+    try:
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS aprendizagem (
+                chave VARCHAR(100) PRIMARY KEY,
+                categoria VARCHAR(50) NOT NULL
+            )
+        """))
+        db.session.commit()
+    except Exception as e:
+        log.warning(f"criar tabela aprendizagem: {e}")
+        db.session.rollback()
+
+
+def carregar_aprendidas():
+    try:
+        rows = db.session.execute(text("SELECT chave, categoria FROM aprendizagem")).fetchall()
+        return {r[0]: r[1] for r in rows}
+    except Exception:
+        db.session.rollback()
+        return {}
+
+
+def guardar_aprendida(chave, categoria):
+    try:
+        chave = chave.lower().strip()
+        categoria = categoria.lower().strip()
+        db.session.execute(
+            text("INSERT INTO aprendizagem (chave, categoria) VALUES (:c, :cat) ON CONFLICT (chave) DO UPDATE SET categoria = :cat"),
+            {'c': chave, 'cat': categoria}
+        )
+        db.session.commit()
+        return True
+    except Exception as e:
+        log.error(f"guardar aprendida: {e}")
+        db.session.rollback()
+        return False
+
+
+CATEGORIAS_VALIDAS = ['fastfood', 'restaurante', 'roupa', 'tecnologia', 'supermercado',
+                      'combustivel', 'gota', 'saude', 'pessoal', 'carro', 'lazer',
+                      'subscricoes', 'outros']
+
+# Mapeia palavras comuns para categorias internas
+ALIAS_CAT = {
+    'comida': 'supermercado', 'mercado': 'supermercado', 'super': 'supermercado',
+    'fast food': 'fastfood', 'fast-food': 'fastfood', 'hamburguer': 'fastfood',
+    'restaurantes': 'restaurante', 'comer fora': 'restaurante', 'jantar': 'restaurante',
+    'roupas': 'roupa', 'sapatilhas': 'roupa', 'tenis': 'roupa', 'sapatos': 'roupa', 'sneakers': 'roupa',
+    'tech': 'tecnologia', 'tecnologia': 'tecnologia', 'eletronica': 'tecnologia', 'gaming': 'tecnologia',
+    'gasolina': 'combustivel', 'gasoleo': 'combustivel', 'gasóleo': 'combustivel', 'posto': 'combustivel',
+    'agua': 'gota', 'água': 'gota', 'bebida': 'gota', 'bebidas': 'gota',
+    'farmacia': 'saude', 'medico': 'saude', 'saúde': 'saude',
+    'unhas': 'pessoal', 'cabelo': 'pessoal', 'estetica': 'pessoal', 'beleza': 'pessoal',
+    'automovel': 'carro', 'oficina': 'carro',
+    'cinema': 'lazer', 'diversao': 'lazer', 'lazer': 'lazer',
+    'netflix': 'subscricoes', 'subscricao': 'subscricoes', 'subscricoes': 'subscricoes',
+}
+
+def normalizar_categoria(cat):
+    cat = cat.lower().strip()
+    if cat in CATEGORIAS_VALIDAS:
+        return cat
+    return ALIAS_CAT.get(cat, cat)
 
 
 # ─── WEBHOOK ─────────────────────────────────────────────────
@@ -333,7 +406,27 @@ def processar_texto(phone_raw, phone, texto):
 
     t = texto.lower().strip()
 
-    if any(p in t for p in ['quem criou', 'quem te fez', 'quem te criou', 'teu criador', 'quem é o teu', 'quem foi que te']):
+    # APRENDER: "aprende que X é roupa" / "X é categoria roupa"
+    m = re.search(r'aprende que (.+?) (?:é|e|sao|são) (?:da categoria |categoria )?(\w+)', t)
+    if m:
+        chave = m.group(1).strip().strip('"\'')
+        cat = normalizar_categoria(m.group(2))
+        if cat in CATEGORIAS_VALIDAS:
+            if guardar_aprendida(chave, cat):
+                enviar_mensagem(phone_raw, f"🧠 Aprendido! A partir de agora '{chave}' vai para {cat.capitalize()}. Obrigado por me ensinares! 😎")
+            else:
+                enviar_mensagem(phone_raw, "Ops, nao consegui guardar 😕 tenta outra vez")
+        else:
+            enviar_mensagem(phone_raw, f"Hmm, '{m.group(2)}' nao e uma categoria que conheço 🤔\nUsa: comida, fastfood, roupa, tecnologia, combustivel, saude, lazer, gota, pessoal, carro...")
+        return
+
+    # CORRIGIR: "corrige para roupa" / "isso é roupa não outros" / "o ultimo é roupa"
+    m2 = re.search(r'(?:corrige|corrigir|muda|mudar|afinal|isso é|isso e|o ultimo é|o último é|era) (?:o ultimo |o último |para |a |de )*(\w+)', t)
+    if m2 and any(p in t for p in ['corrige', 'corrigir', 'muda', 'mudar', 'afinal', 'isso é', 'isso e', 'o ultimo', 'o último', 'era']):
+        cat = normalizar_categoria(m2.group(1))
+        if cat in CATEGORIAS_VALIDAS:
+            corrigir_ultimo(phone_raw, usuario, cat)
+            return
         enviar_mensagem(phone_raw, "Fui criado pelo tuga27 🚀\nO mesmo genio por tras do Zeflix (plataforma de streaming de filmes e series) e agora tambem do teu gestor financeiro pessoal. Sortuda! 😎")
         return
 
@@ -713,6 +806,27 @@ def simular_compra(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, resp)
 
 
+# ─── CORRIGIR ÚLTIMO GASTO ───────────────────────────────────
+def corrigir_ultimo(phone_raw, usuario, nova_cat):
+    ultima = Despesa.query.filter_by(usuario_id=usuario.id).order_by(Despesa.id.desc()).first()
+    if not ultima:
+        enviar_mensagem(phone_raw, "Ainda nao registei nenhum gasto p/ corrigir 🤔")
+        return
+    cat_antiga = ultima.categoria
+    ultima.categoria = nova_cat
+    db.session.commit()
+    # Aprende a palavra-chave do gasto para a próxima
+    desc = ultima.descricao.replace('[conjunta] ', '').lower()
+    palavras = [w for w in re.findall(r"[a-zà-ú&']+", desc) if len(w) > 1 and w not in ['gastei', 'paguei', 'comprei', 'almocei', 'jantei', 'euros', 'euro', 'no', 'na', 'em', 'foi']]
+    aprendido = ''
+    if palavras:
+        chave = palavras[-1]  # última palavra costuma ser a loja
+        if guardar_aprendida(chave, nova_cat):
+            aprendido = f"\n🧠 E aprendi: '{chave}' = {nova_cat.capitalize()} p/ a proxima!"
+    emoji = EMOJI_CAT.get(nova_cat, '💳')
+    enviar_mensagem(phone_raw, f"{emoji} Corrigido! Mudei de {cat_antiga.capitalize()} para {nova_cat.capitalize()}.{aprendido}")
+
+
 # ─── BOAS VINDAS / AJUDA ─────────────────────────────────────
 def enviar_boas_vindas(phone_raw):
     enviar_mensagem(phone_raw, "Ola! 👋 Sou o Ze das Financas, o teu parceiro de carteira 💰\n\nManda-me os teus gastos que eu trato de tudo. Tipo:\n• gastei 25 no conti\n• 15 no bk\n• recebi 1300 euros\n\nDiz 'ajuda' p/ veres tudo o que sei fazer 😎")
@@ -745,6 +859,10 @@ def enviar_ajuda(phone_raw):
 🆘 Extras:
 • estou teso → modo poupanca
 • gasolina mais barata no barreiro
+
+🧠 Ensina-me:
+• aprende que xpto é roupa
+• corrige para roupa (muda o ultimo gasto)
 
 Bora poupar! 🚀"""
     enviar_mensagem(phone_raw, msg)
@@ -806,6 +924,7 @@ with app.app_context():
         db.create_all()
     except Exception as e:
         log.warning(f"db.create_all: {e}")
+    criar_tabela_aprendizagem()
 
 scheduler.add_job(lembrete_recibo, 'cron', hour=12, minute=0)
 scheduler.add_job(lembrete_salario, 'cron', hour=9, minute=0)
