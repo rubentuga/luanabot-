@@ -44,7 +44,7 @@ def webhook():
 
         payload = data.get('payload', data)
 
-        # Ignora mensagens enviadas pelo bot (fromMe=true ou id começa com true_)
+        # Ignora mensagens enviadas pelo bot
         from_me = payload.get('fromMe', False)
         msg_id = payload.get('id', '')
         if from_me or (isinstance(msg_id, str) and msg_id.startswith('true_')):
@@ -62,8 +62,10 @@ def webhook():
             log.warning("Phone vazio — ignorando")
             return jsonify({'status': 'ok'})
 
-        if OWNER_PHONE and phone != OWNER_PHONE:
-            log.info(f"Phone {phone} != OWNER {OWNER_PHONE} — ignorando")
+        # Suporta múltiplos números separados por vírgula
+        owner_phones = [p.strip() for p in OWNER_PHONE.split(',')] if OWNER_PHONE else []
+        if owner_phones and phone not in owner_phones:
+            log.info(f"Phone {phone} != OWNER {owner_phones} — ignorando")
             return jsonify({'status': 'ok'})
 
         # Obtém texto
@@ -433,7 +435,7 @@ def enviar_plano_mes(phone, usuario):
 
 # ─── BOAS VINDAS ─────────────────────────────────────────────
 def enviar_boas_vindas(phone):
-    mensagem = "Ola Luana! Sou o teu assistente financeiro pessoal.\n\nO que podes fazer:\nGastei 25 euros Continente - registo automatico\n50 euros BP - regista combustivel\nRecebi 1200 euros - plano do mes completo\nMes que vem dentista 40 euros - guarda despesa futura\nPosso comprar sapatilhas 90 euros? - simulacao\nResumo - ver tudo do mes\n\nAprendo os teus padroes ao longo do tempo!"
+    mensagem = "Ola! Sou o Ze das Financas, o teu assistente financeiro pessoal.\n\nO que podes fazer:\nGastei 25 euros Continente - registo automatico\n50 euros BP - regista combustivel\nRecebi 1200 euros - plano do mes completo\nMes que vem dentista 40 euros - guarda despesa futura\nPosso comprar sapatilhas 90 euros? - simulacao\nResumo - ver tudo do mes\n\nAprendo os teus padroes ao longo do tempo!"
     enviar_mensagem(phone, mensagem)
 
 
