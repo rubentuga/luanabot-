@@ -719,44 +719,78 @@ def processar_gasto_reserva(phone_raw, usuario, texto):
 # ─── ANIVERSÁRIOS ────────────────────────────────────────────
 def processar_aniversario(phone_raw, usuario, texto):
     t = texto.lower()
+
     # Ver lista
-    if any(p in t for p in ['ver','lista','quais','mostrar']):
+    if any(p in t for p in ['ver','lista','quais','mostrar','aniversarios','aniversários']):
         try:
-            rows = db.session.execute(text("SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id ORDER BY data_aniv"), {'id':usuario.id}).fetchall()
+            rows = db.session.execute(text(
+                "SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id ORDER BY EXTRACT(month FROM data_aniv), EXTRACT(day FROM data_aniv)"),
+                {'id': usuario.id}).fetchall()
             if not rows:
                 enviar_mensagem(phone_raw, "Ainda nao tens aniversarios guardados 🎂\nAdiciona: 'aniversario da Ana dia 15 marco'"); return
-            msg = "🎂 Aniversarios:\n"
             meses = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            hoje = agora()
+            msg = "🎂 Aniversarios:\n\n"
+            mes_atual = None
             for r in rows:
-                msg += f"• {r[0]} — {r[1].day} {meses[r[1].month-1]}\n"
+                if r[1].month != mes_atual:
+                    mes_atual = r[1].month
+                    msg += f"── {meses[r[1].month-1]} ──\n"
+                dias_falta = (r[1].replace(year=hoje.year) - hoje.date()).days
+                if dias_falta < 0: dias_falta += 365
+                alerta = " 🔥" if dias_falta <= 5 else (" ⚠️" if dias_falta <= 14 else "")
+                msg += f"• {r[0]} — dia {r[1].day}{alerta}\n"
             enviar_mensagem(phone_raw, msg)
         except Exception as e:
-            log.error(f"anivs: {e}"); enviar_mensagem(phone_raw, "Erro ao buscar aniversarios 😕")
+            log.error(f"anivs: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
         return
-    # Adicionar: "aniversario da Ana dia 15 marco"
-    m = re.search(r'(?:aniversario|aniversário|faz anos)[^\d]*(?:d[ao] |d[ae] )?([A-Za-zÀ-ú]+).*?dia (\d{1,2}).*?(\w+)', texto, re.IGNORECASE)
-    if m:
-        nome = m.group(1).capitalize()
-        dia  = int(m.group(2))
-        mes_str = m.group(3).lower()
-        meses_map = {'janeiro':1,'fevereiro':2,'marco':3,'março':3,'abril':4,'maio':5,'junho':6,
-                     'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12,
-                     'jan':1,'fev':2,'mar':3,'abr':4,'mai':5,'jun':6,'jul':7,'ago':8,'set':9,'out':10,'nov':11,'dez':12}
-        mes_num = meses_map.get(mes_str)
-        if mes_num and 1 <= dia <= 31:
-            try:
-                data = datetime(2000, mes_num, min(dia,28)).date()
-                db.session.execute(text("INSERT INTO aniversarios (usuario_id,nome,data_aniv) VALUES (:u,:n,:d) ON CONFLICT DO NOTHING"),
-                                   {'u':usuario.id,'n':nome,'d':data})
-                db.session.commit()
-                meses_pt = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
-                enviar_mensagem(phone_raw, f"🎂 Anotado! {nome} faz anos a {dia} de {meses_pt[mes_num-1]}\nVou avisar-te com antecedencia! 🎉")
-            except Exception as e:
-                log.error(f"aniv add: {e}"); enviar_mensagem(phone_raw, "Erro ao guardar 😕")
-        else:
-            enviar_mensagem(phone_raw, "Nao percebi a data 🤔 Ex: 'aniversario da Ana dia 15 marco'")
+
+    # Adicionar — varios formatos:
+    # "aniversario da Ana dia 15 marco"
+    # "aniversario Ana 15/3"
+    # "Ana faz anos dia 15 de marco"
+    meses_map = {
+        'janeiro':1,'fevereiro':2,'marco':3,'março':3,'abril':4,'maio':5,'junho':6,
+        'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12,
+        'jan':1,'fev':2,'mar':3,'abr':4,'mai':5,'jun':6,'jul':7,'ago':8,'set':9,'out':10,'nov':11,'dez':12
+    }
+
+    # Tenta formato DD/MM ou DD-MM
+    m_data = re.search(r'(\d{1,2})[/\-](\d{1,2})', texto)
+    # Tenta formato "dia X de/em mes"
+    m_dia_mes = re.search(r'dia (\d{1,2})(?:\s+de)?\s+([a-záàâãéêíóôõúç]+)', t)
+    # Tenta formato "X de mes"
+    m_x_mes = re.search(r'(\d{1,2})\s+(?:de\s+)?([a-záàâãéêíóôõúç]+)', t)
+
+    dia = mes_num = None
+
+    if m_data:
+        dia = int(m_data.group(1)); mes_num = int(m_data.group(2))
+    elif m_dia_mes:
+        dia = int(m_dia_mes.group(1)); mes_num = meses_map.get(m_dia_mes.group(2))
+    elif m_x_mes:
+        dia = int(m_x_mes.group(1)); mes_num = meses_map.get(m_x_mes.group(2))
+
+    # Extrai nome
+    stop = {'aniversario','aniversário','faz','anos','dia','de','do','da','em','o','a','os','as','para','e'}
+    palavras_nome = [w for w in re.findall(r'[A-Za-zÀ-ú]+', texto)
+                     if w.lower() not in stop and not w.lower() in meses_map and len(w) > 1]
+    # Remove numeros escritos
+    nome = palavras_nome[0].capitalize() if palavras_nome else None
+
+    if nome and dia and mes_num and 1 <= dia <= 31 and 1 <= mes_num <= 12:
+        try:
+            data = f"2000-{mes_num:02d}-{min(dia,28):02d}"
+            db.session.execute(text(
+                "INSERT INTO aniversarios (usuario_id,nome,data_aniv) VALUES (:u,:n,:d) ON CONFLICT DO NOTHING"),
+                {'u': usuario.id, 'n': nome, 'd': data})
+            db.session.commit()
+            meses_pt = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            enviar_mensagem(phone_raw, f"🎂 Anotado! {nome} faz anos a {dia} de {meses_pt[mes_num-1]}\nVou avisar-te antes! 🎉")
+        except Exception as e:
+            log.error(f"aniv add: {e}"); enviar_mensagem(phone_raw, "Erro ao guardar 😕")
     else:
-        enviar_mensagem(phone_raw, "Como adicionar:\n'aniversario da Ana dia 15 marco'\n\nPara ver a lista: 'aniversarios'")
+        enviar_mensagem(phone_raw, "Nao percebi bem 🤔 Tenta assim:\n• 'aniversario da Ana dia 15 marco'\n• 'aniversario Ana 15/3'\n• 'aniversarios' para ver a lista")
 
 # ─── PROCESSAR DESPESA ───────────────────────────────────────
 def processar_despesa(phone_raw, usuario, texto):
@@ -853,6 +887,10 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     msg += f"💳 Para gastar: {p['gastar']:.0f}€\n"
     msg += f"💎 Poupanca: {p['poupanca']:.0f}€"
     if p['subsidio']: msg += "\n\n🌴 Mes de subsidio! Mais margem 😉"
+
+    # Mes do aniversário dela — novembro
+    if agora().month == 11:
+        msg += "\n\n🎂 Este mes e o teu aniversario!! Ja separei 100€ so para ti — compra algo que gostes muito! 🎁"
     enviar_mensagem(phone_raw, msg)
 
     # Verifica se ha poupanca anterior nao usada para adicionar a reserva
@@ -878,6 +916,30 @@ def enviar_plano_salario(phone_raw, usuario, salario):
 
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
     set_estado(phone, 'fecho_feito', {'mes':agora().month,'ano':agora().year})
+
+    # Aviso de aniversários este mês
+    try:
+        mes_atual = agora().month
+        nomes_mes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+        rows = db.session.execute(text(
+            "SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id AND EXTRACT(month FROM data_aniv)=:m ORDER BY EXTRACT(day FROM data_aniv)"),
+            {'id': usuario.id, 'mes': mes_atual, 'm': mes_atual}).fetchall()
+        if rows:
+            msg_aniv = f"🎂 Este mes ({nomes_mes[mes_atual-1]}) tens aniversarios:\n"
+            for r in rows:
+                dias_falta = r[1].day - agora().day
+                if dias_falta < 0:
+                    msg_aniv += f"• {r[0]} — dia {r[1].day} (ja passou este mes)\n"
+                elif dias_falta == 0:
+                    msg_aniv += f"• {r[0]} — HOJE! 🎉\n"
+                elif dias_falta <= 5:
+                    msg_aniv += f"• {r[0]} — dia {r[1].day} (daqui a {dias_falta} dias! ⚠️)\n"
+                else:
+                    msg_aniv += f"• {r[0]} — dia {r[1].day}\n"
+            msg_aniv += "\nQueres ver a lista completa? Diz 'aniversarios' 🎁"
+            enviar_mensagem(phone_raw, msg_aniv)
+    except Exception as e:
+        log.error(f"anivs plano: {e}")
 
 def verificar_sobra_mes(phone_raw, usuario, mes, ano):
     """No fim do mes verifica se sobrou dinheiro da poupanca prevista."""
@@ -1249,6 +1311,29 @@ def enviar_ajuda(phone_raw):
 
 
 # ─── IA ──────────────────────────────────────────────────────
+def filtrar_resposta(texto):
+    """Filtra respostas da IA para garantir linguagem feminina correta."""
+    # Palavras masculinas a substituir
+    substituicoes = [
+        (r'\bbrother\b', 'querida'),
+        (r'\birmao\b', 'querida'),
+        (r'\birmão\b', 'querida'),
+        (r'\bmano\b', 'linda'),
+        (r'\bchefe\b', 'querida'),
+        (r'\bbro\b', 'querida'),
+        (r'\bamigo\b', 'querida'),
+        (r'\brapaz\b', 'rapariga'),
+        (r'\bcara\b', 'querida'),
+        (r'\bparceiro\b', 'parceira'),
+        (r'\bcampeao\b', 'campea'),
+        (r'\bcampeão\b', 'campeã'),
+        (r'\bparabens cara\b', 'parabens querida'),
+    ]
+    resultado = texto
+    for padrao, substituto in substituicoes:
+        resultado = re.sub(padrao, substituto, resultado, flags=re.IGNORECASE)
+    return resultado
+
 def perguntar_ia(texto, usuario):
     try:
         from groq import Groq
@@ -1256,24 +1341,27 @@ def perguntar_ia(texto, usuario):
         modo = get_modo(usuario.id)
         m = MODOS_POUPANCA[modo]
         sys = f"""Es o Ze das Financas, assistente financeiro portugues criado pelo tuga27 para a Luana.
-REGRAS ABSOLUTAS DE LINGUAGEM:
-- Fala SEMPRE no feminino: "gastaste", "tens", "podes", "estás", "linda"
-- NUNCA uses: brother, irmao, mano, chefe, bro, cara, rapaz, amigo
-- Usa expressoes: querida, bora, fixe, top, ena, boa, tás boa
-- Portugues europeu informal e fofo, curto: max 2 linhas + 1 emoji
+
+REGRAS ABSOLUTAS — NAO PODES QUEBRAR NENHUMA:
+1. Fala SEMPRE no feminino: "gastaste", "tens", "podes", "estás", "foste"
+2. PROIBIDO usar: brother, irmao, irmão, mano, chefe, bro, cara, rapaz, amigo, parceiro
+3. Usa: querida, linda, bora, fixe, top, ena, boa
+4. Portugues europeu informal e fofo
+5. Max 2 linhas + 1 emoji
+6. NUNCA inventes precos de gasolina — diz sempre "usa 'gasolina mais barata no barreiro'"
+7. Se nao souberes responder diz "Nao sei querida 🤔 Diz 'ajuda' para veres o que sei!"
 
 CONTEXTO:
-- Modo poupanca: {m['nome']}. Disponivel: {disp:.0f}€. Salario: {usuario.salario_liquido or 'ainda nao registado'}€
+Modo poupanca: {m['nome']} | Disponivel: {disp:.0f}€ | Salario: {usuario.salario_liquido or 'nao registado'}€
 
-SABER:
-- BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports
-- galp/bp/repsol/shell=postos gasolina — NUNCA inventes precos de gasolina
-- Se perguntares sobre precos diz: usa 'gasolina mais barata no barreiro'"""
+ABREVIATURAS: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports, FL=Foot Locker"""
+
         resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
             model='llama-3.3-70b-versatile',
             messages=[{'role':'system','content':sys},{'role':'user','content':texto}],
             max_tokens=150)
-        return resp.choices[0].message.content
+        resposta = resp.choices[0].message.content
+        return filtrar_resposta(resposta)
     except Exception as e:
         log.error(f'IA: {e}'); return "Nao percebi 🤔 Diz 'ajuda'!"
 
