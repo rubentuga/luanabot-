@@ -323,7 +323,7 @@ def webhook():
                 if texto:
                     enviar_mensagem(phone_raw, f'🎤 Percebi: "{texto}"')
             elif 'image' in mime:
-                resultado = ler_foto_talao(url)
+                resultado = ler_foto_talao(url, mime)
                 if resultado:
                     texto = resultado
                     enviar_mensagem(phone_raw, f'📸 Li o talão: {texto}')
@@ -402,30 +402,41 @@ def transcrever_audio(url):
         return ''
 
 
-# ─── FOTO (Claude Vision) ────────────────────────────────────
-def ler_foto_talao(url):
+# ─── FOTO (Groq Vision - gratis) ────────────────────────────
+def ler_foto_talao(url, mimetype='image/jpeg'):
     try:
-        import requests
-        import anthropic
-        if 'localhost' in url:
-            url = url.replace('http://localhost:8080', WAHA_URL)
-        r = requests.get(url, headers={'X-Api-Key': WAHA_API_KEY}, timeout=30)
-        if r.status_code != 200:
+        from groq import Groq
+        conteudo = baixar_media(url)
+        if not conteudo:
             return ''
-        img_b64 = base64.b64encode(r.content).decode()
-        cliente = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = cliente.messages.create(
-            model='claude-haiku-4-5-20251001',
+        # Detetar mimetype real
+        if 'png' in mimetype:
+            media_type = 'image/png'
+            ext = '.png'
+        elif 'webp' in mimetype:
+            media_type = 'image/webp'
+            ext = '.webp'
+        else:
+            media_type = 'image/jpeg'
+            ext = '.jpg'
+        img_b64 = base64.b64encode(conteudo).decode()
+        client = Groq(api_key=GROQ_API_KEY)
+        resp = client.chat.completions.create(
+            model='meta-llama/llama-4-scout-17b-16e-instruct',
             max_tokens=100,
-            messages=[{'role': 'user', 'content': [
-                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': img_b64}},
-                {'type': 'text', 'text': 'Le este talao. Responde APENAS: "X euros NOME_LOJA". Se nao conseguires, responde "erro".'}
-            ]}]
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'type': 'image_url', 'image_url': {'url': f'data:{media_type};base64,{img_b64}'}},
+                    {'type': 'text', 'text': 'Le este talao ou recibo. Responde APENAS no formato: "X euros NOME_LOJA". Exemplo: "25.50 euros Continente". Se nao conseguires ler, responde apenas: "erro"'}
+                ]
+            }]
         )
-        txt = resp.content[0].text.strip()
+        txt = resp.choices[0].message.content.strip()
+        log.info(f'Foto lida: {txt}')
         return '' if 'erro' in txt.lower() else txt
     except Exception as e:
-        log.error(f'Erro foto: {e}')
+        log.error(f'Erro foto: {e}', exc_info=True)
         return ''
 
 
@@ -463,7 +474,10 @@ def processar_texto(phone_raw, phone, texto):
         enviar_mensagem(phone_raw, "Fui criado pelo tuga27 🚀\nO mesmo genio por tras do Zeflix (plataforma de streaming de filmes e series) e agora tambem do teu gestor financeiro pessoal. Sortuda! 😎")
         return
 
-    if any(p in t for p in ['ajuda', 'help', '/start', 'comandos', 'o que fazes', 'o que sabes']):
+    # CRIADOR
+    if any(p in t for p in ['quem criou', 'quem te fez', 'quem te criou', 'teu criador', 'quem e o teu criador', 'quem foi que te criou', 'criador', 'quem te programou']):
+        enviar_mensagem(phone_raw, "Fui criado pelo tuga27 🚀\nO mesmo genio por tras do Zeflix (plataforma de streaming de filmes e series) e agora tambem do teu gestor financeiro pessoal. Sortuda! 😎")
+        return
         enviar_ajuda(phone_raw)
         return
 
@@ -700,15 +714,18 @@ def enviar_quanto_tenho(phone_raw, usuario):
 def enviar_conjunta(phone_raw, usuario):
     mes_atual = agora().month
     ano_atual = agora().year
+    # Gastos marcados como conjunta por AMBOS (aqui so contamos os dela)
     gasto_conjunta = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id == usuario.id,
-        db.extract('month', Despesa.data) == mes_atual, db.extract('year', Despesa.data) == ano_atual,
+        db.extract('month', Despesa.data) == mes_atual,
+        db.extract('year', Despesa.data) == ano_atual,
         Despesa.descricao.like('[conjunta]%')
     ).scalar() or 0
-    # Conjunta = 50 teu + 50 dela = 100 total
-    total_conjunta = 100
-    resta = total_conjunta - gasto_conjunta
-    msg = f"💑 Conjunta (jantares, lanches, cinema...):\n💰 Total: {total_conjunta:.0f} euros (50 teu + 50 Ruben)\n🛒 Ja gastaram: {gasto_conjunta:.2f} euros\n💚 Resta: {resta:.2f} euros"
+    # Conjunta total = 50 dela + 50 Ruben = 100
+    # Aqui so vemos a parte dela (50)
+    total_dela = 50
+    resta = total_dela - gasto_conjunta
+    msg = f"💑 A tua parte da conjunta este mes:\n💰 Orcamento: {total_dela:.0f} euros (a tua metade)\n🛒 Ja gastaste: {gasto_conjunta:.2f} euros\n💚 Ainda tens: {resta:.2f} euros\n\nPara marcar um gasto na conjunta di tipo:\n'jantar 30 na conjunta'"
     enviar_mensagem(phone_raw, msg)
 
 
@@ -781,81 +798,75 @@ def modo_teso(phone_raw, usuario):
 
 
 # ─── GASOLINA (API DGEG real) ────────────────────────────────
-# IDs de municipio DGEG (distrito Setubal = 15)
-MUNICIPIOS_DGEG = {
-    'barreiro': ('1503', 'Barreiro'),
-    'moita': ('1510', 'Moita'),
-    'montijo': ('1508', 'Montijo'),
-    'seixal': ('1511', 'Seixal'),
-    'almada': ('1502', 'Almada'),
-    'setubal': ('1512', 'Setúbal'),
-    'palmela': ('1509', 'Palmela'),
-}
-# Tipo de combustivel: Gasolina simples 95 = 3201, Gasoleo simples = 2101
 GASOLINA_95 = '3201'
+MUNICIPIOS_DGEG = {
+    'barreiro': 223, 'moita': 225, 'montijo': 226, 'seixal': 229,
+    'almada': 222, 'setubal': 231, 'setúbal': 231, 'palmela': 227,
+    'alcochete': 221, 'grandola': 224, 'sesimbra': 230, 'sines': 232,
+}
 
-
-def buscar_postos_dgeg(id_municipio, id_comb=GASOLINA_95):
+def buscar_postos_dgeg(ids_municipio, id_comb=GASOLINA_95):
     import requests
-    url = "https://precoscombustiveis.dgeg.gov.pt/api/PrecoComb/PesquisarPostos"
-    params = {
-        'qtdPorPagina': '500', 'pagina': '1',
-        'idsTiposComb': id_comb, 'idMarca': '', 'idTipoPosto': '',
-        'idDistrito': '15', 'idsMunicipios': id_municipio, 'placeId': ''
-    }
-    try:
-        r = requests.get(url, params=params, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
-        if r.status_code != 200:
-            log.error(f'DGEG status {r.status_code}')
-            return []
-        dados = r.json()
-        postos = dados.get('resultado', []) if isinstance(dados, dict) else []
-        lista = []
-        for p in postos:
-            preco_raw = p.get('Preco', '') or ''
-            preco = float(str(preco_raw).replace(' €/litro', '').replace('€', '').replace(',', '.').strip() or 0)
-            if preco > 0:
-                lista.append({
-                    'nome': p.get('Nome', '?'),
-                    'marca': p.get('Marca', ''),
-                    'morada': p.get('Morada', ''),
-                    'preco': preco
-                })
-        lista.sort(key=lambda x: x['preco'])
-        return lista
-    except Exception as e:
-        log.error(f'Erro DGEG: {e}', exc_info=True)
-        return []
+    todos = []
+    for idm in ids_municipio:
+        url = "https://precoscombustiveis.dgeg.gov.pt/api/PrecoComb/PesquisarPostos"
+        params = {
+            'qtdPorPagina': '500', 'pagina': '1',
+            'idsTiposComb': id_comb, 'idMarca': '', 'idTipoPosto': '',
+            'idDistrito': '15', 'idsMunicipios': str(idm), 'placeId': ''
+        }
+        try:
+            r = requests.get(url, params=params, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
+            log.info(f'DGEG municipio {idm}: status {r.status_code}')
+            if r.status_code != 200:
+                continue
+            dados = r.json()
+            postos = dados.get('resultado') or []
+            for p in postos:
+                preco_raw = str(p.get('Preco', '') or '').replace(' €/litro','').replace('€','').replace(',','.').strip()
+                try:
+                    preco = float(preco_raw) if preco_raw else 0
+                except Exception:
+                    preco = 0
+                if preco > 0:
+                    todos.append({
+                        'nome': p.get('Nome', '?'),
+                        'marca': p.get('Marca', ''),
+                        'morada': p.get('Morada', ''),
+                        'preco': preco
+                    })
+        except Exception as e:
+            log.error(f'Erro DGEG municipio {idm}: {e}')
+    todos.sort(key=lambda x: x['preco'])
+    return todos
 
 
 def gasolina_barata(phone_raw, texto):
     t = texto.lower()
-    municipios = []
-    for chave, (idm, nome) in MUNICIPIOS_DGEG.items():
+    ids = []
+    nomes = []
+    for chave, idm in MUNICIPIOS_DGEG.items():
         if chave in t:
-            municipios.append((idm, nome))
-    if not municipios:
-        municipios = [('1503', 'Barreiro'), ('1510', 'Moita')]
+            ids.append(idm)
+            nomes.append(chave.capitalize())
+    if not ids:
+        ids = [223, 225]
+        nomes = ['Barreiro', 'Moita']
 
-    todos = []
-    nomes_zona = []
-    for idm, nome in municipios:
-        nomes_zona.append(nome)
-        todos.extend(buscar_postos_dgeg(idm))
+    postos = buscar_postos_dgeg(ids)
 
-    if not todos:
-        enviar_mensagem(phone_raw, f"⛽ Nao consegui buscar precos agora 😕\nVe direto em: https://precoscombustiveis.dgeg.gov.pt")
+    if not postos:
+        enviar_mensagem(phone_raw, f"⛽ Nao consegui buscar precos agora 😕\nVe direto em:\nhttps://precoscombustiveis.dgeg.gov.pt")
         return
 
-    todos.sort(key=lambda x: x['preco'])
-    top = todos[:5]
-    zona = ' e '.join(nomes_zona)
+    top = postos[:5]
+    zona = ' e '.join(nomes)
     msg = f"⛽ Gasolina 95 mais barata em {zona}:\n\n"
     medalhas = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
     for i, p in enumerate(top):
         marca = f" ({p['marca']})" if p['marca'] else ''
-        msg += f"{medalhas[i]} {p['preco']:.3f} euros/L\n   {p['nome'][:35]}{marca}\n"
-    msg += "\n💡 Dados oficiais DGEG, atualizados hoje!"
+        msg += f"{medalhas[i]} {p['preco']:.3f} €/L — {p['nome'][:30]}{marca}\n"
+    msg += "\n💡 Dados DGEG, atualizados hoje!"
     enviar_mensagem(phone_raw, msg)
 
 
