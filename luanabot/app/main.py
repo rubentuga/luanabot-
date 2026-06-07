@@ -333,7 +333,7 @@ def processar_texto(phone_raw, phone, texto):
 
     t = texto.lower().strip()
 
-    # ESTADO — confirmar salário
+    # ESTADO — confirmar salário do recibo
     estado, dados_estado = get_estado(phone)
     if estado == 'confirmar_salario':
         if any(p in t for p in ['sim','yes','correto','certo','exato','é isso','e isso']):
@@ -347,7 +347,20 @@ def processar_texto(phone_raw, phone, texto):
             return
         else:
             limpar_estado(phone)
-            enviar_mensagem(phone_raw, "Ok, diz-me tu o valor: recebi X euros 💰")
+            enviar_mensagem(phone_raw, "Ok, diz-me tu: recebi X euros 💰")
+            return
+
+    if estado == 'aguardar_recibo':
+        if any(p in t for p in ['sim','yes','quero','manda','envia']):
+            limpar_estado(phone)
+            enviar_mensagem(phone_raw, "Manda o PDF ou foto do recibo e eu trato do resto! 📄")
+            return
+        elif any(p in t for p in ['nao','não','valor','digo']) or tem_numero(texto):
+            limpar_estado(phone)
+            if tem_numero(texto):
+                processar_receita(phone_raw, usuario, texto)
+            else:
+                enviar_mensagem(phone_raw, "Ok, diz o valor: recebi X euros 💰")
             return
 
     # APRENDER
@@ -394,6 +407,11 @@ def processar_texto(phone_raw, phone, texto):
 
     if any(p in t for p in ['quanto tenho','quanto me resta','quanto sobra','saldo']):
         enviar_quanto_tenho(phone_raw, usuario); return
+
+    if any(p in t for p in ['resumo anterior','mes passado','mes anterior']):
+        mes_ant = agora().month - 1 if agora().month > 1 else 12
+        ano_ant = agora().year if agora().month > 1 else agora().year - 1
+        enviar_resumo(phone_raw, usuario, mes_ant, ano_ant); return
 
     if any(p in t for p in ['resumo','como estou','quanto gastei','situacao','situação']):
         enviar_resumo(phone_raw, usuario); return
@@ -797,40 +815,53 @@ Responde em max 2 linhas, 1 emoji."""
     except Exception as e:
         log.error(f'IA: {e}'); return "Nao percebi 🤔 Diz 'ajuda' p/ veres o que sei!"
 
+def dia_pagamento_mes(ano, mes):
+    """Dia 21, recuando para dia util se fim de semana."""
+    d = datetime(ano, mes, 21)
+    if d.weekday() == 5: d -= timedelta(days=1)
+    elif d.weekday() == 6: d -= timedelta(days=2)
+    return d
+
+def dia_recibo_mes(ano, mes):
+    """1 dia util antes do dia de pagamento."""
+    pag = dia_pagamento_mes(ano, mes)
+    d = pag - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
 # ─── LEMBRETES / SCHEDULER ───────────────────────────────────
 def lembrete_recibo():
     with app.app_context():
         hoje = agora()
-        # Dia util antes do dia 21
-        dia_alvo = hoje.replace(day=21)
-        if dia_alvo.weekday() == 0: dia_antes = dia_alvo - timedelta(days=3)  # 2a feira -> sexta
-        else: dia_antes = dia_alvo - timedelta(days=1)
-        if hoje.day == dia_antes.day and hoje.hour == 11:
+        dia_rec = dia_recibo_mes(hoje.year, hoje.month)
+        if hoje.day == dia_rec.day and hoje.hour == 11:
             for u in Usuario.query.all():
                 if u.phone:
-                    enviar_mensagem(f"{u.phone}@lid", "Ola! 📄 Ja recebeste o recibo este mes?\n\nPodes mandar o PDF ou print, ou dizer o valor! 💰")
+                    set_estado(u.phone, 'aguardar_recibo', {})
+                    enviar_mensagem(f"{u.phone}@lid",
+                        "Ola! 📄 Hoje deve ter chegado o teu recibo!\nJa recebeste? Queres mandar o PDF/foto ou preferes dizer o valor?")
 
 def lembrete_salario():
     with app.app_context():
         hoje = agora()
-        dia = hoje.replace(day=21)
-        if dia.weekday() == 5: dia -= timedelta(days=1)
-        elif dia.weekday() == 6: dia -= timedelta(days=2)
-        if hoje.day == dia.day and hoje.hour == 9:
+        dia_pag = dia_pagamento_mes(hoje.year, hoje.month)
+        if hoje.day == dia_pag.day and hoje.hour == 9:
             for u in Usuario.query.all():
                 if u.phone:
-                    enviar_mensagem(f"{u.phone}@lid", "💰 Hoje e dia de salario! Manda o recibo ou diz quanto recebeste 🚀")
+                    enviar_mensagem(f"{u.phone}@lid", "💰 Hoje e dia de salario! Ja recebeste? Manda o recibo ou diz o valor 🚀")
 
 def fecho_mes():
     with app.app_context():
         hoje = agora()
-        if hoje.day == 21 and hoje.hour == 20:
+        dia_pag = dia_pagamento_mes(hoje.year, hoje.month)
+        if hoje.day == dia_pag.day and hoje.hour == 10:
             mes_ant = hoje.month - 1 if hoje.month > 1 else 12
-            ano_ant = hoje.year if hoje.month > 1 else hoje.year - 1
             nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
             for u in Usuario.query.all():
                 if u.phone:
-                    enviar_mensagem(f"{u.phone}@lid", f"📅 Fecho de {nomes[mes_ant-1]}! Manda 'resumo anterior' p/ veres como correu o mes 📊")
+                    enviar_mensagem(f"{u.phone}@lid",
+                        f"📅 Novo mes financeiro começa hoje!\nO mes de {nomes[mes_ant-1]} ficou para tras.\nDiz 'resumo anterior' p/ veres como correu 📊")
 
 def aviso_meio_mes():
     with app.app_context():
