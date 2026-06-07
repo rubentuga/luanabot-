@@ -784,7 +784,23 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     msg += f"\n🛡️ Fundo: {p['fundo']:.2f}€ (Revolut!)\n"
     msg += f"💳 Para gastar: {p['gastar']:.0f}€\n"
     msg += f"💎 Poupanca: {p['poupanca']:.0f}€"
-    if p['subsidio']: msg += "\n\n🌴 Mes de subsidio! 😉"
+    if p['subsidio']:
+        msg += "\n\n🌴 Mes de subsidio! 😉"
+        # Verifica se tem wishlist
+        try:
+            rows = db.session.execute(text(
+                "SELECT descricao, preco FROM wishlist WHERE usuario_id=:id AND comprado=FALSE ORDER BY criado_em DESC LIMIT 3"),
+                {'id': usuario.id}).fetchall()
+            if rows:
+                msg += "\n\n🛍️ Mes de subsidio = mes de mimar! Tens na wishlist:\n"
+                for r in rows:
+                    preco_txt = f" — {r[1]:.2f}€" if r[1] else ""
+                    msg += f"• {r[0]}{preco_txt}\n"
+                msg += "\nTu mereces! 💕"
+            else:
+                msg += "\n\nAproveira para comprar umas roupas para ti, tu mereces! 🛍️💕"
+        except Exception:
+            msg += "\n\nAproveira para comprar umas roupas para ti, tu mereces! 🛍️💕"
     if agora().month == 11: msg += "\n\n🎂 Este mes e o teu aniversario!! 100€ so para ti! 🎁"
     enviar_mensagem(phone_raw, msg)
 
