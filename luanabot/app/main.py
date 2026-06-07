@@ -347,25 +347,58 @@ def health():
 
 
 # ─── ÁUDIO (Groq Whisper) ────────────────────────────────────
+def baixar_media(url):
+    """Descarrega media do WAHA, tratando o URL interno."""
+    import requests
+    from urllib.parse import urlparse, quote
+    if not url:
+        log.error('Media URL vazio')
+        return None
+    # WAHA devolve localhost interno -> troca pelo URL publico
+    if 'localhost' in url or '127.0.0.1' in url:
+        parsed = urlparse(url)
+        url = WAHA_URL.rstrip('/') + parsed.path
+        if parsed.query:
+            url += '?' + parsed.query
+    log.info(f'A descarregar media: {url}')
+    try:
+        r = requests.get(url, headers={'X-Api-Key': WAHA_API_KEY}, timeout=30)
+        log.info(f'Media download status: {r.status_code}, tamanho: {len(r.content)} bytes')
+        if r.status_code == 200 and len(r.content) > 0:
+            return r.content
+        log.error(f'Media download falhou: {r.status_code} {r.text[:200]}')
+        return None
+    except Exception as e:
+        log.error(f'Erro download media: {e}')
+        return None
+
+
 def transcrever_audio(url):
     try:
-        import requests
         from groq import Groq
-        # URL interno do WAHA -> usa URL público
-        if 'localhost' in url:
-            url = url.replace('http://localhost:8080', WAHA_URL)
-        r = requests.get(url, headers={'X-Api-Key': WAHA_API_KEY}, timeout=30)
-        if r.status_code != 200:
+        conteudo = baixar_media(url)
+        if not conteudo:
             return ''
         with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as f:
-            f.write(r.content)
+            f.write(conteudo)
             fname = f.name
         client = Groq(api_key=GROQ_API_KEY)
         with open(fname, 'rb') as af:
-            t = client.audio.transcriptions.create(model='whisper-large-v3', file=af, language='pt')
-        return t.text.strip()
+            t = client.audio.transcriptions.create(
+                model='whisper-large-v3',
+                file=(os.path.basename(fname), af.read()),
+                language='pt',
+                prompt='Mensagem sobre gastos em euros. Lojas: Continente, Pingo Doce, BK, McDonalds, Galp, BP, Zara.'
+            )
+        texto = t.text.strip()
+        log.info(f'Audio transcrito: {texto}')
+        try:
+            os.unlink(fname)
+        except Exception:
+            pass
+        return texto
     except Exception as e:
-        log.error(f'Erro audio: {e}')
+        log.error(f'Erro audio: {e}', exc_info=True)
         return ''
 
 
@@ -747,16 +780,83 @@ def modo_teso(phone_raw, usuario):
     enviar_mensagem(phone_raw, msg)
 
 
-# ─── GASOLINA ────────────────────────────────────────────────
+# ─── GASOLINA (API DGEG real) ────────────────────────────────
+# IDs de municipio DGEG (distrito Setubal = 15)
+MUNICIPIOS_DGEG = {
+    'barreiro': ('1503', 'Barreiro'),
+    'moita': ('1510', 'Moita'),
+    'montijo': ('1508', 'Montijo'),
+    'seixal': ('1511', 'Seixal'),
+    'almada': ('1502', 'Almada'),
+    'setubal': ('1512', 'Setúbal'),
+    'palmela': ('1509', 'Palmela'),
+}
+# Tipo de combustivel: Gasolina simples 95 = 3201, Gasoleo simples = 2101
+GASOLINA_95 = '3201'
+
+
+def buscar_postos_dgeg(id_municipio, id_comb=GASOLINA_95):
+    import requests
+    url = "https://precoscombustiveis.dgeg.gov.pt/api/PrecoComb/PesquisarPostos"
+    params = {
+        'qtdPorPagina': '500', 'pagina': '1',
+        'idsTiposComb': id_comb, 'idMarca': '', 'idTipoPosto': '',
+        'idDistrito': '15', 'idsMunicipios': id_municipio, 'placeId': ''
+    }
+    try:
+        r = requests.get(url, params=params, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code != 200:
+            log.error(f'DGEG status {r.status_code}')
+            return []
+        dados = r.json()
+        postos = dados.get('resultado', []) if isinstance(dados, dict) else []
+        lista = []
+        for p in postos:
+            preco_raw = p.get('Preco', '') or ''
+            preco = float(str(preco_raw).replace(' €/litro', '').replace('€', '').replace(',', '.').strip() or 0)
+            if preco > 0:
+                lista.append({
+                    'nome': p.get('Nome', '?'),
+                    'marca': p.get('Marca', ''),
+                    'morada': p.get('Morada', ''),
+                    'preco': preco
+                })
+        lista.sort(key=lambda x: x['preco'])
+        return lista
+    except Exception as e:
+        log.error(f'Erro DGEG: {e}', exc_info=True)
+        return []
+
+
 def gasolina_barata(phone_raw, texto):
     t = texto.lower()
-    if 'barreiro' in t:
-        zona = 'Barreiro'
-    elif 'moita' in t:
-        zona = 'Moita'
-    else:
-        zona = 'Barreiro/Moita'
-    enviar_mensagem(phone_raw, f"⛽ Para veres os postos mais baratos em {zona} em tempo real:\nhttps://precoscombustiveis.dgeg.gov.pt\n\nDica: o Prio e o Intermarche costumam ser dos mais baratos na zona! 💡")
+    municipios = []
+    for chave, (idm, nome) in MUNICIPIOS_DGEG.items():
+        if chave in t:
+            municipios.append((idm, nome))
+    if not municipios:
+        municipios = [('1503', 'Barreiro'), ('1510', 'Moita')]
+
+    todos = []
+    nomes_zona = []
+    for idm, nome in municipios:
+        nomes_zona.append(nome)
+        todos.extend(buscar_postos_dgeg(idm))
+
+    if not todos:
+        enviar_mensagem(phone_raw, f"⛽ Nao consegui buscar precos agora 😕\nVe direto em: https://precoscombustiveis.dgeg.gov.pt")
+        return
+
+    todos.sort(key=lambda x: x['preco'])
+    top = todos[:5]
+    zona = ' e '.join(nomes_zona)
+    msg = f"⛽ Gasolina 95 mais barata em {zona}:\n\n"
+    medalhas = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
+    for i, p in enumerate(top):
+        marca = f" ({p['marca']})" if p['marca'] else ''
+        msg += f"{medalhas[i]} {p['preco']:.3f} euros/L\n   {p['nome'][:35]}{marca}\n"
+    msg += "\n💡 Dados oficiais DGEG, atualizados hoje!"
+    enviar_mensagem(phone_raw, msg)
 
 
 # ─── DESPESA FUTURA ──────────────────────────────────────────
