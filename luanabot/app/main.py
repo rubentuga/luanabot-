@@ -263,7 +263,6 @@ def calcular_plano(salario, modo='equilibrado', despesas_futuras_valor=0):
         'unhas': 50 if mes <= 9 else 25,
         'combustivel': BASE_COMBUSTIVEL,
     }
-    # Adiciona despesas futuras deste mês aos fixos
     if despesas_futuras_valor > 0:
         fixos['despesas_mes'] = despesas_futuras_valor
     total_fixos = sum(fixos.values())
@@ -668,7 +667,6 @@ def processar_gasto_reserva(phone_raw, usuario, texto):
 # ─── ANIVERSÁRIOS ────────────────────────────────────────────
 def processar_aniversario(phone_raw, usuario, texto):
     t = texto.lower()
-    # Ver lista
     if any(p in t for p in ['ver','lista','quais','mostrar']):
         try:
             rows = db.session.execute(text("SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id ORDER BY data_aniv"), {'id':usuario.id}).fetchall()
@@ -682,7 +680,6 @@ def processar_aniversario(phone_raw, usuario, texto):
         except Exception as e:
             log.error(f"anivs: {e}"); enviar_mensagem(phone_raw, "Erro ao buscar aniversarios 😕")
         return
-    # Adicionar: "aniversario da Ana dia 15 marco"
     m = re.search(r'(?:aniversario|aniversário|faz anos)[^\d]*(?:d[ao] |d[ae] )?([A-Za-zÀ-ú]+).*?dia (\d{1,2}).*?(\w+)', texto, re.IGNORECASE)
     if m:
         nome = m.group(1).capitalize()
@@ -804,12 +801,10 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     if p['subsidio']: msg += "\n\n🌴 Mes de subsidio! Mais margem 😉"
     enviar_mensagem(phone_raw, msg)
 
-    # Verifica se ha poupanca anterior nao usada para adicionar a reserva
     reserva_atual = get_reserva(usuario.id)
     if reserva_atual > 0:
         enviar_mensagem(phone_raw, f"🛡️ Reserva de emergencia: {reserva_atual:.2f}€ — continua a crescer! 💪")
 
-    # Resumo mes anterior
     mes_ant = agora().month-1 if agora().month>1 else 12
     ano_ant = agora().year if agora().month>1 else agora().year-1
     nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
@@ -820,7 +815,6 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     if total_ant > 0:
         enviar_mensagem(phone_raw, f"📊 Como correu {nomes[mes_ant-1]}:")
         enviar_resumo(phone_raw, usuario, mes_ant, ano_ant)
-        # Verifica se sobrou dinheiro para reserva
         verificar_sobra_mes(phone_raw, usuario, mes_ant, ano_ant)
     else:
         enviar_mensagem(phone_raw, "💡 Primeiro mes! A partir de agora vou guardar tudo 💪")
@@ -829,7 +823,6 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     set_estado(phone, 'fecho_feito', {'mes':agora().month,'ano':agora().year})
 
 def verificar_sobra_mes(phone_raw, usuario, mes, ano):
-    """No fim do mes verifica se sobrou dinheiro da poupanca prevista."""
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
@@ -1131,10 +1124,12 @@ def enviar_boas_vindas(phone_raw, usuario=None, phone=None):
     dias = dias_para_salario()
 
     if not tem_salario:
-        # Primeira vez — escolher modo
         if phone:
             set_estado(phone, 'escolher_modo', {})
-        msg = (f"Ola! 👋 Sou o Ze das Financas, o teu novo bestie financeiro! 💸\n\n"
+        msg = (f"Ola Luana! 👋 Eu sou o Ze das Financas!\n"
+               f"Fui criado pelo tuga27 especialmente para ti 💸\n"
+               f"A minha missao? Ajudar-te a poupar, controlar os teus gastos\n"
+               f"e nunca mais ficares a zeros antes do salario 😅\n\n"
                f"Antes de comecarmos, diz-me como queres gerir o teu dinheiro:\n\n"
                f"1. 💎 Poupanca Maxima\nPoupes o maximo, gastas so o essencial. Modo monge 🧘\n\n"
                f"2. ⚖️ Equilibrado\nPoupas bem mas ainda tens margem para viver a vida 😊\n\n"
@@ -1144,7 +1139,7 @@ def enviar_boas_vindas(phone_raw, usuario=None, phone=None):
     else:
         disp, p = calcular_disponivel(usuario)
         m = MODOS_POUPANCA[modo]
-        msg = (f"Ola de volta! 👋 {m['emoji']}\n"
+        msg = (f"Ola Luana! 👋 {m['emoji']}\n"
                f"Tens {disp:.0f}€ para gastar | Poupanca: {p['poupanca']:.0f}€\n"
                f"🛡️ Reserva: {get_reserva(usuario.id):.2f}€\n\n"
                f"Sugestoes de melhorias? Manda! Estou sempre a evoluir 🚀\n"
