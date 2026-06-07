@@ -225,8 +225,14 @@ def webhook():
             elif 'image' in mime:
                 resultado = ler_foto_talao(url, mime)
                 if resultado:
-                    enviar_mensagem(phone_raw, f'📸 Li: {resultado}')
-                    texto = resultado
+                    valor_lido = extrair_valor(resultado)
+                    # Se valor > 500€ provavelmente e recibo de salario
+                    if valor_lido > 500:
+                        enviar_mensagem(phone_raw, f'📸 Vi no recibo: {valor_lido:.2f}€ — e esse o teu salario?')
+                        set_estado(phone, 'confirmar_salario', {'valor': valor_lido})
+                    else:
+                        enviar_mensagem(phone_raw, f'📸 Li: {resultado}')
+                        texto = resultado
                 else:
                     enviar_mensagem(phone_raw, "Nao consegui ler a imagem 😕 Escreve o valor!")
                     return jsonify({'status':'ok'})
@@ -298,7 +304,7 @@ def ler_foto_talao(url, mimetype='image/jpeg'):
             model='meta-llama/llama-4-scout-17b-16e-instruct', max_tokens=80,
             messages=[{'role':'user','content':[
                 {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img}'}},
-                {'type':'text','text':'Le este talao. Responde APENAS: "X euros LOJA". Ex: "25.50 euros Continente". Se nao deres, responde: erro'}
+                {'type':'text','text':'Le este documento. Se for recibo de salario responde APENAS: "X euros SALARIO". Se for talao de compra responde APENAS: "X euros LOJA". Usa o valor liquido/total. Formato: numero virgula decimais. Ex: "1327,92 euros SALARIO" ou "25,50 euros Continente". Se nao deres, responde: erro'}
             ]}])
         txt = resp.choices[0].message.content.strip()
         log.info(f'Foto: {txt}')
@@ -446,8 +452,34 @@ def tem_numero(texto):
     return bool(re.search(r'[0-9]+[.,]?[0-9]*', texto))
 
 def extrair_valor(texto):
-    m = re.findall(r'[0-9]+[.,]?[0-9]*', texto)
-    return float(m[0].replace(',','.')) if m else 0
+    # Extrai primeiro numero que pareca valor monetario
+    # Suporta: 1.327,92 / 1327,92 / 1327.92 / 13.50 / 1300 / 1.300
+    padrao = re.findall(r'\d[\d.,]*\d|\d+', texto)
+    for n in padrao:
+        try:
+            tem_ponto = '.' in n
+            tem_virgula = ',' in n
+            if tem_ponto and tem_virgula:
+                # 1.327,92 — formato PT com milhar
+                v = float(n.replace('.', '').replace(',', '.'))
+            elif tem_virgula:
+                # 1327,92 ou 13,50
+                v = float(n.replace(',', '.'))
+            elif tem_ponto:
+                # 1.327 (milhar) ou 13.50 (decimal)
+                pos_ponto = n.rfind('.')
+                decimais = n[pos_ponto+1:]
+                if len(decimais) == 3 and n.replace('.','').isdigit():
+                    v = float(n.replace('.', ''))
+                else:
+                    v = float(n)
+            else:
+                v = float(n)
+            if v > 0:
+                return v
+        except Exception:
+            continue
+    return 0
 
 def eh_gasto(texto):
     t = texto.lower()
@@ -581,10 +613,16 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     if p['subsidio']: msg += "\n\n🌴 Mes de subsidio! Meti mais margem. Aproveita com juizo 😉"
     enviar_mensagem(phone_raw, msg)
 
-    # Pergunta se quer ver resumo do mes passado
+    # Manda logo o resumo do mes passado e marca fecho como feito
     mes_ant = agora().month - 1 if agora().month > 1 else 12
-    nomes = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
-    enviar_mensagem(phone_raw, f"Queres ver o resumo de {nomes[mes_ant-1]}? Diz 'resumo anterior' 📊")
+    ano_ant = agora().year if agora().month > 1 else agora().year - 1
+    nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+    enviar_mensagem(phone_raw, f"📊 Como correu {nomes[mes_ant-1]}:")
+    enviar_resumo(phone_raw, usuario, mes_ant, ano_ant)
+
+    # Marca que o fecho ja foi feito para nao repetir as 10h
+    phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+    set_estado(phone, 'fecho_feito', {'mes': agora().month, 'ano': agora().year})
 
 # ─── QUANTO TENHO ────────────────────────────────────────────
 def enviar_quanto_tenho(phone_raw, usuario):
@@ -859,9 +897,14 @@ def fecho_mes():
             mes_ant = hoje.month - 1 if hoje.month > 1 else 12
             nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
             for u in Usuario.query.all():
-                if u.phone:
-                    enviar_mensagem(f"{u.phone}@lid",
-                        f"📅 Novo mes financeiro começa hoje!\nO mes de {nomes[mes_ant-1]} ficou para tras.\nDiz 'resumo anterior' p/ veres como correu 📊")
+                if not u.phone: continue
+                phone = u.phone
+                estado, dados = get_estado(phone)
+                # Nao manda se ja fez o fecho (confirmou salario hoje)
+                if estado == 'fecho_feito' and dados.get('mes') == hoje.month and dados.get('ano') == hoje.year:
+                    continue
+                enviar_mensagem(f"{phone}@lid",
+                    f"📅 Novo mes financeiro começa hoje!\nO mes de {nomes[mes_ant-1]} ficou para tras.\nDiz 'resumo anterior' p/ veres como correu 📊")
 
 def aviso_meio_mes():
     with app.app_context():
