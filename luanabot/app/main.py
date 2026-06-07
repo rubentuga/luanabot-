@@ -431,10 +431,14 @@ def processar_texto(phone_raw, phone, texto):
     if any(p in t for p in ['poupar para','quero poupar','objetivo','objectivo']):
         enviar_mensagem(phone_raw, processar_mensagem_ia(texto, usuario, 'objetivo')); return
 
-    if any(p in t for p in ['mes que vem','mês que vem','proximo mes','próximo mês']) and tem_numero(texto):
+    if any(p in t for p in ['mes que vem','mês que vem','proximo mes','próximo mês','este mes tenho','este mês tenho']) and tem_numero(texto):
         processar_despesa_futura(phone_raw, usuario, texto); return
 
     if any(p in t for p in ['dentista','seguro','inspecao','inspeção']) and 'mes' in t and tem_numero(texto):
+        processar_despesa_futura(phone_raw, usuario, texto); return
+
+    # Cancelar despesa futura
+    if any(p in t for p in ['afinal nao','afinal não','cancela','cancelo','remove a despesa','apaga despesa','nao tenho mais','não tenho mais']):
         processar_despesa_futura(phone_raw, usuario, texto); return
 
     if any(p in t for p in ['posso comprar','posso gastar','vale a pena','consigo comprar']):
@@ -613,12 +617,23 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     if p['subsidio']: msg += "\n\n🌴 Mes de subsidio! Meti mais margem. Aproveita com juizo 😉"
     enviar_mensagem(phone_raw, msg)
 
-    # Manda logo o resumo do mes passado e marca fecho como feito
+    # Manda logo o resumo do mes passado se tiver dados
     mes_ant = agora().month - 1 if agora().month > 1 else 12
     ano_ant = agora().year if agora().month > 1 else agora().year - 1
     nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
-    enviar_mensagem(phone_raw, f"📊 Como correu {nomes[mes_ant-1]}:")
-    enviar_resumo(phone_raw, usuario, mes_ant, ano_ant)
+
+    # Verifica se ha gastos no mes anterior
+    total_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes_ant,
+        db.extract('year',Despesa.data)==ano_ant
+    ).scalar() or 0
+
+    if total_ant > 0:
+        enviar_mensagem(phone_raw, f"📊 Como correu {nomes[mes_ant-1]}:")
+        enviar_resumo(phone_raw, usuario, mes_ant, ano_ant)
+    else:
+        enviar_mensagem(phone_raw, f"💡 Ainda nao tens gastos registados de {nomes[mes_ant-1]}. Comeca a usar este mes! 💪")
 
     # Marca que o fecho ja foi feito para nao repetir as 10h
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
@@ -784,23 +799,88 @@ def gasolina_barata(phone_raw, texto):
 
 # ─── DESPESA FUTURA ──────────────────────────────────────────
 def processar_despesa_futura(phone_raw, usuario, texto):
+    t = texto.lower()
+
+    # CANCELAR despesa futura: "afinal nao tenho dentista" / "cancela dentista" / "remove dentista"
+    if any(p in t for p in ['afinal','cancela','cancelo','remove','apaga','nao tenho','não tenho']):
+        palavras_chave = [w for w in re.findall(r'[a-zà-ú]+', t)
+                         if w not in ['afinal','nao','não','tenho','cancela','cancelo','remove','apaga','que','vem','mes','mês','o','a','os','as']]
+        if palavras_chave:
+            chave = palavras_chave[0]
+            futuras = DespesaFutura.query.filter(
+                DespesaFutura.usuario_id==usuario.id,
+                DespesaFutura.pago==False,
+                DespesaFutura.descricao.ilike(f'%{chave}%')
+            ).all()
+            if futuras:
+                for f in futuras:
+                    db.session.delete(f)
+                db.session.commit()
+                nomes = ', '.join(f.descricao for f in futuras)
+                enviar_mensagem(phone_raw, f"🗑️ Removido! '{nomes}' ja nao esta nas tuas despesas futuras 👍")
+            else:
+                # Mostra lista das que existem
+                todas = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
+                if todas:
+                    lista = '\n'.join(f"• {d.descricao} — {d.valor_total:.0f}€" for d in todas)
+                    enviar_mensagem(phone_raw, f"Nao encontrei '{chave}'. As tuas despesas futuras sao:\n{lista}\n\nDiz qual queres cancelar!")
+                else:
+                    enviar_mensagem(phone_raw, "Nao tens despesas futuras registadas 😊")
+        else:
+            # Mostra lista para escolher
+            todas = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
+            if todas:
+                lista = '\n'.join(f"• {d.descricao} — {d.valor_total:.0f}€" for d in todas)
+                enviar_mensagem(phone_raw, f"Qual queres cancelar?\n{lista}")
+            else:
+                enviar_mensagem(phone_raw, "Nao tens despesas futuras registadas 😊")
+        return
+
     valor = extrair_valor(texto)
     if valor == 0:
         enviar_mensagem(phone_raw, "Quanto vai custar? Ex: mes que vem dentista 40€"); return
-    t = texto.lower()
+
     if 'dentista' in t: desc='Dentista'
     elif 'seguro' in t: desc='Seguro'
     elif 'inspe' in t: desc='Inspecao'
     elif 'renda' in t: desc='Renda'
     else:
-        palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>3 and w.lower() not in ['mes','mês','que','vem','tenho']]
+        palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>3
+                    and w.lower() not in ['mes','mês','que','vem','tenho','este','esse','proximo','próximo','afinal']]
         desc = ' '.join(palavras[:2]).capitalize() if palavras else 'Despesa futura'
+
     meses = 2 if ('2 meses' in t or 'dois meses' in t) else (3 if '3 meses' in t else 1)
+
+    # Tenta extrair dia do mês se mencionado
+    dia_match = re.search(r'dia (\d{1,2})', t)
+    dia = int(dia_match.group(1)) if dia_match else None
+
+    # Calcula data prevista
+    hoje = agora().replace(tzinfo=None)
+    if dia:
+        mes_alvo = hoje.month + meses
+        ano_alvo = hoje.year
+        while mes_alvo > 12:
+            mes_alvo -= 12; ano_alvo += 1
+        try:
+            data_prev = hoje.replace(year=ano_alvo, month=mes_alvo, day=min(dia, 28))
+        except Exception:
+            data_prev = hoje + timedelta(days=30*meses)
+    else:
+        data_prev = hoje + timedelta(days=30*meses)
+
     reserva = round(valor/meses, 2)
     db.session.add(DespesaFutura(usuario_id=usuario.id, descricao=desc, valor_total=valor,
-        valor_reserva_mensal=reserva, meses=meses, data_prevista=agora().replace(tzinfo=None)+timedelta(days=30*meses)))
+        valor_reserva_mensal=reserva, meses=meses, data_prevista=data_prev))
     db.session.commit()
-    enviar_mensagem(phone_raw, f"📅 Anotado! {desc}: {valor:.0f}€ em {meses} mes{'es' if meses>1 else ''}\nGuardo {reserva:.0f}€/mes p/ isso 👍")
+
+    dia_txt = f" (dia {dia})" if dia else ""
+    when_txt = f"daqui a {meses} mes{'es' if meses>1 else ''}{dia_txt}"
+    if 'este mes' in t or 'este mês' in t:
+        when_txt = f"este mes{dia_txt}"
+
+    enviar_mensagem(phone_raw, f"📅 Anotado! {desc}: {valor:.0f}€ {when_txt}\nGuardo {reserva:.0f}€/mes p' isso 👍\n\nPara cancelar diz: 'afinal nao tenho {desc.lower()}'")
+
 
 # ─── SIMULAR ─────────────────────────────────────────────────
 def simular_compra(phone_raw, usuario, texto):
