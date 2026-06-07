@@ -195,6 +195,13 @@ def criar_tabelas():
             valor_cada FLOAT, pessoa VARCHAR(100),
             pago BOOLEAN DEFAULT FALSE,
             criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS objetivos_poupanca (
+            id SERIAL PRIMARY KEY, usuario_id INTEGER,
+            descricao VARCHAR(200), valor_objetivo FLOAT,
+            valor_atual FLOAT DEFAULT 0, concluido BOOLEAN DEFAULT FALSE,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS marcos_objetivo (
+            id SERIAL PRIMARY KEY, objetivo_id INTEGER, marco INTEGER)""",
         """CREATE TABLE IF NOT EXISTS aniversarios (
             id SERIAL PRIMARY KEY, usuario_id INTEGER,
             nome VARCHAR(100), data_aniv DATE)""",
@@ -656,8 +663,8 @@ def processar_texto(phone_raw, phone, texto):
     if any(p in t for p in ['score','conquistas','badges']):
         enviar_score(phone_raw, usuario); return
 
-    if any(p in t for p in ['poupar para','quero poupar','objetivo','objectivo']):
-        enviar_mensagem(phone_raw, processar_mensagem_ia(texto, usuario, 'objetivo')); return
+    if any(p in t for p in ['poupar para','quero poupar','objetivo','objectivo','meta de poupanca','meta de poupança']):
+        processar_objetivo_poupanca(phone_raw, usuario, texto); return
 
     if any(p in t for p in ['mes que vem','mês que vem','proximo mes','próximo mês','este mes tenho','este mês tenho']) and tem_numero(texto):
         processar_despesa_futura(phone_raw, usuario, texto); return
@@ -941,7 +948,90 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     except Exception as e:
         log.error(f"anivs plano: {e}")
 
-def verificar_sobra_mes(phone_raw, usuario, mes, ano):
+def aviso_fim_mes_wishlist():
+    """Dias 17-19: se ainda tem dinheiro disponível, sugere item da wishlist."""
+    with app.app_context():
+        hoje = agora()
+        dia_pag = dia_pagamento_mes(hoje.year, hoje.month)
+        dias_para_fim = (dia_pag.date() - hoje.date()).days
+
+        # Só avisa entre 2-4 dias antes do fim do ciclo
+        if dias_para_fim not in [2, 3, 4]: return
+
+        for u in Usuario.query.all():
+            if not u.phone or not u.salario_liquido: continue
+            try:
+                disp, _ = calcular_disponivel(u)
+                if disp < 20: continue  # nao tem dinheiro suficiente
+
+                # Busca items da wishlist dentro do orçamento
+                rows = db.session.execute(text("""
+                    SELECT descricao, preco, link, categoria
+                    FROM wishlist
+                    WHERE usuario_id=:id AND comprado=FALSE AND preco IS NOT NULL AND preco <= :disp
+                    ORDER BY preco DESC LIMIT 3
+                """), {'id': u.id, 'disp': disp}).fetchall()
+
+                if not rows:
+                    # Mesmo sem wishlist avisa que tem dinheiro sobrando
+                    enviar_mensagem(f"{u.phone}@lid",
+                        f"💡 Faltam {dias_para_fim} dias para o novo ciclo e ainda tens {disp:.0f}€!\n"
+                        f"Se nao gastares vai para a reserva de emergencia automaticamente 💪\n"
+                        f"Ou aproveita para algo da tua wishlist — diz 'wishlist' para veres 🛍️")
+                    continue
+
+                cat_emojis = {'roupa':'👗','calcado':'👟','acessorios':'👜','maquilagem':'💄','casa':'🏠','tecnologia':'📱','outros':'🛒'}
+                msg = f"🛍️ Tens {disp:.0f}€ disponíveis e o ciclo acaba em {dias_para_fim} dias!\n\nDa tua wishlist podes comprar:\n"
+                for r in rows:
+                    emoji = cat_emojis.get(r[3], '🛒')
+                    link_txt = f"\n   🔗 {r[2]}" if r[2] else ""
+                    msg += f"{emoji} {r[0]} — {r[1]:.2f}€{link_txt}\n"
+                msg += f"\nSe nao gastares vai para a tua reserva 💪"
+                enviar_mensagem(f"{u.phone}@lid", msg)
+            except Exception as e:
+                log.error(f"aviso wishlist: {e}")
+
+
+def verificar_objetivo_poupanca():
+    """Verifica se atingiu marcos do objetivo de poupança."""
+    with app.app_context():
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                rows = db.session.execute(text("""
+                    SELECT id, descricao, valor_objetivo, valor_atual
+                    FROM objetivos_poupanca
+                    WHERE usuario_id=:id AND concluido=FALSE
+                """), {'id': u.id}).fetchall()
+                for r in rows:
+                    pct = (r[3] / r[2] * 100) if r[2] > 0 else 0
+                    # Avisa nos marcos 25, 50, 75, 100%
+                    for marco in [25, 50, 75, 100]:
+                        if pct >= marco:
+                            # Verifica se ja avisou este marco
+                            ja_avisou = db.session.execute(text(
+                                "SELECT 1 FROM marcos_objetivo WHERE objetivo_id=:id AND marco=:m"),
+                                {'id': r[0], 'm': marco}).fetchone()
+                            if not ja_avisou:
+                                db.session.execute(text(
+                                    "INSERT INTO marcos_objetivo (objetivo_id,marco) VALUES (:id,:m)"),
+                                    {'id': r[0], 'm': marco})
+                                db.session.commit()
+                                if marco == 100:
+                                    enviar_mensagem(f"{u.phone}@lid",
+                                        f"🎉🎊 CONSEGUISTE! Objetivo '{r[1]}' concluido!\n"
+                                        f"Poupaste {r[2]:.0f}€! Orgulho! 🏆")
+                                    db.session.execute(text(
+                                        "UPDATE objetivos_poupanca SET concluido=TRUE WHERE id=:id"),
+                                        {'id': r[0]})
+                                    db.session.commit()
+                                else:
+                                    emojis = {25:'🌱', 50:'🌿', 75:'🌳'}
+                                    enviar_mensagem(f"{u.phone}@lid",
+                                        f"{emojis[marco]} {marco}% do objetivo '{r[1]}' atingido!\n"
+                                        f"{r[3]:.0f}€ de {r[2]:.0f}€ — continua! 💪")
+            except Exception as e:
+                log.error(f"objetivo poupanca: {e}")
     """No fim do mes verifica se sobrou dinheiro da poupanca prevista."""
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
@@ -1276,13 +1366,18 @@ def enviar_ajuda(phone_raw):
 • jantar 30 na conjunta
 • gastei 30 da reserva
 • foto talao | audio | PDF recibo
+• [foto odometro] → regista km
 
 🛍️ Wishlist:
-• [foto etiqueta] → guarda automatico
+• [foto etiqueta] → guarda + compara precos
 • quero sapatilhas nike 89€
-• wishlist → ver tudo
-• comprei o vestido
-• remove da wishlist o vestido
+• [link produto] → analisa e compara
+• wishlist | wishlist roupa | wishlist verao
+• comprei o vestido | remove da wishlist X
+
+🎯 Objetivos poupanca:
+• quero poupar 500€ para ferias
+• objetivos → ver progresso
 
 ✂️ Splitting:
 • dividi 60€ jantar com o Ruben
@@ -1290,11 +1385,12 @@ def enviar_ajuda(phone_raw):
 
 📊 Consultas:
 • resumo | plano | quanto tenho
-• quanto tenho na conjunta
-• score | resumo anterior
+• quanto tenho na conjunta | score
+• resumo anterior
 
 🎂 Aniversarios:
-• aniversario da Ana dia 15 marco
+• aniversario da Ana 15/3
+• aniversarios → ver lista
 
 🎯 Planear:
 • posso comprar X?
@@ -1303,7 +1399,7 @@ def enviar_ajuda(phone_raw):
 
 ⛽ Gasolina mais barata no barreiro
 🆘 Estou teso
-🔒 Limpa conversa (modo discreto)
+🔒 Limpa conversa
 🔄 Muda modo (maximo/equilibrado/relaxado)
 🧠 Aprende que X e roupa | corrige para roupa
 
@@ -1823,7 +1919,55 @@ def modo_discreto(phone_raw):
         log.error(f"discreto: {e}")
         enviar_mensagem(phone_raw, "Nao consegui apagar 😕 O WAHA pode nao suportar esta funcao.")
 
-# ─── SCHEDULER ───────────────────────────────────────────────
+def processar_objetivo_poupanca(phone_raw, usuario, texto):
+    t = texto.lower()
+
+    # Ver objetivos
+    if any(p in t for p in ['ver','lista','mostrar','objetivos','metas']):
+        try:
+            rows = db.session.execute(text(
+                "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
+                {'id': usuario.id}).fetchall()
+            if not rows:
+                enviar_mensagem(phone_raw, "Nao tens objetivos de poupanca ainda 🎯\nCria um: 'quero poupar 500€ para ferias'"); return
+            msg = "🎯 Os teus objetivos:\n\n"
+            for r in rows:
+                pct = int(r[2]/r[1]*100) if r[1] > 0 else 0
+                barra = '█' * (pct//10) + '░' * (10-pct//10)
+                msg += f"📌 {r[0]}\n{barra} {pct}%\n{r[2]:.0f}€ de {r[1]:.0f}€\n\n"
+            enviar_mensagem(phone_raw, msg)
+        except Exception as e:
+            log.error(f"objetivos: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Criar objetivo: "quero poupar 500€ para ferias"
+    valor = extrair_valor(texto)
+    if valor == 0:
+        enviar_mensagem(phone_raw, "Quanto queres poupar? Ex: 'quero poupar 500€ para ferias'"); return
+
+    stop = {'quero','poupar','para','objetivo','meta','de','poupanca','poupança','objectivo'}
+    palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
+    desc = ' '.join(palavras[:3]).capitalize() if palavras else 'Objetivo'
+
+    try:
+        db.session.execute(text(
+            "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo) VALUES (:u,:d,:v)"),
+            {'u': usuario.id, 'd': desc, 'v': valor})
+        db.session.commit()
+
+        modo = get_modo(usuario.id)
+        p = calcular_plano(usuario.salario_liquido or 0, modo)
+        meses_est = round(valor / p['poupanca']) if p['poupanca'] > 0 else '?'
+
+        enviar_mensagem(phone_raw,
+            f"🎯 Objetivo criado!\n📌 {desc}: {valor:.0f}€\n"
+            f"⏱️ Ao ritmo atual ({p['poupanca']:.0f}€/mes) chegas la em ~{meses_est} meses\n\n"
+            f"Vou avisar-te quando atingires 25%, 50%, 75% e 100%! 💪\n"
+            f"Diz 'objetivos' para veres o progresso")
+    except Exception as e:
+        log.error(f"criar objetivo: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+
 def lembrete_recibo():
     with app.app_context():
         hoje = agora()
@@ -1945,9 +2089,11 @@ scheduler.add_job(lembrete_recibo,            'cron', hour=11, minute=0)
 scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
 scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
 scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
+scheduler.add_job(aviso_fim_mes_wishlist,     'cron', hour=11, minute=0)
 scheduler.add_job(resumo_semanal,             'cron', hour=9,  minute=30, day_of_week='mon')
 scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
 scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
+scheduler.add_job(verificar_objetivo_poupanca,'cron', hour=9,  minute=0)
 scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
 scheduler.start()
 log.info("Ze das Financas v6 iniciado")
