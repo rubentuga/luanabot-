@@ -510,7 +510,35 @@ def processar_texto(phone_raw, phone, texto):
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
-        if estado == 'wishlist_mapa':
+        if estado == 'wishlist_tipo_pendente':
+            dados_t = dados_estado
+            tipo_escolha = t.strip()
+            nome_tipo = TIPOS_ROUPA.get(tipo_escolha)
+            if nome_tipo:
+                limpar_estado(phone)
+                marca = dados_t.get('marca','')
+                preco = dados_t.get('preco')
+                link  = dados_t.get('link')
+                cat   = dados_t.get('cat', 'roupa')
+                est   = dados_t.get('est')
+                ref   = dados_t.get('ref','')
+                desc  = f"{nome_tipo} ({marca})" if marca else nome_tipo
+                if ref and ref.strip(): desc += f" ({ref})"
+                # Categoria por tipo
+                if nome_tipo == 'Calçado': cat = 'calcado'
+                elif nome_tipo in ['T-Shirt','Polo','Camisa','Sweatshirt','Casaco','Calças','Calções','Jeans']: cat = 'roupa'
+                try:
+                    db.session.execute(text(
+                        "INSERT INTO wishlist (usuario_id,descricao,preco,link,marca,categoria,estacao) VALUES (:u,:d,:p,:l,:m,:c,:e)"),
+                        {'u':usuario.id,'d':desc,'p':preco,'l':link,'m':marca,'c':cat,'e':est})
+                    db.session.commit()
+                    preco_txt = f" — {preco:.2f}€" if preco else ""
+                    enviar_mensagem(phone_raw, f"🛍️ Guardado! {desc}{preco_txt}\nDiz 'wishlist' para ver 😊")
+                except Exception as e:
+                    log.error(f"wishlist tipo: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+            else:
+                enviar_mensagem(phone_raw, "Responde com o número:\n1 T-Shirt   2 Polo   3 Camisa\n4 Sweatshirt   5 Casaco   6 Calças\n7 Calções   8 Jeans   9 Calçado   0 Outro")
+            return
             mapa = dados_estado.get('mapa', {})
             # "comprar 1" ou "comprei 1"
             m_comprar = re.search(r'(?:comprar|comprei|comprado)\s+(\d+)', t)
@@ -1673,17 +1701,46 @@ def comparar_precos_tavily(desc, marca=None):
     except Exception as e:
         log.error(f"Tavily: {e}"); return []
 
+TIPOS_ROUPA = {
+    '1':'T-Shirt', '2':'Polo', '3':'Camisa', '4':'Sweatshirt',
+    '5':'Casaco', '6':'Calças', '7':'Calções', '8':'Jeans',
+    '9':'Calçado', '0':'Outro',
+}
+
+def nome_produto_valido(nome):
+    """Verifica se o nome do produto é válido para guardar."""
+    if not nome: return False
+    # Remove referências técnicas
+    limpo = re.sub(r'\([0-9/\s]{3,}\)', '', nome).strip()
+    limpo = re.sub(r'^[0-9/\s]+$', '', limpo).strip()
+    if len(limpo) < 3: return False
+    invalidos = {'item','none','não identificado','nao identificado','produto','desconhecido','unknown'}
+    if limpo.lower() in invalidos: return False
+    if re.match(r'^[\d\s/\-]+$', limpo): return False
+    return True
+
 def limpar_nome_wishlist(nome):
-    """Remove referências técnicas do nome do produto para display."""
-    if not nome: return 'Item'
-    # Remove referências entre parênteses com números (ex: (4174/845/712), (03670382623011))
-    limpo = re.sub(r'\([0-9/\s]{4,}\)', '', nome).strip()
-    # Remove códigos de barras colados ao nome
+    """Limpa nome para display — remove referências técnicas."""
+    if not nome: return 'Artigo'
+    limpo = re.sub(r'\s*\([0-9/\s]{4,}\)', '', nome).strip()
     limpo = re.sub(r'\s+[0-9]{8,}', '', limpo).strip()
-    # Remove "Item" se sobrar nada útil
-    if limpo.lower() in ['item', ''] or re.match(r'^[\d/\s]+$', limpo):
-        return nome  # Devolve o original se não ficou nada útil
-    return limpo
+    return limpo if len(limpo) > 2 else nome
+
+def wishlist_duplicado(usuario_id, link=None, referencia=None):
+    """Verifica se o item já existe na wishlist."""
+    try:
+        if link:
+            r = db.session.execute(text(
+                "SELECT id FROM wishlist WHERE usuario_id=:u AND link=:l AND comprado=FALSE"),
+                {'u':usuario_id,'l':link}).fetchone()
+            if r: return True
+        if referencia and len(referencia) > 5:
+            r = db.session.execute(text(
+                "SELECT id FROM wishlist WHERE usuario_id=:u AND descricao LIKE :r AND comprado=FALSE"),
+                {'u':usuario_id,'r':f'%{referencia}%'}).fetchone()
+            if r: return True
+    except Exception: pass
+    return False
 
 CAT_DISPLAY = {
     'roupa':      '👗 Roupa',
@@ -1703,18 +1760,11 @@ def processar_wishlist(phone_raw, usuario, texto):
     if any(p in t for p in ['ver','lista','mostrar','wishlist','desejos']) and \
        not any(p in t for p in ['quero','gostei','adorei']):
 
-        # Filtros
         filtro_cat = next((c for c in WISHLIST_CATS if c in t), None)
         filtro_est = next((e for e in ESTACOES if e in t), None)
-        filtro_marca = None
-        for m in ['zara','nike','adidas','hm','h&m','pull','bershka','shein','mango','primor','sephora']:
-            if m in t: filtro_marca = m; break
-        # Filtro por preço
-        filtro_max = filtro_min = None
-        m_preco = re.search(r'abaixo\s+(\d+)', t)
-        if m_preco: filtro_max = float(m_preco.group(1))
-        m_preco2 = re.search(r'acima\s+(\d+)', t)
-        if m_preco2: filtro_min = float(m_preco2.group(1))
+        filtro_marca = next((m for m in ['zara','nike','adidas','hm','pull','bershka','shein','mango','primor'] if m in t), None)
+        m_max = re.search(r'abaixo\s+(\d+)', t)
+        m_min = re.search(r'acima\s+(\d+)', t)
 
         try:
             q = "SELECT id, descricao, preco, link, marca, categoria, estacao FROM wishlist WHERE usuario_id=:id AND comprado=FALSE"
@@ -1722,76 +1772,80 @@ def processar_wishlist(phone_raw, usuario, texto):
             if filtro_cat: q += " AND categoria=:cat"; params['cat'] = filtro_cat
             if filtro_est: q += " AND estacao=:est"; params['est'] = filtro_est
             if filtro_marca: q += " AND LOWER(marca) LIKE :marc"; params['marc'] = f"%{filtro_marca}%"
-            if filtro_max: q += " AND (preco IS NULL OR preco <= :max)"; params['max'] = filtro_max
-            if filtro_min: q += " AND preco >= :min"; params['min'] = filtro_min
-            q += " ORDER BY categoria, criado_em DESC"
+            if m_max: q += " AND (preco IS NULL OR preco <= :max)"; params['max'] = float(m_max.group(1))
+            if m_min: q += " AND preco >= :min"; params['min'] = float(m_min.group(1))
+            q += " ORDER BY categoria, preco DESC NULLS LAST"
             rows = db.session.execute(text(q), params).fetchall()
 
             if not rows:
-                filtro_txt = ""
-                if filtro_cat: filtro_txt = f" de {filtro_cat}"
-                elif filtro_marca: filtro_txt = f" de {filtro_marca}"
-                elif filtro_max: filtro_txt = f" abaixo de {filtro_max:.0f}€"
-                enviar_mensagem(phone_raw, f"Wishlist{filtro_txt} vazia 🛍️\nManda foto de etiqueta, link ou 'quero [produto]'!"); return
+                enviar_mensagem(phone_raw, "Wishlist vazia 🛍️\nManda foto de etiqueta, link ou 'quero [produto]'!"); return
 
             total = sum(r[2] for r in rows if r[2])
-            msg = f"🛍️ Wishlist — {len(rows)} itens"
-            if total: msg += f" | {total:.0f}€"
-            msg += "\n"
 
             # Agrupa por categoria
             por_cat = {}
-            mapa_numeros = {}  # numero → id do item
-            numero = 1
+            mapa = {}
+            n = 1
             for r in rows:
-                cat = r[6] or 'outros'  # estacao não, categoria
                 cat = r[5] or 'outros'
                 if cat not in por_cat: por_cat[cat] = []
-                por_cat[cat].append((numero, r))
-                mapa_numeros[str(numero)] = r[0]  # id da wishlist
-                numero += 1
+                por_cat[cat].append((n, r))
+                mapa[str(n)] = r[0]
+                n += 1
 
-            # Mostra por categoria
+            msg = f"🛍️ Wishlist — {len(rows)} itens\n"
+
             for cat, items in por_cat.items():
                 cat_label = CAT_DISPLAY.get(cat, f'🛒 {cat.capitalize()}')
-                msg += f"\n{cat_label} ({len(items)})\n"
+                msg += f"\n{cat_label}\n"
                 for num, r in items:
-                    nome_limpo = limpar_nome_wishlist(r[1])
-                    marca_txt = f" ({r[4]})" if r[4] else ""
-                    preco_txt = f" — {r[2]:.2f}€" if r[2] else ""
-                    est_txt   = f" · {r[6]}" if r[6] else ""
-                    msg += f"{num}️⃣ {nome_limpo}{marca_txt}{preco_txt}{est_txt}\n"
+                    nome = limpar_nome_wishlist(r[1])
+                    # Extrai referência do nome original se existir (ex: 4174/845/712)
+                    ref_match = re.search(r'\(([0-9/]{4,})\)', r[1] or '')
+                    ref_txt = f" ({ref_match.group(1)})" if ref_match else ""
+                    marca_txt = f" ({r[4]})" if r[4] and r[4].lower() not in nome.lower() else ""
+                    preco_txt = f" — {r[2]:.0f}€" if r[2] else ""
+                    est_txt   = f"  ·  {r[6]}" if r[6] else ""
+                    msg += f"{num}. {nome}{marca_txt}{ref_txt}{preco_txt}{est_txt}\n"
+                    # Mostra URL curto clicável se tiver link
+                    if r[3]:
+                        try:
+                            import urllib.parse
+                            parsed = urllib.parse.urlparse(r[3])
+                            netloc = parsed.netloc.replace('www.','')
+                            path = parsed.path
+                            url_curto = f"{netloc}{path[:40]}{'...' if len(path)>40 else ''}"
+                            msg += f"   ↗ {r[3]}\n"
+                        except Exception:
+                            msg += f"   ↗ {r[3]}\n"
 
-            msg += "\n"
-            if total: msg += f"💰 Total: {total:.0f}€\n\n"
-            msg += "comprar 1 · remover 1 · ver link 1\nwishlist roupa · wishlist abaixo 50€"
+            if total: msg += f"\n💰 Total: {total:.0f}€\n"
+            msg += "\ncomprar 3  ·  remover 3  ·  link 3"
 
-            # Guarda mapa de números no estado
-            phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-            set_estado(phone, 'wishlist_mapa', {'mapa': mapa_numeros})
+            phone_n = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+            set_estado(phone_n, 'wishlist_mapa', {'mapa': mapa})
             enviar_mensagem(phone_raw, msg)
         except Exception as e:
             log.error(f"wishlist ver: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
         return
 
-    # ── VER LINK DE ITEM ──
-    m_ver = re.search(r'ver\s+(?:link\s+)?(\d+)|link\s+(\d+)', t)
-    if m_ver:
-        num = m_ver.group(1) or m_ver.group(2)
-        estado_w, dados_w = get_estado(phone_raw.replace('@lid','').replace('@c.us','').split('@')[0])
+    # ── VER LINK ──
+    m_link = re.search(r'(?:link|ver)\s+(\d+)', t)
+    if m_link:
+        phone_n = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+        estado_w, dados_w = get_estado(phone_n)
         mapa = dados_w.get('mapa', {}) if estado_w == 'wishlist_mapa' else {}
-        item_id = mapa.get(str(num))
+        item_id = mapa.get(m_link.group(1))
         if item_id:
             try:
                 r = db.session.execute(text("SELECT descricao, link FROM wishlist WHERE id=:id"), {'id':item_id}).fetchone()
                 if r and r[1]:
-                    nome_limpo = limpar_nome_wishlist(r[0])
-                    enviar_mensagem(phone_raw, f"🔗 {nome_limpo}\n{r[1]}")
+                    enviar_mensagem(phone_raw, f"🔗 {limpar_nome_wishlist(r[0])}\n{r[1]}")
                 else:
-                    enviar_mensagem(phone_raw, f"Sem link guardado para o item {num} 😕")
+                    enviar_mensagem(phone_raw, "Sem link guardado para este item 😕")
             except Exception: enviar_mensagem(phone_raw, "Erro 😕")
         else:
-            enviar_mensagem(phone_raw, f"Não encontrei o item {num}. Diz 'wishlist' primeiro.")
+            enviar_mensagem(phone_raw, "Diz 'wishlist' primeiro para ver a lista numerada.")
         return
 
     # Link direto
@@ -1999,26 +2053,17 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
         est = detetar_estacao(desc)
         lojas = []; link_f = qr_url; preco_online = None
 
-        # 3. Se tem QR URL, vai buscar o nome oficial do produto
+        # Segue QR redirect para obter URL real e nome
         if qr_url:
-            # Segue redirects para obter o URL real do produto
             try:
                 import requests as req
                 r_redirect = req.get(qr_url, allow_redirects=True, timeout=10,
                     headers={'User-Agent': 'Mozilla/5.0'})
                 url_final = r_redirect.url
-                if url_final != qr_url and len(url_final) > len(qr_url):
-                    log.info(f"QR redirect: {qr_url} → {url_final}")
-                    link_f = url_final
-                    # Extrai nome do produto do URL final
-                    nome_from_url = extrair_nome_produto_url(url_final)
-                    if nome_from_url and len(nome_from_url) > 3:
-                        desc = nome_from_url
-                else:
-                    link_f = qr_url
-                    nome_from_qr = extrair_nome_produto_url(qr_url)
-                    if nome_from_qr and len(nome_from_qr) > 3:
-                        desc = nome_from_qr
+                link_f = url_final if url_final != qr_url else qr_url
+                nome_from_url = extrair_nome_produto_url(link_f)
+                if nome_from_url and len(nome_from_url) > 3:
+                    desc = nome_from_url
             except Exception as e:
                 log.error(f"qr redirect: {e}")
                 link_f = qr_url
@@ -2029,7 +2074,28 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
         if cat == 'outros' and marca and marca.lower().replace('&','').replace(' ','') in {m.replace('&','').replace(' ','') for m in MARCAS_ROUPA}:
             cat = 'roupa'; cat_e = '👗'
 
+        # Verifica duplicados
+        if wishlist_duplicado(usuario.id, link=link_f, referencia=ref):
+            enviar_mensagem(phone_raw, "⚠️ Este artigo já está na wishlist!\nDiz 'wishlist' para ver a lista."); return True
+
         preco_f = preco
+
+        # Valida o nome — se não for válido, pergunta ao utilizador
+        if not nome_produto_valido(desc):
+            phone_n = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+            set_estado(phone_n, 'wishlist_tipo_pendente', {
+                'marca': marca, 'preco': preco_f, 'link': link_f,
+                'cat': cat, 'est': est, 'ref': ref or ''
+            })
+            marca_txt = f" ({marca})" if marca else ""
+            preco_txt = f" — {preco_f:.2f}€" if preco_f else ""
+            msg = (f"🏷️{marca_txt}{preco_txt}\n"
+                   f"Não consegui identificar o artigo. O que é?\n\n"
+                   f"1 T-Shirt   2 Polo   3 Camisa\n"
+                   f"4 Sweatshirt   5 Casaco   6 Calças\n"
+                   f"7 Calções   8 Jeans   9 Calçado   0 Outro")
+            enviar_mensagem(phone_raw, msg); return True
+
         try:
             db.session.execute(text(
                 "INSERT INTO wishlist (usuario_id,descricao,preco,link,marca,categoria,estacao) VALUES (:u,:d,:p,:l,:m,:c,:e)"),
@@ -2041,10 +2107,8 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
         preco_txt = f" — {preco_f:.2f}€" if preco_f else ""
         marca_txt = f" ({marca})" if marca else ""
         qr_txt = " 📱 QR lido!" if qr_url else ""
-        msg = f"🛍️ {cat_e} Guardado!{qr_txt}\n{desc}{marca_txt}{preco_txt}\n"
-        if link_f:
-            msg += f"🔗 {link_f}\n"
-        msg += "\nDiz 'wishlist' para ver tudo 😊"
+        msg = f"🛍️ Guardado!{qr_txt}\n{desc}{marca_txt}{preco_txt}"
+        if link_f: msg += f"\n🔗 {link_f}"
         enviar_mensagem(phone_raw, msg); return True
     except Exception as e:
         log.error(f"etiqueta: {e}", exc_info=True); return False
