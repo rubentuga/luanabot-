@@ -1602,27 +1602,32 @@ def extrair_nome_produto_url(url):
     return url_limpo
 
 def comparar_precos_tavily(desc, marca=None):
-    """Pesquisa produto em lojas populares específicas."""
+    """Pesquisa produto e compara precos em várias lojas."""
     try:
         import requests as req, urllib.parse
+        # Query sem restrição de domínio mas com nomes de lojas
         query = f"{desc} comprar preco"
-        if marca: query = f"{marca} {query}"
+        if marca and marca.lower() not in desc.lower():
+            query = f"{marca} {desc} comprar preco"
         r = req.post("https://api.tavily.com/search",
             json={
                 'api_key': TAVILY_API_KEY,
                 'query': query,
                 'search_depth': 'advanced',
                 'max_results': 8,
-                'include_domains': [l[1] for l in LOJAS_POPULARES],
             }, timeout=20)
         if r.status_code != 200: return []
-        lojas = []
+        lojas = []; dominios_vistos = set()
         for res in r.json().get('results', []):
             url = res.get('url', ''); conteudo = res.get('content', '')
-            dominio = urllib.parse.urlparse(url).netloc.replace('www.', '')
-            parts = dominio.split('.')
+            netloc = urllib.parse.urlparse(url).netloc.replace('www.', '')
+            parts = netloc.split('.')
             nome_base = parts[-2] if len(parts) >= 3 else parts[0]
-            nome_loja = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0].lower() == nome_base.lower()), nome_base.capitalize())
+            # Só inclui lojas conhecidas
+            nome_loja = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0].lower() == nome_base.lower()), None)
+            if not nome_loja: continue
+            if nome_base in dominios_vistos: continue
+            dominios_vistos.add(nome_base)
             pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
             if pm:
                 try:
@@ -1630,12 +1635,7 @@ def comparar_precos_tavily(desc, marca=None):
                     if 0 < preco < 10000:
                         lojas.append({'loja': nome_loja, 'preco': preco, 'url': url})
                 except: pass
-        # Remove duplicados por loja (fica o mais barato)
-        vistas = {}
-        for l in sorted(lojas, key=lambda x: x['preco']):
-            if l['loja'] not in vistas:
-                vistas[l['loja']] = l
-        return sorted(vistas.values(), key=lambda x: x['preco'])[:5]
+        return sorted(lojas, key=lambda x: x['preco'])[:5]
     except Exception as e:
         log.error(f"Tavily: {e}"); return []
 
@@ -1777,36 +1777,64 @@ def processar_wishlist(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, msg)
 
 def ler_qr_code_pyzbar(image_bytes):
-    """Tenta ler QR code da imagem. Usa zxingcpp (sem deps do sistema)."""
-    # Tenta zxingcpp primeiro (sem deps do sistema)
+    """Tenta ler QR code com múltiplas abordagens."""
     try:
-        import zxingcpp
-        from PIL import Image
+        from PIL import Image, ImageEnhance, ImageFilter
         import io
-        img = Image.open(io.BytesIO(image_bytes))
-        results = zxingcpp.read_barcodes(img)
-        for r in results:
-            log.info(f"QR zxingcpp: {r.text}")
-            return r.text
-    except ImportError:
-        pass
-    except Exception as e:
-        log.error(f"zxingcpp: {e}")
 
-    # Fallback: pyzbar
-    try:
-        from pyzbar.pyzbar import decode
-        from PIL import Image
-        import io
-        img = Image.open(io.BytesIO(image_bytes))
-        decoded = decode(img)
-        for d in decoded:
-            result = d.data.decode('utf-8')
-            log.info(f"QR pyzbar: {result}")
-            return result
-    except Exception as e:
-        log.error(f"pyzbar: {e}")
+        img_orig = Image.open(io.BytesIO(image_bytes)).convert('RGB')
 
+        # Prepara várias versões da imagem para aumentar chances de leitura
+        versoes = []
+
+        # 1. Original em grayscale
+        versoes.append(img_orig.convert('L'))
+
+        # 2. Aumentada 2x + grayscale
+        w, h = img_orig.size
+        img_grande = img_orig.resize((w*2, h*2), Image.LANCZOS)
+        versoes.append(img_grande.convert('L'))
+
+        # 3. Alto contraste
+        img_contraste = ImageEnhance.Contrast(img_orig).enhance(2.0)
+        versoes.append(img_contraste.convert('L'))
+
+        # 4. Nitidez aumentada
+        img_sharp = ImageEnhance.Sharpness(img_orig).enhance(3.0)
+        versoes.append(img_sharp.convert('L'))
+
+        # Tenta zxing-cpp em cada versão
+        try:
+            import zxingcpp
+            for img_v in versoes:
+                try:
+                    results = zxingcpp.read_barcodes(img_v)
+                    for r in results:
+                        if r.text:
+                            log.info(f"QR zxingcpp: {r.text}")
+                            return r.text
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
+        # Tenta pyzbar como fallback
+        try:
+            from pyzbar.pyzbar import decode
+            for img_v in versoes:
+                try:
+                    decoded = decode(img_v)
+                    for d in decoded:
+                        result = d.data.decode('utf-8')
+                        log.info(f"QR pyzbar: {result}")
+                        return result
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.error(f"qr: {e}")
     return None
 
 def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
