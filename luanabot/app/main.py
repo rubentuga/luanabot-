@@ -1544,6 +1544,18 @@ LOJAS_POPULARES = [
     ('Wells', 'wells.pt'), ('Wook', 'wook.pt'),
 ]
 
+def limpar_url(url):
+    """Remove parâmetros de tracking do URL."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    tracking = {'utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+                'utm_id','gad_source','gad_campaignid','gbraid','gclid','fbclid',
+                'ref','affiliate','source','medium','campaign'}
+    params_limpos = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()
+                     if k.lower() not in tracking}
+    query_limpa = urllib.parse.urlencode(params_limpos)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', query_limpa, ''))
+
 def extrair_nome_loja(url):
     """Extrai nome da loja do URL correctamente. pt.primor.eu → Primor"""
     import urllib.parse
@@ -1765,7 +1777,23 @@ def processar_wishlist(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, msg)
 
 def ler_qr_code_pyzbar(image_bytes):
-    """Tenta ler QR code da imagem com pyzbar."""
+    """Tenta ler QR code da imagem. Usa zxingcpp (sem deps do sistema)."""
+    # Tenta zxingcpp primeiro (sem deps do sistema)
+    try:
+        import zxingcpp
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(image_bytes))
+        results = zxingcpp.read_barcodes(img)
+        for r in results:
+            log.info(f"QR zxingcpp: {r.text}")
+            return r.text
+    except ImportError:
+        pass
+    except Exception as e:
+        log.error(f"zxingcpp: {e}")
+
+    # Fallback: pyzbar
     try:
         from pyzbar.pyzbar import decode
         from PIL import Image
@@ -1776,9 +1804,10 @@ def ler_qr_code_pyzbar(image_bytes):
             result = d.data.decode('utf-8')
             log.info(f"QR pyzbar: {result}")
             return result
-        return None
     except Exception as e:
-        log.error(f"pyzbar: {e}"); return None
+        log.error(f"pyzbar: {e}")
+
+    return None
 
 def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
     """Lê etiqueta com pyzbar para QR e Groq para texto."""
