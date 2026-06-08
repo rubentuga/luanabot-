@@ -57,6 +57,29 @@ OWNER_PHONE  = os.environ.get('OWNER_PHONE', '')
 PHONE_RUBEN  = os.environ.get('PHONE_RUBEN', '264909371768998')
 PHONE_LUANA  = os.environ.get('PHONE_LUANA', '84516500680875')
 
+# ── MODO CASAL ──────────────────────────────────────────────
+CASAL = {
+    PHONE_RUBEN: PHONE_LUANA,
+    PHONE_LUANA: PHONE_RUBEN,
+}
+NOMES_CASAL = {
+    PHONE_RUBEN: 'Ruben',
+    PHONE_LUANA: 'Luana',
+}
+
+def get_parceiro_phone(phone):
+    return CASAL.get(phone)
+
+def get_parceiro_raw(phone):
+    p = get_parceiro_phone(phone)
+    return f"{p}@lid" if p else None
+
+def notificar_parceiro(phone_origem, mensagem):
+    """Envia notificação ao parceiro."""
+    parceiro_raw = get_parceiro_raw(phone_origem)
+    if parceiro_raw:
+        enviar_mensagem(parceiro_raw, mensagem)
+
 def get_perfil(phone):
     """Devolve o perfil do utilizador com base no número."""
     if phone == PHONE_RUBEN:
@@ -1009,6 +1032,16 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['splits','divididos','o que me devem','pendentes']):
             ver_splits(phone_raw, usuario); return
 
+        # ── MODO CASAL ──
+        if any(p in t for p in ['resumo casal','financas casal','finanças casal','dashboard casal']):
+            enviar_resumo_casal(phone_raw, usuario); return
+
+        if re.search(r'objetivo casal|meta casal|poupar.*casal|casal.*poupar', t):
+            processar_objetivo_casal(phone_raw, usuario, texto); return
+
+        if any(p in t for p in ['quem gastou mais','comparar','competicao','competição','batalha']):
+            enviar_comparacao_casal(phone_raw, usuario); return
+
         # ── X PAGOU / MARCAR SPLIT PAGO ──
         m_pagou = re.search(r'([A-Za-zÀ-ú]{2,})\s+pagou', t)
         if m_pagou:
@@ -1124,6 +1157,14 @@ def processar_despesa(phone_raw, usuario, texto):
         else:
             msg += f"⚠️ Passaste {abs(resta_conj):.2f}€ na conjunta!"
         enviar_mensagem(phone_raw, msg)
+
+        # Notifica o parceiro
+        meu_nome = NOMES_CASAL.get(usuario.phone, 'O parceiro')
+        emoji_aviso = "💑"
+        notif_msg = (f"{emoji_aviso} *{meu_nome}* gastou {valor:.2f}€ na conjunta\n"
+                     f"📍 {nome_loja}\n"
+                     f"💑 Conjunta este mês: {gc:.2f}€ de 50€ · Resta {max(resta_conj,0):.2f}€")
+        notificar_parceiro(usuario.phone, notif_msg)
         return
 
     disp, p = calcular_disponivel(usuario)
@@ -2429,6 +2470,109 @@ def ver_splits(phone_raw, usuario):
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
         log.error(f"splits: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+# ─── MODO CASAL ───────────────────────────────────────────────
+def enviar_resumo_casal(phone_raw, usuario):
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'Tu')
+    par_nome = NOMES_CASAL.get(parceiro_phone, 'Parceiro')
+    mes = agora().month; ano = agora().year
+
+    def gastos_mes_u(u):
+        return db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==u.id, db.extract('month',Despesa.data)==mes,
+            db.extract('year',Despesa.data)==ano,
+            ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
+
+    meus_gastos = gastos_mes_u(usuario)
+    disp_m, p_m = calcular_disponivel(usuario)
+    minha_poupa = p_m.get('poupanca', 0)
+
+    conj_total = 0
+    for u in ([usuario, parceiro] if parceiro else [usuario]):
+        conj_total += db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==u.id, db.extract('month',Despesa.data)==mes,
+            db.extract('year',Despesa.data)==ano,
+            Despesa.descricao.like('[conjunta]%')).scalar() or 0
+
+    msg = f"💑 Resumo do Casal — {['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'][mes-1]}\n\n"
+    msg += f"👤 {meu_nome}\n  💸 Gastos: {meus_gastos:.0f}€  💚 Poupança: {minha_poupa:.0f}€\n"
+
+    if parceiro:
+        par_gastos = gastos_mes_u(parceiro)
+        disp_p, p_p = calcular_disponivel(parceiro)
+        par_poupa = p_p.get('poupanca', 0)
+        msg += f"\n👤 {par_nome}\n  💸 Gastos: {par_gastos:.0f}€  💚 Poupança: {par_poupa:.0f}€\n"
+        msg += f"\n💑 Conjunta: {conj_total:.0f}€ de 100€\n"
+        msg += f"💎 Poupança total do casal: {minha_poupa+par_poupa:.0f}€\n"
+        if minha_poupa > par_poupa: msg += f"\n🏆 {meu_nome} está a poupar mais!"
+        elif par_poupa > minha_poupa: msg += f"\n🏆 {par_nome} está a poupar mais!"
+        else: msg += f"\n🤝 Empate na poupança!"
+
+    try:
+        objs = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND descricao LIKE '[casal]%' AND concluido=FALSE"),
+            {'id':usuario.id}).fetchall()
+        if objs:
+            msg += "\n\n🎯 Objetivos do casal:\n"
+            for o in objs:
+                nome_obj = o[0].replace('[casal] ','')
+                pct = round(o[2]/o[1]*100) if o[1] else 0
+                barra = '█'*int(pct/10) + '░'*(10-int(pct/10))
+                msg += f"  {nome_obj}: {barra} {pct}%\n  {o[2]:.0f}€ / {o[1]:.0f}€\n"
+    except Exception: pass
+
+    enviar_mensagem(phone_raw, msg)
+
+def enviar_comparacao_casal(phone_raw, usuario):
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    if not parceiro: enviar_mensagem(phone_raw, "Ainda não tens parceiro ligado 😅"); return
+
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'Tu')
+    par_nome = NOMES_CASAL.get(parceiro_phone, 'Parceiro')
+    mes = agora().month; ano = agora().year
+
+    def g(u): return db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==u.id, db.extract('month',Despesa.data)==mes,
+        db.extract('year',Despesa.data)==ano, ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
+
+    meus = g(usuario); deles = g(parceiro); diff = abs(meus-deles)
+    msg = f"⚔️ Batalha do mês!\n\n"
+    msg += f"{'🏆' if meus<=deles else '😅'} {meu_nome}: {meus:.0f}€\n"
+    msg += f"{'🏆' if deles<=meus else '😅'} {par_nome}: {deles:.0f}€\n\n"
+    if meus < deles: msg += f"Estás a ganhar! {par_nome} gastou {diff:.0f}€ a mais 👑"
+    elif deles < meus: msg += f"{par_nome} está a ganhar! Gastaste {diff:.0f}€ a mais 😬"
+    else: msg += f"Empate perfeito! 🤝"
+    enviar_mensagem(phone_raw, msg)
+
+def processar_objetivo_casal(phone_raw, usuario, texto):
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'Tu')
+    par_nome = NOMES_CASAL.get(parceiro_phone, 'Parceiro')
+
+    m = re.search(r'(\d+(?:[.,]\d+)?)', texto)
+    valor = float(m.group(1).replace(',','.')) if m else None
+    m_desc = re.search(r'para\s+(.+?)(?:\s+em\s+|\s+até|\s*$)', texto, re.IGNORECASE)
+    desc = m_desc.group(1).strip()[:50] if m_desc else 'objetivo conjunto'
+
+    if not valor: enviar_mensagem(phone_raw, "Diz o valor! Ex: 'objetivo casal 1000€ para férias'"); return
+
+    desc_casal = f"[casal] {desc}"
+    try:
+        for u in ([usuario, parceiro] if parceiro else [usuario]):
+            db.session.execute(text(
+                "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,0)"),
+                {'u':u.id,'d':desc_casal,'v':valor})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"obj casal: {e}"); db.session.rollback()
+
+    enviar_mensagem(phone_raw, f"💑 Objetivo conjunto criado!\n🎯 {desc.capitalize()}: {valor:.0f}€\n{'👫 '+meu_nome+' + '+par_nome+' a trabalhar para isso! 💪' if parceiro else ''}")
+    if parceiro:
+        notificar_parceiro(usuario.phone, f"💑 {meu_nome} criou um objetivo conjunto!\n🎯 {desc.capitalize()}: {valor:.0f}€\nVamos a isso! 💪")
 
 # ─── OBJETIVO POUPANÇA ───────────────────────────────────────
 def processar_objetivo_poupanca(phone_raw, usuario, texto):
