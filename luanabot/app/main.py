@@ -1879,33 +1879,15 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
         lojas = []; link_f = qr_url; preco_online = None
 
         # 3. Se tem QR URL, vai buscar o nome oficial do produto
-        if qr_url and TAVILY_API_KEY:
-            enviar_mensagem(phone_raw, "📱 QR lido! A buscar o produto no site...")
-            try:
-                import requests as req
-                r2 = req.post("https://api.tavily.com/search",
-                    json={'api_key':TAVILY_API_KEY,'query':qr_url,'max_results':1,'search_depth':'basic'},
-                    timeout=15)
-                if r2.status_code == 200:
-                    results = r2.json().get('results', [])
-                    if results:
-                        titulo = results[0].get('title','')
-                        nome_limpo = re.sub(r'\s*[\|\-]\s*.*$','',titulo).strip()
-                        if len(nome_limpo) > 3: desc = nome_limpo[:80]
-                        conteudo = results[0].get('content','')
-                        pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
-                        if pm:
-                            try: preco_online = float((pm.group(1) or pm.group(2)).replace(',','.'))
-                            except: pass
-            except Exception as e:
-                log.error(f"qr fetch: {e}")
-            lojas = comparar_precos_tavily(desc, marca)
-        elif TAVILY_API_KEY and (marca or desc != 'Item'):
-            enviar_mensagem(phone_raw, f"🔍 A procurar '{desc}' nas lojas...")
-            lojas = comparar_precos_tavily(dados.get('produto','') or desc, marca)
-            if lojas: link_f = lojas[0]['url']; preco_online = lojas[0]['preco']
+        if qr_url:
+            # Extrai nome do produto do path do URL se possível
+            nome_from_qr = extrair_nome_produto_url(qr_url)
+            if nome_from_qr and len(nome_from_qr) > 3:
+                desc = nome_from_qr
+                log.info(f"Nome do QR URL: {desc}")
+            link_f = qr_url
 
-        preco_f = preco or preco_online
+        preco_f = preco
         try:
             db.session.execute(text("INSERT INTO wishlist (usuario_id,descricao,preco,link,marca,categoria,estacao) VALUES (:u,:d,:p,:l,:m,:c,:e)"),
                 {'u':usuario.id,'d':desc,'p':preco_f,'l':link_f,'m':marca,'c':cat,'e':est})
@@ -1917,18 +1899,9 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
         marca_txt = f" ({marca})" if marca else ""
         qr_txt = " 📱 QR lido!" if qr_url else ""
         msg = f"🛍️ {cat_e} Guardado!{qr_txt}\n{desc}{marca_txt}{preco_txt}\n"
-        if lojas:
-            msg += "\n💰 Preços nas lojas:\n"
-            for i, l in enumerate(lojas[:4]):
-                medalha = ['🥇','🥈','🥉','4️⃣'][i]
-                diff = ""
-                if preco_f and l['preco'] < preco_f: diff = f" (-{preco_f-l['preco']:.2f}€)"
-                elif preco_f and l['preco'] > preco_f: diff = f" (+{l['preco']-preco_f:.2f}€)"
-                msg += f"{medalha} {l['loja']}: {l['preco']:.2f}€{diff}\n"
-            if len(lojas) > 1: msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
-        else:
-            msg += "Não encontrei preços noutras lojas 😕"
-        msg += "\n\nDiz 'wishlist' para ver tudo 😊"
+        if link_f:
+            msg += f"🔗 {link_f}\n"
+        msg += "\nDiz 'wishlist' para ver tudo 😊"
         enviar_mensagem(phone_raw, msg); return True
     except Exception as e:
         log.error(f"etiqueta: {e}", exc_info=True); return False
