@@ -381,9 +381,15 @@ def webhook():
                 if resultado:
                     e_salario = 'SALARIO' in resultado.upper()
                     valor_lido = extrair_valor(resultado)
+                    # Verifica se a loja foi identificada ou ficou genérica
+                    loja_generica = re.search(r'\bLOJA\b', resultado.upper()) is not None
                     if e_salario and valor_lido > 200:
-                        enviar_mensagem(phone_raw, f'📸 Vi no recibo: {valor_lido:.2f}€ — e esse o teu salario?')
+                        enviar_mensagem(phone_raw, f'📸 Vi no recibo: {valor_lido:.2f}€ — é esse o teu salário?')
                         set_estado(phone, 'confirmar_salario', {'valor': valor_lido})
+                    elif loja_generica and valor_lido > 0:
+                        # Não identificou a loja — pergunta
+                        enviar_mensagem(phone_raw, f'📸 Vi {valor_lido:.2f}€ no talão mas não percebi a loja.\nQue loja foi? (ex: Pingo Doce, Continente, Zara...)')
+                        set_estado(phone, 'aguardar_loja_talao', {'valor': valor_lido})
                     else:
                         u_temp = Usuario.query.filter_by(phone=phone).first()
                         if u_temp and ler_etiqueta_wishlist(phone_raw, u_temp, url, mime):
@@ -393,7 +399,7 @@ def webhook():
                     u_temp = Usuario.query.filter_by(phone=phone).first()
                     if u_temp and ler_foto_km(phone_raw, u_temp, url, mime): return jsonify({'status':'ok'})
                     if u_temp and ler_etiqueta_wishlist(phone_raw, u_temp, url, mime): return jsonify({'status':'ok'})
-                    enviar_mensagem(phone_raw, "Nao consegui ler 😕 Escreve o valor!"); return jsonify({'status':'ok'})
+                    enviar_mensagem(phone_raw, "Não consegui ler 😕 Escreve o valor e a loja!"); return jsonify({'status':'ok'})
             elif 'pdf' in mime or 'application' in mime:
                 resultado = ler_pdf_salario(url)
                 if resultado:
@@ -458,9 +464,18 @@ def ler_foto_talao(url, mimetype='image/jpeg'):
             model='meta-llama/llama-4-scout-17b-16e-instruct', max_tokens=80,
             messages=[{'role':'user','content':[
                 {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img}'}},
-                {'type':'text','text':'Le este documento. Se recibo salario responde: "X,XX euros SALARIO". Se talao compra responde: "X,XX euros LOJA". Exemplo: "1327,92 euros SALARIO" ou "25,50 euros Continente". Se nao deres: erro'}
+                {'type':'text','text':(
+                    'Le este talao/recibo/documento.\n'
+                    'Se for recibo de salario: responde exatamente "X,XX euros SALARIO"\n'
+                    'Se for talao de compra: responde exatamente "X,XX euros NOME_DA_LOJA"\n'
+                    'O NOME_DA_LOJA deve ser o nome real da loja (ex: "Pingo Doce", "Continente", "Zara", "McDonald\'s").\n'
+                    'Procura o nome da loja no cabecalho do talao.\n'
+                    'Exemplos corretos: "7,27 euros Pingo Doce" ou "25,50 euros Continente" ou "1327,92 euros SALARIO"\n'
+                    'Se nao conseguires ler: responde "erro"'
+                )}
             ]}])
         txt = resp.choices[0].message.content.strip()
+        log.info(f"Talao lido: {txt}")
         return '' if 'erro' in txt.lower() else txt
     except Exception as e:
         log.error(f'Foto: {e}', exc_info=True); return ''
@@ -494,6 +509,15 @@ def processar_texto(phone_raw, phone, texto):
 
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
+
+        if estado == 'aguardar_loja_talao':
+            valor = dados_estado.get('valor', 0)
+            limpar_estado(phone)
+            if valor > 0 and texto.strip():
+                processar_despesa(phone_raw, usuario, f"{valor} {texto.strip()}")
+            else:
+                enviar_mensagem(phone_raw, "Ok! Diz: X euros [loja] — ex: 7,27 Pingo Doce")
+            return
 
         if estado == 'resumo_categoria':
             cats = dados_estado.get('cats', {})
@@ -1498,7 +1522,29 @@ LOJAS_POPULARES = [
     ('Snipes', 'snipes.com'), ('Foot Locker', 'footlocker.pt'),
     ('Primark', 'primark.com'), ('Lefties', 'lefties.com'),
     ('IKEA', 'ikea.com'), ('El Corte Inglés', 'elcorteingles.pt'),
+    # Beleza e perfumes
+    ('Primor', 'primor.eu'), ('Sephora', 'sephora.pt'),
+    ('Douglas', 'douglas.pt'), ('Notino', 'notino.pt'),
+    ('Perfumes Club', 'perfumesclub.pt'), ('Druni', 'druni.pt'),
+    ('Wells', 'wells.pt'), ('Wook', 'wook.pt'),
 ]
+
+def limpar_url(url):
+    """Remove parâmetros de tracking do URL."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    # Remove parâmetros de tracking comuns
+    params_limpos = {}
+    tracking = {'utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+                'utm_id','gad_source','gad_campaignid','gbraid','gclid','fbclid',
+                'ref','affiliate','source','medium','campaign'}
+    for k, v in urllib.parse.parse_qs(parsed.query).items():
+        if k.lower() not in tracking:
+            params_limpos[k] = v[0]
+    query_limpa = urllib.parse.urlencode(params_limpos)
+    # Remove âncoras (#...)
+    url_limpo = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', query_limpa, ''))
+    return url_limpo
 
 def comparar_precos_tavily(desc, marca=None):
     """Pesquisa produto em lojas populares específicas."""
@@ -1573,7 +1619,8 @@ def processar_wishlist(phone_raw, usuario, texto):
     # Link direto
     link_match = re.search(r'https?://\S+', texto)
     if link_match:
-        link = link_match.group(0).rstrip(')')
+        link_raw = link_match.group(0).rstrip(')')
+        link = limpar_url(link_raw)  # Remove tracking params
         enviar_mensagem(phone_raw, "🔍 A analisar o produto e a comparar preços nas lojas...")
         try:
             import requests as req, urllib.parse
