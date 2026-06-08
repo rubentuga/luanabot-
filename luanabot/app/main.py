@@ -516,6 +516,11 @@ def api_dashboard():
         "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
         {'id':usuario.id}).fetchall()
 
+    # Transações recentes (últimos 30 registos)
+    transacoes = db.session.execute(text(
+        "SELECT descricao, valor, categoria, data FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
+        {'id':usuario.id}).fetchall()
+
     nomes_mes_full = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
 
     return jsonify({
@@ -533,6 +538,7 @@ def api_dashboard():
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
         'dias_salario': dias_para_salario(),
+        'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else ''} for r in transacoes],
     })
 
 # ─── MEDIA ───────────────────────────────────────────────────
