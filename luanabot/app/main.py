@@ -6,6 +6,7 @@ try:
 except Exception:
     TZ = None
 from flask import Flask, request, jsonify
+from flask import after_this_request
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import text
 from models import db, Usuario, Despesa, Receita, DespesaFutura, ObjetivoFinanceiro, FundoEmergencia
@@ -17,11 +18,42 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Token'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
+@app.route('/api/dashboard', methods=['OPTIONS'])
+def dashboard_options():
+    return '', 204
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///luana.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
 OWNER_PHONE  = os.environ.get('OWNER_PHONE', '')
+PHONE_RUBEN  = os.environ.get('PHONE_RUBEN', '264909371768998')
+PHONE_LUANA  = os.environ.get('PHONE_LUANA', '84516500680875')
+
+def get_perfil(phone):
+    """Devolve o perfil do utilizador com base no número."""
+    if phone == PHONE_RUBEN:
+        return {
+            'nome': 'Ruben', 'genero': 'M',
+            'tratamento': 'mano', 'emoji_cumprimento': '🤙',
+            'estilo': 'direto e brincalhão entre amigos',
+            'expressoes': 'mano, bro, bora, top, fixe, boa, pa',
+            'proibido': '',
+        }
+    return {
+        'nome': 'Luana', 'genero': 'F',
+        'tratamento': 'querida', 'emoji_cumprimento': '👋',
+        'estilo': 'fofo, motivador e carinhoso',
+        'expressoes': 'querida, linda, bora, fixe, top, boa',
+        'proibido': 'brother, irmao, mano, chefe, bro, cara, rapaz',
+    }
 WAHA_URL     = os.environ.get('WAHA_URL', 'https://evolution-api-production-634b.up.railway.app')
 WAHA_API_KEY = os.environ.get('WAHA_API_KEY', 'waha123')
 WAHA_SESSION = os.environ.get('WAHA_SESSION', 'default')
@@ -421,6 +453,87 @@ def webhook():
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
+
+# ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/dashboard', methods=['GET'])
+def api_dashboard():
+    """API para o dashboard visual. Autentica por token."""
+    token = request.args.get('token') or request.headers.get('X-Token','')
+    phone = request.args.get('phone','')
+    # Token simples: primeiros 8 chars do phone + "zef"
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+
+    usuario = Usuario.query.filter_by(phone=phone).first()
+    if not usuario:
+        return jsonify({'error':'user not found'}), 404
+
+    mes = agora().month; ano = agora().year
+    mes_ant = mes-1 if mes>1 else 12; ano_ant = ano if mes>1 else ano-1
+
+    # Gastos por categoria este mês
+    por_cat = db.session.query(Despesa.categoria, db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes,
+        db.extract('year',Despesa.data)==ano
+    ).group_by(Despesa.categoria).all()
+
+    # Gastos últimos 6 meses
+    historico = []
+    for i in range(5, -1, -1):
+        m = mes - i; y = ano
+        if m <= 0: m += 12; y -= 1
+        total = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            db.extract('month',Despesa.data)==m,
+            db.extract('year',Despesa.data)==y
+        ).scalar() or 0
+        nomes = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+        historico.append({'mes': nomes[m-1], 'total': round(total, 2)})
+
+    # Disponível
+    modo = get_modo(usuario.id)
+    futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
+    total_fut = sum(d.valor_reserva_mensal for d in futuras)
+    p = calcular_plano(usuario.salario_liquido or 0, modo, total_fut)
+    gastos_mes = sum(v for _, v in por_cat)
+    disp = p['gastar'] - gastos_mes
+    reserva = get_reserva(usuario.id)
+
+    # Wishlist
+    wishlist = db.session.execute(text(
+        "SELECT descricao, preco, marca, categoria FROM wishlist WHERE usuario_id=:id AND comprado=FALSE ORDER BY criado_em DESC LIMIT 10"),
+        {'id':usuario.id}).fetchall()
+
+    # Splits pendentes
+    splits = db.session.execute(text(
+        "SELECT descricao, valor_cada, pessoa FROM splitting WHERE usuario_id=:u AND pago=FALSE"),
+        {'u':usuario.id}).fetchall()
+
+    # Objetivos
+    objetivos = db.session.execute(text(
+        "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
+        {'id':usuario.id}).fetchall()
+
+    nomes_mes_full = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+
+    return jsonify({
+        'nome': usuario.nome or 'Utilizador',
+        'mes': nomes_mes_full[mes-1],
+        'salario': usuario.salario_liquido or 0,
+        'disponivel': round(disp, 2),
+        'poupanca_prevista': p['poupanca'],
+        'reserva': reserva,
+        'modo': modo,
+        'gastos_mes': round(gastos_mes, 2),
+        'por_categoria': [{'cat': c, 'total': round(v, 2)} for c, v in sorted(por_cat, key=lambda x:-x[1])],
+        'historico_6m': historico,
+        'wishlist': [{'nome': r[0], 'preco': r[1], 'marca': r[2], 'cat': r[3]} for r in wishlist],
+        'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
+        'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
+        'dias_salario': dias_para_salario(),
+    })
 
 # ─── MEDIA ───────────────────────────────────────────────────
 def baixar_media(url):
@@ -2418,14 +2531,17 @@ def enviar_ajuda(phone_raw):
 💡 Sugestoes? Manda! 🚀""")
 
 # ─── IA ──────────────────────────────────────────────────────
-def filtrar_resposta(txt):
-    subs = [
-        (r'\bbrother\b','querida'),(r'\birmao\b','querida'),(r'\birmão\b','querida'),
-        (r'\bmano\b','linda'),(r'\bchefe\b','querida'),(r'\bbro\b','querida'),
-        (r'\bamigo\b','querida'),(r'\brapaz\b','rapariga'),(r'\bcara\b','querida'),
-        (r'\bparceiro\b','parceira'),
-    ]
-    for p, s in subs: txt = re.sub(p, s, txt, flags=re.IGNORECASE)
+def filtrar_resposta(txt, phone=None):
+    """Filtra respostas da IA conforme o perfil do utilizador."""
+    perfil = get_perfil(phone or '')
+    if perfil['genero'] == 'F':
+        subs = [
+            (r'\bbrother\b','querida'),(r'\birmao\b','querida'),(r'\birmão\b','querida'),
+            (r'\bmano\b','linda'),(r'\bchefe\b','querida'),(r'\bbro\b','querida'),
+            (r'\bamigo\b','querida'),(r'\brapaz\b','rapariga'),(r'\bcara\b','querida'),
+            (r'\bparceiro\b','parceira'),
+        ]
+        for p, s in subs: txt = re.sub(p, s, txt, flags=re.IGNORECASE)
     return txt
 
 def perguntar_ia(texto, usuario):
@@ -2433,24 +2549,30 @@ def perguntar_ia(texto, usuario):
         from groq import Groq
         disp, _ = calcular_disponivel(usuario)
         modo = get_modo(usuario.id); m = MODOS_POUPANCA[modo]
-        sys = f"""Es o Ze das Financas, assistente financeiro portugues criado pelo tuga27 para a Luana.
-REGRAS ABSOLUTAS:
-1. Fala SEMPRE no feminino: "gastaste","tens","podes","estás","foste"
-2. PROIBIDO: brother, irmao, mano, chefe, bro, cara, rapaz, amigo, parceiro
-3. Usa: querida, linda, bora, fixe, top, ena, boa
-4. Portugues europeu informal. Max 2 linhas + 1 emoji
-5. NUNCA inventes precos de gasolina — diz "usa 'gasolina mais barata no barreiro'"
-6. Se nao souberes: "Nao sei querida 🤔 Diz 'ajuda' para veres o que sei!"
+        perfil = get_perfil(usuario.phone or '')
 
-CONTEXTO: Modo {m['nome']} | {disp:.0f}€ disponivel | Salario: {usuario.salario_liquido or 'nao registado'}€
-SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports, galp/bp=gasolina"""
+        if perfil['genero'] == 'M':
+            sys = f"""És o Zé das Finanças, assistente financeiro criado pelo tuga27 para o {perfil['nome']}.
+ESTILO: português europeu informal, direto e brincalhão entre amigos.
+Usa: {perfil['expressoes']}. Trata no masculino sempre.
+Max 2 linhas + 1 emoji. NUNCA inventes preços de gasolina.
+CONTEXTO: Modo {m['nome']} | {disp:.0f}€ disponível | Salário: {usuario.salario_liquido or 'não registado'}€
+SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports"""
+        else:
+            sys = f"""És o Zé das Finanças, assistente financeiro criado pelo tuga27 para a {perfil['nome']}.
+REGRAS: fala SEMPRE no feminino. PROIBIDO: {perfil['proibido']}.
+Usa: {perfil['expressoes']}. Português europeu informal e fofo. Max 2 linhas + 1 emoji.
+NUNCA inventes preços de gasolina.
+CONTEXTO: Modo {m['nome']} | {disp:.0f}€ disponível | Salário: {usuario.salario_liquido or 'não registado'}€
+SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports"""
+
         resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
             model='llama-3.3-70b-versatile',
             messages=[{'role':'system','content':sys},{'role':'user','content':texto}],
             max_tokens=150)
-        return filtrar_resposta(resp.choices[0].message.content)
+        return filtrar_resposta(resp.choices[0].message.content, usuario.phone)
     except Exception as e:
-        log.error(f'IA: {e}'); return "Nao percebi 🤔 Diz 'ajuda'!"
+        log.error(f'IA: {e}'); return "Não percebi 🤔 Diz 'ajuda'!"
 
 # ─── SCHEDULER ───────────────────────────────────────────────
 def lembrete_recibo():
