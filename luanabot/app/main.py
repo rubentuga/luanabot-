@@ -510,7 +510,41 @@ def processar_texto(phone_raw, phone, texto):
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
-        if estado == 'aguardar_loja_talao':
+        if estado == 'wishlist_mapa':
+            mapa = dados_estado.get('mapa', {})
+            # "comprar 1" ou "comprei 1"
+            m_comprar = re.search(r'(?:comprar|comprei|comprado)\s+(\d+)', t)
+            if m_comprar:
+                num = m_comprar.group(1)
+                item_id = mapa.get(num)
+                if item_id:
+                    try:
+                        r = db.session.execute(text(
+                            "UPDATE wishlist SET comprado=TRUE WHERE id=:id AND usuario_id=:u RETURNING descricao,preco"),
+                            {'id':item_id,'u':usuario.id}).fetchone()
+                        db.session.commit()
+                        if r:
+                            nome_limpo = limpar_nome_wishlist(r[0])
+                            enviar_mensagem(phone_raw, f"✅ '{nome_limpo}' marcado como comprado! 🎉\nVai registar o gasto?")
+                    except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+                return
+            # "remover 1" ou "remove 1"
+            m_remover = re.search(r'(?:remover?|apagar?|tira[r]?)\s+(\d+)', t)
+            if m_remover:
+                num = m_remover.group(1)
+                item_id = mapa.get(num)
+                if item_id:
+                    try:
+                        r = db.session.execute(text(
+                            "DELETE FROM wishlist WHERE id=:id AND usuario_id=:u RETURNING descricao"),
+                            {'id':item_id,'u':usuario.id}).fetchone()
+                        db.session.commit()
+                        if r:
+                            nome_limpo = limpar_nome_wishlist(r[0])
+                            enviar_mensagem(phone_raw, f"🗑️ '{nome_limpo}' removido!")
+                    except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+                return
+            # Estado não consumido — continua processamento normal
             valor = dados_estado.get('valor', 0)
             limpar_estado(phone)
             if valor > 0 and texto.strip():
@@ -1639,38 +1673,125 @@ def comparar_precos_tavily(desc, marca=None):
     except Exception as e:
         log.error(f"Tavily: {e}"); return []
 
+def limpar_nome_wishlist(nome):
+    """Remove referências técnicas do nome do produto para display."""
+    if not nome: return 'Item'
+    # Remove referências entre parênteses com números (ex: (4174/845/712), (03670382623011))
+    limpo = re.sub(r'\([0-9/\s]{4,}\)', '', nome).strip()
+    # Remove códigos de barras colados ao nome
+    limpo = re.sub(r'\s+[0-9]{8,}', '', limpo).strip()
+    # Remove "Item" se sobrar nada útil
+    if limpo.lower() in ['item', ''] or re.match(r'^[\d/\s]+$', limpo):
+        return nome  # Devolve o original se não ficou nada útil
+    return limpo
+
+CAT_DISPLAY = {
+    'roupa':      '👗 Roupa',
+    'calcado':    '👟 Calçado',
+    'maquilagem': '💄 Perfumes & Beleza',
+    'acessorios': '👜 Acessórios',
+    'casa':       '🏠 Casa',
+    'tecnologia': '📱 Tecnologia',
+    'desporto':   '🏃 Desporto',
+    'outros':     '🛒 Outros',
+}
+
 def processar_wishlist(phone_raw, usuario, texto):
     t = texto.lower()
 
-    # Ver lista
+    # ── VER WISHLIST ──
     if any(p in t for p in ['ver','lista','mostrar','wishlist','desejos']) and \
-       not any(p in t for p in ['quero','gostei','adorei','link']):
+       not any(p in t for p in ['quero','gostei','adorei']):
+
+        # Filtros
         filtro_cat = next((c for c in WISHLIST_CATS if c in t), None)
         filtro_est = next((e for e in ESTACOES if e in t), None)
+        filtro_marca = None
+        for m in ['zara','nike','adidas','hm','h&m','pull','bershka','shein','mango','primor','sephora']:
+            if m in t: filtro_marca = m; break
+        # Filtro por preço
+        filtro_max = filtro_min = None
+        m_preco = re.search(r'abaixo\s+(\d+)', t)
+        if m_preco: filtro_max = float(m_preco.group(1))
+        m_preco2 = re.search(r'acima\s+(\d+)', t)
+        if m_preco2: filtro_min = float(m_preco2.group(1))
+
         try:
             q = "SELECT id, descricao, preco, link, marca, categoria, estacao FROM wishlist WHERE usuario_id=:id AND comprado=FALSE"
-            params = {'id':usuario.id}
-            if filtro_cat: q += " AND categoria=:cat"; params['cat']=filtro_cat
-            if filtro_est: q += " AND estacao=:est"; params['est']=filtro_est
-            q += " ORDER BY criado_em DESC"
+            params = {'id': usuario.id}
+            if filtro_cat: q += " AND categoria=:cat"; params['cat'] = filtro_cat
+            if filtro_est: q += " AND estacao=:est"; params['est'] = filtro_est
+            if filtro_marca: q += " AND LOWER(marca) LIKE :marc"; params['marc'] = f"%{filtro_marca}%"
+            if filtro_max: q += " AND (preco IS NULL OR preco <= :max)"; params['max'] = filtro_max
+            if filtro_min: q += " AND preco >= :min"; params['min'] = filtro_min
+            q += " ORDER BY categoria, criado_em DESC"
             rows = db.session.execute(text(q), params).fetchall()
+
             if not rows:
-                enviar_mensagem(phone_raw, "Wishlist vazia 🛍️\nManda foto de etiqueta, link ou 'quero [produto]'!"); return
+                filtro_txt = ""
+                if filtro_cat: filtro_txt = f" de {filtro_cat}"
+                elif filtro_marca: filtro_txt = f" de {filtro_marca}"
+                elif filtro_max: filtro_txt = f" abaixo de {filtro_max:.0f}€"
+                enviar_mensagem(phone_raw, f"Wishlist{filtro_txt} vazia 🛍️\nManda foto de etiqueta, link ou 'quero [produto]'!"); return
+
             total = sum(r[2] for r in rows if r[2])
-            msg = f"🛍️ Wishlist ({len(rows)} items"
+            msg = f"🛍️ Wishlist — {len(rows)} itens"
             if total: msg += f" | {total:.0f}€"
-            msg += "):\n\n"
-            for i, r in enumerate(rows[:8], 1):
-                cat_e = WISHLIST_CATS.get(r[5],('🛒',))[0] if r[5] else '🛒'
-                preco_txt = f" — {r[2]:.2f}€" if r[2] else ""
-                marca_txt = f" ({r[4]})" if r[4] else ""
-                est_txt   = f" [{r[6]}]" if r[6] else ""
-                link_txt  = f"\n   🔗 {r[3]}" if r[3] else ""
-                msg += f"{i}. {cat_e} {r[1]}{marca_txt}{preco_txt}{est_txt}{link_txt}\n"
-            msg += "\n'comprei o [nome]' | 'remove wishlist 1' | 'wishlist roupa' para filtrar"
+            msg += "\n"
+
+            # Agrupa por categoria
+            por_cat = {}
+            mapa_numeros = {}  # numero → id do item
+            numero = 1
+            for r in rows:
+                cat = r[6] or 'outros'  # estacao não, categoria
+                cat = r[5] or 'outros'
+                if cat not in por_cat: por_cat[cat] = []
+                por_cat[cat].append((numero, r))
+                mapa_numeros[str(numero)] = r[0]  # id da wishlist
+                numero += 1
+
+            # Mostra por categoria
+            for cat, items in por_cat.items():
+                cat_label = CAT_DISPLAY.get(cat, f'🛒 {cat.capitalize()}')
+                msg += f"\n{cat_label} ({len(items)})\n"
+                for num, r in items:
+                    nome_limpo = limpar_nome_wishlist(r[1])
+                    marca_txt = f" ({r[4]})" if r[4] else ""
+                    preco_txt = f" — {r[2]:.2f}€" if r[2] else ""
+                    est_txt   = f" · {r[6]}" if r[6] else ""
+                    msg += f"{num}️⃣ {nome_limpo}{marca_txt}{preco_txt}{est_txt}\n"
+
+            msg += "\n"
+            if total: msg += f"💰 Total: {total:.0f}€\n\n"
+            msg += "comprar 1 · remover 1 · ver link 1\nwishlist roupa · wishlist abaixo 50€"
+
+            # Guarda mapa de números no estado
+            phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+            set_estado(phone, 'wishlist_mapa', {'mapa': mapa_numeros})
             enviar_mensagem(phone_raw, msg)
         except Exception as e:
             log.error(f"wishlist ver: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # ── VER LINK DE ITEM ──
+    m_ver = re.search(r'ver\s+(?:link\s+)?(\d+)|link\s+(\d+)', t)
+    if m_ver:
+        num = m_ver.group(1) or m_ver.group(2)
+        estado_w, dados_w = get_estado(phone_raw.replace('@lid','').replace('@c.us','').split('@')[0])
+        mapa = dados_w.get('mapa', {}) if estado_w == 'wishlist_mapa' else {}
+        item_id = mapa.get(str(num))
+        if item_id:
+            try:
+                r = db.session.execute(text("SELECT descricao, link FROM wishlist WHERE id=:id"), {'id':item_id}).fetchone()
+                if r and r[1]:
+                    nome_limpo = limpar_nome_wishlist(r[0])
+                    enviar_mensagem(phone_raw, f"🔗 {nome_limpo}\n{r[1]}")
+                else:
+                    enviar_mensagem(phone_raw, f"Sem link guardado para o item {num} 😕")
+            except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+        else:
+            enviar_mensagem(phone_raw, f"Não encontrei o item {num}. Diz 'wishlist' primeiro.")
         return
 
     # Link direto
