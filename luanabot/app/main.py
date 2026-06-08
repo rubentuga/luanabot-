@@ -26,7 +26,27 @@ def add_cors(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
-@app.route('/api/dashboard', methods=['OPTIONS'])
+@app.route('/api/comando', methods=['POST'])
+def api_comando():
+    """Executa comando como se fosse mensagem WhatsApp do utilizador."""
+    data = request.get_json() or {}
+    phone = data.get('phone','')
+    token = data.get('token','')
+    cmd   = data.get('cmd','')
+    if not phone or token != phone[:8]+'zef':
+        return jsonify({'error':'unauthorized'}), 401
+    if not cmd:
+        return jsonify({'error':'empty command'}), 400
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error':'user not found'}), 404
+        phone_raw = f"{phone}@lid"
+        processar_texto(phone, phone_raw, cmd)
+        return jsonify({'ok': True, 'cmd': cmd})
+    except Exception as e:
+        log.error(f"api_comando: {e}")
+        return jsonify({'error': str(e)}), 500
 def dashboard_options():
     return '', 204
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///luana.db')
