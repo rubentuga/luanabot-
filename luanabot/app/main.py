@@ -792,8 +792,43 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['limpa conversa','apaga mensagens','modo discreto','limpar chat']):
             modo_discreto(phone_raw); return
 
+        # ── VW TAIGO — calcula km ao abastecer ──
+        if any(p in t for p in ['abasteci','meti gasolina','pus gasolina']) and tem_numero(texto):
+            valor_gas = extrair_valor(texto)
+            if valor_gas > 5:
+                litros = round(valor_gas / 1.9, 1)
+                km_est = round(litros / 5.4 * 100)
+                processar_despesa(phone_raw, usuario, texto)
+                enviar_mensagem(phone_raw, f"🚗 Com {valor_gas:.0f}€ tens ~{litros:.1f}L\n📍 Dá para ~{km_est} km no Taigo!\nManda foto do odómetro 📸")
+                return
+
+        # ── RESPOSTAS CURTAS ──
+        respostas_curtas = {'obrigada','obrigado','obg','thanks','fixe','ok','okay','boa','top','perfeito','ótimo','otimo'}
+        if t.strip() in respostas_curtas:
+            import random
+            resps = ["😊","De nada! 💪","Boa! 😎","Sempre! 🙌","👍"]
+            enviar_mensagem(phone_raw, random.choice(resps)); return
+
         # ── GASTO (texto/sem keyword) ──
         if tem_numero(texto) and eh_gasto(texto):
+            valor_check = extrair_valor(texto)
+            # Gasto grande
+            if valor_check >= 50:
+                disp_check, _ = calcular_disponivel(usuario)
+                if valor_check > disp_check * 0.4:
+                    processar_despesa(phone_raw, usuario, texto)
+                    enviar_mensagem(phone_raw, f"😮 {valor_check:.0f}€ de uma vez! Foi especial ou necessário? 😅")
+                    return
+            # Detetar duplicados
+            categoria_check, _, nome_check = categorizar(texto)
+            hoje_inicio = agora().replace(hour=0, minute=0, second=0, tzinfo=None)
+            valor_hoje_cat = db.session.query(db.func.sum(Despesa.valor)).filter(
+                Despesa.usuario_id==usuario.id, Despesa.categoria==categoria_check,
+                Despesa.data>=hoje_inicio).scalar() or 0
+            if valor_hoje_cat > 0 and abs(valor_check - valor_hoje_cat) < 2:
+                processar_despesa(phone_raw, usuario, texto)
+                enviar_mensagem(phone_raw, f"⚠️ Já tinhas {valor_hoje_cat:.2f}€ em {nome_check} hoje — é outro gasto?")
+                return
             processar_despesa(phone_raw, usuario, texto); return
 
         # ── IA FALLBACK ──
@@ -949,6 +984,24 @@ def enviar_plano_salario(phone_raw, usuario, salario):
         enviar_mensagem(phone_raw, f"📊 Como correu {nomes[mes_ant-1]}:")
         enviar_resumo(phone_raw, usuario, mes_ant, ano_ant)
         verificar_sobra_mes(phone_raw, usuario, mes_ant, ano_ant)
+        # Celebrar se poupou mais que o mês anterior
+        try:
+            gasto_mes_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+                Despesa.usuario_id==usuario.id,
+                db.extract('month',Despesa.data)==mes_ant,
+                db.extract('year',Despesa.data)==ano_ant,
+                ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
+            gasto_mes_ant_ant_mes = mes_ant-1 if mes_ant>1 else 12
+            gasto_mes_ant_ant_ano = ano_ant if mes_ant>1 else ano_ant-1
+            gasto_ant_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+                Despesa.usuario_id==usuario.id,
+                db.extract('month',Despesa.data)==gasto_mes_ant_ant_mes,
+                db.extract('year',Despesa.data)==gasto_mes_ant_ant_ano,
+                ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
+            if gasto_ant_ant > 0 and gasto_mes_ant < gasto_ant_ant:
+                diferenca = gasto_ant_ant - gasto_mes_ant
+                enviar_mensagem(phone_raw, f"🎉 No mês passado gastaste {diferenca:.0f}€ a menos que no mês anterior! Estás a bombar! 💪🏆")
+        except Exception: pass
     else:
         enviar_mensagem(phone_raw, "💡 Primeiro mes! A partir de agora vou guardar tudo 💪")
 
@@ -1004,18 +1057,24 @@ def enviar_quanto_tenho(phone_raw, usuario):
         Despesa.descricao.like('[conjunta]%')).scalar() or 0
     resta_conj = 50 - gc
     modo = get_modo(usuario.id); m = MODOS_POUPANCA[modo]
+    dias = dias_para_salario()
 
     msg = f"💰 Resumo de saldos {m['emoji']}\n\n"
     msg += f"💳 Para gastar: {disp:.2f}€"
     if disp < 0: msg += " ⚠️"
     msg += f"\n💑 Conjunta: {max(resta_conj,0):.2f}€ disponíveis"
     msg += f"\n💎 Poupança prevista: {p['poupanca']:.0f}€"
-    msg += f"\n🛡️ Reserva emergência: {reserva:.2f}€"
+    msg += f"\n🛡️ Reserva: {reserva:.2f}€"
+    msg += f"\n\n📅 Faltam {dias} dia{'s' if dias!=1 else ''} para o salário"
+
+    if disp > 0 and dias > 0:
+        por_dia = round(disp/dias, 2)
+        msg += f" — podes gastar ~{por_dia:.2f}€/dia"
 
     if disp < 0:
         msg += f"\n\n⚠️ Passaste o orçamento em {abs(disp):.0f}€!"
     elif disp < 30:
-        msg += f"\n\n😬 Tás quase no limite, vai com calma!"
+        msg += f"\n\n😬 Tás quase no limite!"
     enviar_mensagem(phone_raw, msg)
 
 def enviar_conjunta(phone_raw, usuario):
@@ -1072,7 +1131,8 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     if por_cat_sorted:
         msg += "\n📈 Categorias:\n"
         for i, (cat, total) in enumerate(por_cat_sorted, 1):
-            msg += f"{i}. {EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€\n"
+            pct = round(total/gp*100) if gp > 0 else 0
+            msg += f"{i}. {EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€ ({pct}%)\n"
 
     if not mes_override and agora().day > 3 and gp > 0:
         ritmo = gp/agora().day*30
@@ -1146,11 +1206,15 @@ def modo_teso(phone_raw, usuario):
     disp, _ = calcular_disponivel(usuario)
     reserva = get_reserva(usuario.id)
     dias = dias_para_salario()
-    msg = (f"😅 Modo teso!\n\n💚 Para gastar: {disp:.2f}€\n"
-           f"🛡️ Reserva: {reserva:.2f}€ (so em emergencias!)\n"
-           f"📅 ~{dias} dias p/ o salario\n\n"
-           f"Dicas:\n🍳 Cozinha em casa\n🚶 Anda a pe\n"
-           f"🛒 So o essencial\n☕ Cafe de maquina\n💪 Consegues!")
+    por_dia = round(disp/dias, 2) if dias > 0 and disp > 0 else 0
+    msg = f"😅 Modo teso!\n\n"
+    msg += f"💳 Disponível: {disp:.2f}€\n"
+    if por_dia > 0:
+        msg += f"📅 {dias} dias até ao salário → {por_dia:.2f}€/dia\n"
+    else:
+        msg += f"📅 {dias} dias até ao salário — cuidado!\n"
+    msg += f"🛡️ Reserva: {reserva:.2f}€ (só em emergências!)\n\n"
+    msg += "Dicas:\n🍳 Cozinha em casa\n🚶 Anda a pé\n🛒 Só o essencial\n☕ Café de máquina\n💪 Consegues!"
     enviar_mensagem(phone_raw, msg)
 
 # ─── CORRIGIR ────────────────────────────────────────────────
@@ -1996,8 +2060,28 @@ def aviso_meio_mes():
                     disp, p = calcular_disponivel(u)
                     gastar = p['gastar']
                     pct = (gastar-disp)/gastar*100 if gastar>0 else 0
-                    if pct > 70:
-                        enviar_mensagem(f"{u.phone}@lid", f"⚠️ A meio do mes e ja usaste {pct:.0f}% do orcamento! Vai com calma 💪")
+                    if pct >= 70:
+                        enviar_mensagem(f"{u.phone}@lid", f"⚠️ A meio do mês e já usaste {pct:.0f}% do orçamento! Vai com calma 💪")
+                    elif pct >= 50:
+                        enviar_mensagem(f"{u.phone}@lid", f"📊 Meio do mês — usaste {pct:.0f}% do orçamento. No bom caminho! 👍")
+
+def aviso_uma_semana_salario():
+    with app.app_context():
+        hoje = agora()
+        dia_pag = dia_pagamento_mes(hoje.year, hoje.month)
+        dias_falta = (dia_pag.date() - hoje.date()).days
+        if dias_falta == 7 and hoje.hour == 10:
+            for u in Usuario.query.all():
+                if u.phone and u.salario_liquido:
+                    disp, _ = calcular_disponivel(u)
+                    por_dia = round(disp/7, 2) if disp > 0 else 0
+                    if por_dia > 0:
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"⏰ Última semana antes do salário!\n"
+                            f"💳 Tens {disp:.2f}€ — dá {por_dia:.2f}€/dia até sexta 💪")
+                    else:
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"😅 Última semana e o orçamento já está no limite!\nForça, falta pouco! 💪")
 
 def aviso_fim_mes_wishlist():
     with app.app_context():
@@ -2096,6 +2180,7 @@ scheduler.add_job(lembrete_recibo,            'cron', hour=11, minute=0)
 scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
 scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
 scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
+scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
 scheduler.add_job(aviso_fim_mes_wishlist,     'cron', hour=11, minute=0)
 scheduler.add_job(resumo_semanal,             'cron', hour=9,  minute=30, day_of_week='mon')
 scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
