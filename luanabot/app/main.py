@@ -394,7 +394,8 @@ def webhook():
                         u_temp = Usuario.query.filter_by(phone=phone).first()
                         if u_temp and ler_etiqueta_wishlist(phone_raw, u_temp, url, mime):
                             return jsonify({'status':'ok'})
-                        enviar_mensagem(phone_raw, f'📸 Li: {resultado}'); texto = resultado
+                        # Vai direto para processar como gasto sem mensagem intermédia
+                        texto = resultado
                 else:
                     u_temp = Usuario.query.filter_by(phone=phone).first()
                     if u_temp and ler_foto_km(phone_raw, u_temp, url, mime): return jsonify({'status':'ok'})
@@ -806,6 +807,21 @@ def processar_texto(phone_raw, phone, texto):
 
         if any(p in t for p in ['splits','divididos','o que me devem','pendentes']):
             ver_splits(phone_raw, usuario); return
+
+        # ── X PAGOU / MARCAR SPLIT PAGO ──
+        m_pagou = re.search(r'([A-Za-zÀ-ú]{2,})\s+pagou', t)
+        if m_pagou:
+            pessoa_pagou = m_pagou.group(1).capitalize()
+            try:
+                r = db.session.execute(text(
+                    "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE RETURNING descricao,valor_cada"),
+                    {'u':usuario.id,'p':pessoa_pagou}).fetchone()
+                db.session.commit()
+                if r: enviar_mensagem(phone_raw, f"✅ {pessoa_pagou} pagou {r[1]:.2f}€ — {r[0]}! 🎉")
+                else: enviar_mensagem(phone_raw, f"Não encontrei splits pendentes com {pessoa_pagou} 🤔")
+            except Exception as e:
+                log.error(f"pagou: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+            return
 
         # ── DÍVIDAS ──
         if any(p in t for p in ['devo ','deve-me','devem-me','me deve']) and tem_numero(texto):
@@ -1528,7 +1544,35 @@ LOJAS_POPULARES = [
     ('Wells', 'wells.pt'), ('Wook', 'wook.pt'),
 ]
 
-def limpar_url(url):
+def extrair_nome_loja(url):
+    """Extrai nome da loja do URL correctamente. pt.primor.eu → Primor"""
+    import urllib.parse
+    netloc = urllib.parse.urlparse(url).netloc.replace('www.','')
+    parts = netloc.split('.')
+    # pt.primor.eu → ['pt','primor','eu'] → toma penúltimo: 'primor'
+    # zara.com → ['zara','com'] → toma primeiro: 'zara'
+    if len(parts) >= 3:
+        nome_base = parts[-2]
+    else:
+        nome_base = parts[0]
+    # Encontra nas lojas populares
+    return next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0].lower() == nome_base.lower()), nome_base.capitalize())
+
+def extrair_nome_produto_url(url):
+    """Extrai nome do produto do path do URL. /ralph-lauren-polo-67-eau-de-toilette-112592.html → Ralph Lauren Polo 67 Eau De Toilette"""
+    import urllib.parse
+    path = urllib.parse.urlparse(url).path
+    # Pega o último segmento do path
+    segmento = path.rstrip('/').split('/')[-1]
+    # Remove extensão
+    segmento = re.sub(r'\.(html?|php|aspx?).*$', '', segmento)
+    # Remove ID numérico no final (ex: -112592)
+    segmento = re.sub(r'-\d{4,}$', '', segmento)
+    # Remove parâmetros tipo _pt_pt
+    segmento = re.sub(r'^[a-z]{2}_[a-z]{2}[-_]', '', segmento)
+    # Converte hífens para espaços e capitaliza
+    nome = segmento.replace('-', ' ').replace('_', ' ').title().strip()
+    return nome if len(nome) > 3 else ''
     """Remove parâmetros de tracking do URL."""
     import urllib.parse
     parsed = urllib.parse.urlparse(url)
@@ -1563,8 +1607,10 @@ def comparar_precos_tavily(desc, marca=None):
         lojas = []
         for res in r.json().get('results', []):
             url = res.get('url', ''); conteudo = res.get('content', '')
-            dominio = urllib.parse.urlparse(url).netloc.replace('www.', '').split('.')[0]
-            nome_loja = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0] in dominio), dominio.capitalize())
+            dominio = urllib.parse.urlparse(url).netloc.replace('www.', '')
+            parts = dominio.split('.')
+            nome_base = parts[-2] if len(parts) >= 3 else parts[0]
+            nome_loja = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0].lower() == nome_base.lower()), nome_base.capitalize())
             pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
             if pm:
                 try:
@@ -1619,40 +1665,40 @@ def processar_wishlist(phone_raw, usuario, texto):
     link_match = re.search(r'https?://\S+', texto)
     if link_match:
         link_raw = link_match.group(0).rstrip(')')
-        link = limpar_url(link_raw)  # Remove tracking params
+        link = limpar_url(link_raw)
         enviar_mensagem(phone_raw, "🔍 A analisar o produto e a comparar preços nas lojas...")
         try:
-            import requests as req, urllib.parse
-            # Extrai nome da loja do link
-            dominio = urllib.parse.urlparse(link).netloc.replace('www.','').split('.')[0]
-            loja_link = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0] in dominio), dominio.capitalize())
-
-            # Busca info do produto via Tavily
-            r2 = req.post("https://api.tavily.com/search",
-                json={'api_key':TAVILY_API_KEY,'query':link,'max_results':1,'search_depth':'basic'},
-                timeout=15)
+            import requests as req
+            loja_link = extrair_nome_loja(link)
+            # Tenta extrair nome do produto do path do URL (muito mais fiável)
+            nome_from_path = extrair_nome_produto_url(link)
             nome_prod = None; preco_prod = None
+
+            # Busca info via Tavily usando o nome extraído do URL
+            query_tavily = nome_from_path if nome_from_path else link
+            r2 = req.post("https://api.tavily.com/search",
+                json={'api_key':TAVILY_API_KEY,'query':query_tavily,'max_results':2,'search_depth':'basic'},
+                timeout=15)
             if r2.status_code == 200:
                 results = r2.json().get('results', [])
                 if results:
-                    res = results[0]
-                    titulo = res.get('title', '')
-                    # Limpa o título: remove nome da loja e sufixos
-                    nome_prod = re.sub(r'\s*[\|\-]\s*.*$', '', titulo).strip()
-                    nome_prod = re.sub(r'\s*-\s*(Zara|H&M|ASOS|Shein|Mango|Nike|Adidas).*', '', nome_prod, flags=re.IGNORECASE).strip()
-                    if len(nome_prod) > 60: nome_prod = nome_prod[:60]
-                    conteudo = res.get('content', '')
+                    titulo = results[0].get('title', '')
+                    # Limpa título: remove loja e sufixos
+                    nome_limpo = re.sub(r'\s*[\|\-]\s*.*$', '', titulo).strip()
+                    nome_limpo = re.sub(r'\s*[-–]\s*(' + loja_link + r'|Portugal|PT|Shop).*', '', nome_limpo, flags=re.IGNORECASE).strip()
+                    if len(nome_limpo) > 5: nome_prod = nome_limpo[:70]
+                    conteudo = results[0].get('content', '')
                     pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
                     if pm:
                         try: preco_prod = float((pm.group(1) or pm.group(2)).replace(',','.'))
                         except: pass
 
-            if not nome_prod or len(nome_prod) < 3:
-                nome_prod = f"Produto {loja_link}"
+            # Fallback: usa nome extraído do path do URL
+            if not nome_prod or len(nome_prod) < 4:
+                nome_prod = nome_from_path or f"Produto {loja_link}"
 
             # Compara preços noutras lojas
-            lojas = comparar_precos_tavily(nome_prod, loja_link if loja_link != 'Produto' else None)
-            # Remove a loja de origem dos resultados para mostrar alternativas
+            lojas = comparar_precos_tavily(nome_prod, loja_link)
             lojas_alt = [l for l in lojas if l['loja'].lower() != loja_link.lower()]
 
         except Exception as e:
@@ -2211,6 +2257,18 @@ def aviso_meio_mes():
                         enviar_mensagem(f"{u.phone}@lid", f"⚠️ A meio do mês e já usaste {pct:.0f}% do orçamento! Vai com calma 💪")
                     elif pct >= 50:
                         enviar_mensagem(f"{u.phone}@lid", f"📊 Meio do mês — usaste {pct:.0f}% do orçamento. No bom caminho! 👍")
+
+                    # Aviso padrão combustível
+                    mes = hoje.month; ano = hoje.year
+                    mes_ant = mes-1 if mes>1 else 12; ano_ant = ano if mes>1 else ano-1
+                    gas_atual = gastos_cat_mes(u, 'combustivel', mes, ano)
+                    gas_ant   = gastos_cat_mes(u, 'combustivel', mes_ant, ano_ant)
+                    if gas_ant > 0 and gas_atual > gas_ant * 1.2:
+                        diferenca = gas_atual - gas_ant
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"⛽ Este mês já gastaste {diferenca:.0f}€ a mais em combustível que o mês passado!\n"
+                            f"Este mês: {gas_atual:.0f}€ | Mês passado: {gas_ant:.0f}€\n"
+                            f"Andaste mais ou os preços subiram? 🤔")
 
 def aviso_uma_semana_salario():
     with app.app_context():
