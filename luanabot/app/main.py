@@ -465,17 +465,16 @@ def ler_foto_talao(url, mimetype='image/jpeg'):
             messages=[{'role':'user','content':[
                 {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img}'}},
                 {'type':'text','text':(
-                    'Le este talao/recibo/documento.\n'
-                    'Se for recibo de salario: responde exatamente "X,XX euros SALARIO"\n'
-                    'Se for talao de compra: responde exatamente "X,XX euros NOME_DA_LOJA"\n'
-                    'O NOME_DA_LOJA deve ser o nome real da loja (ex: "Pingo Doce", "Continente", "Zara", "McDonald\'s").\n'
-                    'Procura o nome da loja no cabecalho do talao.\n'
-                    'Exemplos corretos: "7,27 euros Pingo Doce" ou "25,50 euros Continente" ou "1327,92 euros SALARIO"\n'
-                    'Se nao conseguires ler: responde "erro"'
+                    'Le este talao/recibo. '
+                    'Se for salario: "X,XX euros SALARIO". '
+                    'Se for talao de compra: "X,XX euros NOME_DA_LOJA" onde NOME_DA_LOJA e o nome real da loja no cabecalho (ex: Pingo Doce, Continente, Zara, McDonald\'s, Lidl). '
+                    'Exemplos: "7,27 euros Pingo Doce" ou "1327,92 euros SALARIO" ou "25,50 euros Continente". '
+                    'Nunca uses a palavra LOJA — usa sempre o nome real. '
+                    'Se nao conseguires ler: "erro"'
                 )}
             ]}])
         txt = resp.choices[0].message.content.strip()
-        log.info(f"Talao lido: {txt}")
+        log.info(f"Talao: {txt}")
         return '' if 'erro' in txt.lower() else txt
     except Exception as e:
         log.error(f'Foto: {e}', exc_info=True); return ''
@@ -1719,47 +1718,66 @@ def processar_wishlist(phone_raw, usuario, texto):
     msg += "\n\nDiz 'wishlist' para ver tudo 😊"
     enviar_mensagem(phone_raw, msg)
 
+def ler_qr_code_pyzbar(image_bytes):
+    """Tenta ler QR code da imagem com pyzbar."""
+    try:
+        from pyzbar.pyzbar import decode
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(image_bytes))
+        decoded = decode(img)
+        for d in decoded:
+            result = d.data.decode('utf-8')
+            log.info(f"QR pyzbar: {result}")
+            return result
+        return None
+    except Exception as e:
+        log.error(f"pyzbar: {e}"); return None
+
 def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
-    """Lê foto de etiqueta, tenta ler QR code, pesquisa e compara preços nas lojas populares."""
+    """Lê etiqueta com pyzbar para QR e Groq para texto."""
     try:
         from groq import Groq
         c = baixar_media(url)
         if not c: return False
+
+        # 1. Tenta ler QR code com pyzbar (muito mais fiável que vision)
+        qr_url = ler_qr_code_pyzbar(c)
+
+        # 2. Groq lê o texto da etiqueta (marca, produto, preço, referência)
         mt = 'image/png' if 'png' in mimetype else 'image/jpeg'
-        img = base64.b64encode(c).decode()
-        prompt = (
-            'Analisa esta imagem de etiqueta de produto/roupa.\n'
-            'Se tiver QR code visivel, le o URL completo.\n'
-            'Responde APENAS em JSON sem markdown:\n'
-            '{"marca":"MARCA","produto":"NOME","preco":NUMERO_OU_NULL,'
-            '"referencia":"REF_OU_NULL","tipo":"roupa/calcado/acessorio/maquilagem/outro",'
-            '"qr_url":"URL_COMPLETO_OU_NULL"}\n'
-            'Se nao for etiqueta de produto: {"erro":"nao_etiqueta"}'
-        )
+        img_b64 = base64.b64encode(c).decode()
         resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
             model='meta-llama/llama-4-scout-17b-16e-instruct', max_tokens=200,
             messages=[{'role':'user','content':[
-                {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img}'}},
-                {'type':'text','text':prompt}
+                {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img_b64}'}},
+                {'type':'text','text':(
+                    'Esta e uma etiqueta de roupa/produto. '
+                    'Le toda a informacao visivel: marca, nome do produto, preco, referencia/codigo. '
+                    'Responde APENAS em JSON sem markdown: '
+                    '{"marca":"MARCA","produto":"NOME_PRODUTO","preco":NUMERO_OU_NULL,'
+                    '"referencia":"REF_OU_NULL","tipo":"roupa/calcado/acessorio/maquilagem/outro"} '
+                    'Se nao for etiqueta: {"erro":"nao_etiqueta"}'
+                )}
             ]}])
         txt = re.sub(r'```json|```', '', resp.choices[0].message.content.strip()).strip()
         try: dados = json.loads(txt)
-        except: return False
+        except: dados = {}
         if 'erro' in dados: return False
 
-        desc   = dados.get('produto', 'Item')
-        marca  = dados.get('marca')
-        preco  = dados.get('preco')
-        ref    = dados.get('referencia')
-        tipo   = dados.get('tipo', 'outro')
-        qr_url = dados.get('qr_url')
-        if ref and ref not in ['null', 'None', None]: desc = f"{desc} ({ref})"
+        desc  = dados.get('produto') or 'Item'
+        marca = dados.get('marca')
+        preco = dados.get('preco')
+        ref   = dados.get('referencia')
+        tipo  = dados.get('tipo', 'outro')
+        if ref and str(ref) not in ['null','None','']: desc = f"{desc} ({ref})"
         cat, cat_e = detetar_cat_wishlist(desc + ' ' + tipo)
         est = detetar_estacao(desc)
         lojas = []; link_f = qr_url; preco_online = None
 
+        # 3. Se tem QR URL, vai buscar o nome oficial do produto
         if qr_url and TAVILY_API_KEY:
-            enviar_mensagem(phone_raw, "🔍 QR code lido! A procurar o produto...")
+            enviar_mensagem(phone_raw, "📱 QR lido! A buscar o produto no site...")
             try:
                 import requests as req
                 r2 = req.post("https://api.tavily.com/search",
@@ -1770,7 +1788,7 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
                     if results:
                         titulo = results[0].get('title','')
                         nome_limpo = re.sub(r'\s*[\|\-]\s*.*$','',titulo).strip()
-                        if len(nome_limpo) > 3: desc = nome_limpo
+                        if len(nome_limpo) > 3: desc = nome_limpo[:80]
                         conteudo = results[0].get('content','')
                         pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
                         if pm:
@@ -1779,9 +1797,9 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
             except Exception as e:
                 log.error(f"qr fetch: {e}")
             lojas = comparar_precos_tavily(desc, marca)
-        elif TAVILY_API_KEY and marca:
+        elif TAVILY_API_KEY and (marca or desc != 'Item'):
             enviar_mensagem(phone_raw, f"🔍 A procurar '{desc}' nas lojas...")
-            lojas = comparar_precos_tavily(dados.get('produto', ''), marca)
+            lojas = comparar_precos_tavily(dados.get('produto','') or desc, marca)
             if lojas: link_f = lojas[0]['url']; preco_online = lojas[0]['preco']
 
         preco_f = preco or preco_online
@@ -1804,8 +1822,7 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
                 if preco_f and l['preco'] < preco_f: diff = f" (-{preco_f-l['preco']:.2f}€)"
                 elif preco_f and l['preco'] > preco_f: diff = f" (+{l['preco']-preco_f:.2f}€)"
                 msg += f"{medalha} {l['loja']}: {l['preco']:.2f}€{diff}\n"
-            if len(lojas) > 1:
-                msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
+            if len(lojas) > 1: msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
         else:
             msg += "Não encontrei preços noutras lojas 😕"
         msg += "\n\nDiz 'wishlist' para ver tudo 😊"
