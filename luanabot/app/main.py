@@ -1490,26 +1490,49 @@ def detetar_estacao(texto):
         if any(p in t for p in palavras): return est
     return None
 
+LOJAS_POPULARES = [
+    ('Zara', 'zara.com'), ('H&M', 'hm.com'), ('Bershka', 'bershka.com'),
+    ('Pull&Bear', 'pullandbear.com'), ('Mango', 'mango.com'), ('ASOS', 'asos.com'),
+    ('Shein', 'shein.com'), ('Stradivarius', 'stradivarius.com'),
+    ('Nike', 'nike.com'), ('Adidas', 'adidas.pt'), ('JD Sports', 'jdsports.pt'),
+    ('Snipes', 'snipes.com'), ('Foot Locker', 'footlocker.pt'),
+    ('Primark', 'primark.com'), ('Lefties', 'lefties.com'),
+    ('IKEA', 'ikea.com'), ('El Corte Inglés', 'elcorteingles.pt'),
+]
+
 def comparar_precos_tavily(desc, marca=None):
+    """Pesquisa produto em lojas populares específicas."""
     try:
         import requests as req, urllib.parse
-        query = f"{marca + ' ' if marca else ''}{desc} comprar Portugal preco"
+        query = f"{desc} comprar preco"
+        if marca: query = f"{marca} {query}"
         r = req.post("https://api.tavily.com/search",
-            json={'api_key':TAVILY_API_KEY,'query':query,'search_depth':'advanced','max_results':5},
-            timeout=20)
+            json={
+                'api_key': TAVILY_API_KEY,
+                'query': query,
+                'search_depth': 'advanced',
+                'max_results': 8,
+                'include_domains': [l[1] for l in LOJAS_POPULARES],
+            }, timeout=20)
         if r.status_code != 200: return []
         lojas = []
-        for res in r.json().get('results',[]):
-            url = res.get('url',''); conteudo = res.get('content','')
-            dominio = urllib.parse.urlparse(url).netloc.replace('www.','').split('.')[0].capitalize()
+        for res in r.json().get('results', []):
+            url = res.get('url', ''); conteudo = res.get('content', '')
+            dominio = urllib.parse.urlparse(url).netloc.replace('www.', '').split('.')[0]
+            nome_loja = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0] in dominio), dominio.capitalize())
             pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
             if pm:
                 try:
-                    preco = float((pm.group(1) or pm.group(2)).replace(',','.'))
+                    preco = float((pm.group(1) or pm.group(2)).replace(',', '.'))
                     if 0 < preco < 10000:
-                        lojas.append({'loja':dominio,'preco':preco,'url':url})
+                        lojas.append({'loja': nome_loja, 'preco': preco, 'url': url})
                 except: pass
-        return sorted(lojas, key=lambda x:x['preco'])[:4]
+        # Remove duplicados por loja (fica o mais barato)
+        vistas = {}
+        for l in sorted(lojas, key=lambda x: x['preco']):
+            if l['loja'] not in vistas:
+                vistas[l['loja']] = l
+        return sorted(vistas.values(), key=lambda x: x['preco'])[:5]
     except Exception as e:
         log.error(f"Tavily: {e}"); return []
 
@@ -1550,35 +1573,48 @@ def processar_wishlist(phone_raw, usuario, texto):
     # Link direto
     link_match = re.search(r'https?://\S+', texto)
     if link_match:
-        link = link_match.group(0)
-        enviar_mensagem(phone_raw, "🔍 A analisar o produto...")
+        link = link_match.group(0).rstrip(')')
+        enviar_mensagem(phone_raw, "🔍 A analisar o produto e a comparar preços nas lojas...")
         try:
             import requests as req, urllib.parse
-            # Tenta buscar info do produto via Tavily
+            # Extrai nome da loja do link
+            dominio = urllib.parse.urlparse(link).netloc.replace('www.','').split('.')[0]
+            loja_link = next((l[0] for l in LOJAS_POPULARES if l[1].split('.')[0] in dominio), dominio.capitalize())
+
+            # Busca info do produto via Tavily
             r2 = req.post("https://api.tavily.com/search",
-                json={'api_key':TAVILY_API_KEY,'query':link,'max_results':3,'search_depth':'basic'},
+                json={'api_key':TAVILY_API_KEY,'query':link,'max_results':1,'search_depth':'basic'},
                 timeout=15)
-            nome_prod = 'Produto'; preco_prod = None
+            nome_prod = None; preco_prod = None
             if r2.status_code == 200:
-                results = r2.json().get('results',[])
+                results = r2.json().get('results', [])
                 if results:
                     res = results[0]
-                    nome_prod = res.get('title','Produto')[:60]
-                    # Limpa nome
-                    nome_prod = re.sub(r'\s*[\|\-]\s*.*$','',nome_prod).strip()
-                    conteudo = res.get('content','')
+                    titulo = res.get('title', '')
+                    # Limpa o título: remove nome da loja e sufixos
+                    nome_prod = re.sub(r'\s*[\|\-]\s*.*$', '', titulo).strip()
+                    nome_prod = re.sub(r'\s*-\s*(Zara|H&M|ASOS|Shein|Mango|Nike|Adidas).*', '', nome_prod, flags=re.IGNORECASE).strip()
+                    if len(nome_prod) > 60: nome_prod = nome_prod[:60]
+                    conteudo = res.get('content', '')
                     pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
                     if pm:
                         try: preco_prod = float((pm.group(1) or pm.group(2)).replace(',','.'))
                         except: pass
-            # Compara preços
-            lojas = comparar_precos_tavily(nome_prod)
+
+            if not nome_prod or len(nome_prod) < 3:
+                nome_prod = f"Produto {loja_link}"
+
+            # Compara preços noutras lojas
+            lojas = comparar_precos_tavily(nome_prod, loja_link if loja_link != 'Produto' else None)
+            # Remove a loja de origem dos resultados para mostrar alternativas
+            lojas_alt = [l for l in lojas if l['loja'].lower() != loja_link.lower()]
+
         except Exception as e:
-            log.error(f"link wishlist: {e}"); nome_prod = 'Produto'; preco_prod = None; lojas = []
+            log.error(f"link wishlist: {e}"); nome_prod = 'Produto'; preco_prod = None; lojas_alt = []; loja_link = '?'
 
         cat, cat_e = detetar_cat_wishlist(nome_prod + ' ' + texto)
         est = detetar_estacao(nome_prod + ' ' + texto)
-        preco_f = preco_prod or (lojas[0]['preco'] if lojas else None)
+        preco_f = preco_prod
 
         try:
             db.session.execute(text("INSERT INTO wishlist (usuario_id,descricao,preco,link,categoria,estacao) VALUES (:u,:d,:p,:l,:c,:e)"),
@@ -1587,15 +1623,22 @@ def processar_wishlist(phone_raw, usuario, texto):
         except Exception: db.session.rollback()
 
         preco_txt = f" — {preco_f:.2f}€" if preco_f else ""
-        msg = f"🛍️ {cat_e} {nome_prod}{preco_txt}\n"
-        if lojas:
-            msg += "\n💰 Comparação de preços:\n"
-            for i, l in enumerate(lojas[:3]):
-                msg += f"{'🥇🥈🥉'[i]} {l['loja']}: {l['preco']:.2f}€\n"
-            if len(lojas)>1: msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
+        msg = f"🛍️ {cat_e} {nome_prod}{preco_txt} ({loja_link})\n"
+        msg += "Guardado na wishlist! ✅\n"
+        if lojas_alt:
+            msg += "\n💰 Também disponível em:\n"
+            for i, l in enumerate(lojas_alt[:3]):
+                medalha = ['🥇','🥈','🥉'][i]
+                diff = ""
+                if preco_f and l['preco'] < preco_f:
+                    diff = f" (-{preco_f-l['preco']:.2f}€)"
+                elif preco_f and l['preco'] > preco_f:
+                    diff = f" (+{l['preco']-preco_f:.2f}€)"
+                msg += f"{medalha} {l['loja']}: {l['preco']:.2f}€{diff}\n"
+            if lojas_alt and preco_f and lojas_alt[0]['preco'] < preco_f:
+                msg += f"\n✅ Mais barato na {lojas_alt[0]['loja']}! ({lojas_alt[0]['preco']:.2f}€)"
         else:
-            msg += "Não encontrei comparação de preços 😕"
-        msg += "\n\nGuardado na wishlist! Diz 'wishlist' para ver 😊"
+            msg += "Não encontrei comparações 😕"
         enviar_mensagem(phone_raw, msg); return
 
     # Adicionar por texto
@@ -1630,36 +1673,68 @@ def processar_wishlist(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, msg)
 
 def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
+    """Lê foto de etiqueta, tenta ler QR code, pesquisa e compara preços nas lojas populares."""
     try:
         from groq import Groq
         c = baixar_media(url)
         if not c: return False
         mt = 'image/png' if 'png' in mimetype else 'image/jpeg'
         img = base64.b64encode(c).decode()
+        prompt = (
+            'Analisa esta imagem de etiqueta de produto/roupa.\n'
+            'Se tiver QR code visivel, le o URL completo.\n'
+            'Responde APENAS em JSON sem markdown:\n'
+            '{"marca":"MARCA","produto":"NOME","preco":NUMERO_OU_NULL,'
+            '"referencia":"REF_OU_NULL","tipo":"roupa/calcado/acessorio/maquilagem/outro",'
+            '"qr_url":"URL_COMPLETO_OU_NULL"}\n'
+            'Se nao for etiqueta de produto: {"erro":"nao_etiqueta"}'
+        )
         resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
-            model='meta-llama/llama-4-scout-17b-16e-instruct', max_tokens=150,
+            model='meta-llama/llama-4-scout-17b-16e-instruct', max_tokens=200,
             messages=[{'role':'user','content':[
                 {'type':'image_url','image_url':{'url':f'data:{mt};base64,{img}'}},
-                {'type':'text','text':'Le esta etiqueta de produto/roupa. Responde APENAS em JSON sem markdown: {"marca":"MARCA","produto":"NOME","preco":NUMERO_OU_NULL,"referencia":"REF_OU_NULL","tipo":"roupa/calcado/acessorio/maquilagem/outro"}. Se nao for etiqueta: {"erro":"nao_etiqueta"}'}
+                {'type':'text','text':prompt}
             ]}])
-        txt = re.sub(r'```json|```','', resp.choices[0].message.content.strip()).strip()
+        txt = re.sub(r'```json|```', '', resp.choices[0].message.content.strip()).strip()
         try: dados = json.loads(txt)
         except: return False
         if 'erro' in dados: return False
 
-        desc  = dados.get('produto','Item')
-        marca = dados.get('marca')
-        preco = dados.get('preco')
-        ref   = dados.get('referencia')
-        tipo  = dados.get('tipo','outro')
-        if ref and ref not in ['null','None',None]: desc = f"{desc} ({ref})"
-        cat, cat_e = detetar_cat_wishlist(desc+' '+tipo)
+        desc   = dados.get('produto', 'Item')
+        marca  = dados.get('marca')
+        preco  = dados.get('preco')
+        ref    = dados.get('referencia')
+        tipo   = dados.get('tipo', 'outro')
+        qr_url = dados.get('qr_url')
+        if ref and ref not in ['null', 'None', None]: desc = f"{desc} ({ref})"
+        cat, cat_e = detetar_cat_wishlist(desc + ' ' + tipo)
         est = detetar_estacao(desc)
+        lojas = []; link_f = qr_url; preco_online = None
 
-        lojas = []; link_f = None; preco_online = None
-        if TAVILY_API_KEY and marca:
-            enviar_mensagem(phone_raw, f"🔍 A procurar '{desc}' online...")
-            lojas = comparar_precos_tavily(dados.get('produto',''), marca)
+        if qr_url and TAVILY_API_KEY:
+            enviar_mensagem(phone_raw, "🔍 QR code lido! A procurar o produto...")
+            try:
+                import requests as req
+                r2 = req.post("https://api.tavily.com/search",
+                    json={'api_key':TAVILY_API_KEY,'query':qr_url,'max_results':1,'search_depth':'basic'},
+                    timeout=15)
+                if r2.status_code == 200:
+                    results = r2.json().get('results', [])
+                    if results:
+                        titulo = results[0].get('title','')
+                        nome_limpo = re.sub(r'\s*[\|\-]\s*.*$','',titulo).strip()
+                        if len(nome_limpo) > 3: desc = nome_limpo
+                        conteudo = results[0].get('content','')
+                        pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
+                        if pm:
+                            try: preco_online = float((pm.group(1) or pm.group(2)).replace(',','.'))
+                            except: pass
+            except Exception as e:
+                log.error(f"qr fetch: {e}")
+            lojas = comparar_precos_tavily(desc, marca)
+        elif TAVILY_API_KEY and marca:
+            enviar_mensagem(phone_raw, f"🔍 A procurar '{desc}' nas lojas...")
+            lojas = comparar_precos_tavily(dados.get('produto', ''), marca)
             if lojas: link_f = lojas[0]['url']; preco_online = lojas[0]['preco']
 
         preco_f = preco or preco_online
@@ -1672,12 +1747,20 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
 
         preco_txt = f" — {preco_f:.2f}€" if preco_f else ""
         marca_txt = f" ({marca})" if marca else ""
-        msg = f"🛍️ {cat_e} Guardado!\n{desc}{marca_txt}{preco_txt}\n"
+        qr_txt = " 📱 QR lido!" if qr_url else ""
+        msg = f"🛍️ {cat_e} Guardado!{qr_txt}\n{desc}{marca_txt}{preco_txt}\n"
         if lojas:
-            msg += "\n💰 Precos:\n"
-            for i, l in enumerate(lojas[:3]): msg += f"{'🥇🥈🥉'[i]} {l['loja']}: {l['preco']:.2f}€\n"
-            if len(lojas)>1: msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
-        else: msg += "Nao encontrei precos online 😕"
+            msg += "\n💰 Preços nas lojas:\n"
+            for i, l in enumerate(lojas[:4]):
+                medalha = ['🥇','🥈','🥉','4️⃣'][i]
+                diff = ""
+                if preco_f and l['preco'] < preco_f: diff = f" (-{preco_f-l['preco']:.2f}€)"
+                elif preco_f and l['preco'] > preco_f: diff = f" (+{l['preco']-preco_f:.2f}€)"
+                msg += f"{medalha} {l['loja']}: {l['preco']:.2f}€{diff}\n"
+            if len(lojas) > 1:
+                msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
+        else:
+            msg += "Não encontrei preços noutras lojas 😕"
         msg += "\n\nDiz 'wishlist' para ver tudo 😊"
         enviar_mensagem(phone_raw, msg); return True
     except Exception as e:
