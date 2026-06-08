@@ -1880,16 +1880,38 @@ def ler_etiqueta_wishlist(phone_raw, usuario, url, mimetype):
 
         # 3. Se tem QR URL, vai buscar o nome oficial do produto
         if qr_url:
-            # Extrai nome do produto do path do URL se possível
-            nome_from_qr = extrair_nome_produto_url(qr_url)
-            if nome_from_qr and len(nome_from_qr) > 3:
-                desc = nome_from_qr
-                log.info(f"Nome do QR URL: {desc}")
-            link_f = qr_url
+            # Segue redirects para obter o URL real do produto
+            try:
+                import requests as req
+                r_redirect = req.get(qr_url, allow_redirects=True, timeout=10,
+                    headers={'User-Agent': 'Mozilla/5.0'})
+                url_final = r_redirect.url
+                if url_final != qr_url and len(url_final) > len(qr_url):
+                    log.info(f"QR redirect: {qr_url} → {url_final}")
+                    link_f = url_final
+                    # Extrai nome do produto do URL final
+                    nome_from_url = extrair_nome_produto_url(url_final)
+                    if nome_from_url and len(nome_from_url) > 3:
+                        desc = nome_from_url
+                else:
+                    link_f = qr_url
+                    nome_from_qr = extrair_nome_produto_url(qr_url)
+                    if nome_from_qr and len(nome_from_qr) > 3:
+                        desc = nome_from_qr
+            except Exception as e:
+                log.error(f"qr redirect: {e}")
+                link_f = qr_url
+
+        # Categoria por defeito para marcas de roupa conhecidas
+        MARCAS_ROUPA = {'zara','pull&bear','pullandbear','bershka','stradivarius','hm','h&m',
+                        'mango','shein','primark','lefties','springfield','nike','adidas','jd','snipes'}
+        if cat == 'outros' and marca and marca.lower().replace('&','').replace(' ','') in {m.replace('&','').replace(' ','') for m in MARCAS_ROUPA}:
+            cat = 'roupa'; cat_e = '👗'
 
         preco_f = preco
         try:
-            db.session.execute(text("INSERT INTO wishlist (usuario_id,descricao,preco,link,marca,categoria,estacao) VALUES (:u,:d,:p,:l,:m,:c,:e)"),
+            db.session.execute(text(
+                "INSERT INTO wishlist (usuario_id,descricao,preco,link,marca,categoria,estacao) VALUES (:u,:d,:p,:l,:m,:c,:e)"),
                 {'u':usuario.id,'d':desc,'p':preco_f,'l':link_f,'m':marca,'c':cat,'e':est})
             db.session.commit()
         except Exception as e:
