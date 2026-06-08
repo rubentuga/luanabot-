@@ -101,6 +101,19 @@ LOJAS = {
     'minipreco':'supermercado','intermarche':'supermercado',
     # Casa/IKEA
     'ik':'casa','ikea':'casa','zara home':'casa',
+    # Casa/Deco
+    'ik':'casa','ikea':'casa','zara home':'casa','leroy':'casa','leroy merlin':'casa',
+    'worten casa':'casa','aki':'casa',
+    # Animais
+    'veterinario':'animais','vet':'animais','zoomalia':'animais','racao':'animais',
+    # Presentes
+    'presente':'presentes','prenda':'presentes','fnac presente':'presentes',
+    # Desporto
+    'decathlon':'desporto','sport':'desporto','ginasio':'desporto','gym':'desporto',
+    # Viagem
+    'ryanair':'viagem','tap':'viagem','booking':'viagem','airbnb':'viagem',
+    # Educação
+    'livro':'educacao','curso':'educacao','udemy':'educacao',
     # Combustível
     'bp':'combustivel','galp':'combustivel','repsol':'combustivel','shell':'combustivel',
     'prio':'combustivel','cepsa':'combustivel','gasolina':'combustivel',
@@ -135,7 +148,8 @@ EMOJI_CAT = {
     'fastfood':'🍔','restaurante':'🍽️','roupa':'👗','tecnologia':'📱',
     'supermercado':'🛒','combustivel':'⛽','gota':'🧃','saude':'💊',
     'pessoal':'💅','carro':'🚗','lazer':'🎭','subscricoes':'📺',
-    'casa':'🏠','outros':'💳',
+    'casa':'🏠','animais':'🐶','presentes':'🎁','educacao':'📚',
+    'desporto':'🏃','viagem':'✈️','outros':'💳',
 }
 CATEGORIAS_VALIDAS = list(EMOJI_CAT.keys())
 ALIAS_CAT = {
@@ -481,7 +495,92 @@ def processar_texto(phone_raw, phone, texto):
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
-        if estado == 'confirmar_salario':
+        if estado == 'resumo_categoria':
+            cats = dados_estado.get('cats', {})
+            mes_r = dados_estado.get('mes', agora().month)
+            ano_r = dados_estado.get('ano', agora().year)
+            if t.strip() in cats:
+                cat_sel = cats[t.strip()]
+                limpar_estado(phone)
+                try:
+                    rows = db.session.query(Despesa).filter(
+                        Despesa.usuario_id==usuario.id,
+                        db.extract('month',Despesa.data)==mes_r,
+                        db.extract('year',Despesa.data)==ano_r,
+                        Despesa.categoria==cat_sel
+                    ).order_by(Despesa.data.desc()).all()
+                    total = sum(d.valor for d in rows)
+                    nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+                    msg = f"{EMOJI_CAT.get(cat_sel,'💳')} {cat_sel.capitalize()} — {nomes_m[mes_r-1]}\n\n"
+                    for d in rows[:15]:
+                        desc = d.descricao.replace('[conjunta] ','').replace('[reserva] ','')[:30]
+                        msg += f"• {d.valor:.2f}€ — {desc}\n"
+                    msg += f"\n💰 Total: {total:.2f}€"
+                    enviar_mensagem(phone_raw, msg)
+                except Exception as e:
+                    log.error(f"cat detalhe: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+                return
+            else:
+                limpar_estado(phone)
+                # continua processamento normal
+
+        if estado == 'aguardar_confirmacao_wishlist':
+            desc_w = dados_estado.get('desc','')
+            preco_w = dados_estado.get('preco')
+            cat_w = dados_estado.get('cat','outros')
+            if any(p in t for p in ['sim','s','yes','1','quero','adiciona']):
+                limpar_estado(phone)
+                try:
+                    db.session.execute(text("INSERT INTO wishlist (usuario_id,descricao,preco,categoria) VALUES (:u,:d,:p,:c)"),
+                        {'u':usuario.id,'d':desc_w,'p':preco_w,'c':cat_w})
+                    db.session.commit()
+                    enviar_mensagem(phone_raw, f"🛍️ '{desc_w}' adicionado à wishlist! Diz 'wishlist' para ver 😊")
+                except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+            elif any(p in t for p in ['nao','não','n','2']):
+                limpar_estado(phone)
+                processar_despesa(phone_raw, usuario, f"{desc_w} {preco_w}€")
+            else:
+                enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
+            return
+
+        if estado == 'objetivo_data':
+            valor_obj = dados_estado.get('valor', 0)
+            desc_obj = dados_estado.get('desc', 'Objetivo')
+            limpar_estado(phone)
+            # Tenta extrair mês/data da resposta
+            meses_map2 = {'janeiro':1,'fevereiro':2,'marco':3,'março':3,'abril':4,'maio':5,'junho':6,
+                         'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12}
+            mes_alvo = None
+            for nome_m, num_m in meses_map2.items():
+                if nome_m in t: mes_alvo = num_m; break
+            if not mes_alvo:
+                m_num = re.search(r'(\d{1,2})', t)
+                if m_num: mes_alvo = int(m_num.group(1))
+            hoje = agora()
+            if mes_alvo:
+                ano_alvo = hoje.year if mes_alvo > hoje.month else hoje.year + 1
+                meses_falta = (ano_alvo - hoje.year) * 12 + (mes_alvo - hoje.month)
+                meses_falta = max(meses_falta, 1)
+            else:
+                meses_falta = 6
+            por_mes = round(valor_obj / meses_falta, 2)
+            try:
+                db.session.execute(text(
+                    "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,0)"),
+                    {'u':usuario.id,'d':desc_obj,'v':valor_obj})
+                db.session.commit()
+                nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+                mes_txt = nomes_m[mes_alvo-1] if mes_alvo else '?'
+                enviar_mensagem(phone_raw,
+                    f"🎯 Objetivo criado!\n📌 {desc_obj}: {valor_obj:.0f}€\n"
+                    f"📅 Meta: {mes_txt}\n"
+                    f"💰 Precisas de guardar ~{por_mes:.0f}€/mês durante {meses_falta} meses\n\n"
+                    f"Vou avisar-te quando atingires 25%, 50%, 75% e 100%! 💪")
+            except Exception as e:
+                log.error(f"obj data: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+            return
+
+
             if any(p in t for p in ['sim','yes','correto','certo','exato','e isso','é isso']):
                 valor = dados_estado.get('valor', 0); limpar_estado(phone)
                 processar_receita(phone_raw, usuario, f"recebi {valor}")
@@ -583,10 +682,11 @@ def processar_texto(phone_raw, phone, texto):
         # ── GASOLINA ──
         gasolina_keywords = ['gasolina mais barata','posto mais barato','gasolina barata',
                              'valor gasolina','preco gasolina','preço gasolina','onde e a gasolina',
-                             'onde é a gasolina','gasolina mais barata','combustivel mais barato']
+                             'onde é a gasolina','combustivel mais barato']
         municipios = ['barreiro','moita','seixal','almada','montijo','palmela','alcochete','setubal','setúbal']
-        if any(p in t for p in gasolina_keywords) or \
-           (any(m in t for m in municipios) and any(p in t for p in ['gasolina','combustivel','posto','barata','barato','preco','preço','valor'])):
+        e_municipio_gas = any(m in t for m in municipios) and any(p in t for p in ['gasolina','combustivel','posto','barata','barato','preco','preço','valor'])
+        e_na_local = bool(re.search(r'^e\s+(na|no)\s+(moita|barreiro|seixal|almada|montijo)[\s?!.]*$', t.strip()))
+        if any(p in t for p in gasolina_keywords) or e_municipio_gas or e_na_local:
             gasolina_barata(phone_raw, t); return
 
         # ── CONJUNTA ──
@@ -653,8 +753,17 @@ def processar_texto(phone_raw, phone, texto):
 
         # "quero X" só vai para wishlist se nao for gasto
         if t.startswith('quero ') and not any(p in t for p in ['poupar','gastar']):
-            if not eh_gasto(texto):
-                processar_wishlist(phone_raw, usuario, texto); return
+            # Mesmo com valor vai para wishlist — pergunta se é wishlist ou gasto
+            valor_q = extrair_valor(texto)
+            stop_q = {'quero','uma','um','umas','uns'}
+            palavras_q = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop_q]
+            desc_q = ' '.join(palavras_q[:4]).capitalize() if palavras_q else 'Item'
+            cat_q, _ = detetar_cat_wishlist(texto)
+            phone_tmp = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+            set_estado(phone_tmp, 'aguardar_confirmacao_wishlist', {'desc':desc_q,'preco':valor_q if valor_q>0 else None,'cat':cat_q})
+            preco_txt = f" — {valor_q:.2f}€" if valor_q > 0 else ""
+            enviar_mensagem(phone_raw, f"🛍️ {desc_q}{preco_txt}\nAdicionas à wishlist?\n1 - Sim\n2 - Não (registar como gasto)")
+            return
 
         if any(p in t for p in ['comprei o ','comprei a ','já comprei','ja comprei']):
             if tem_numero(texto): processar_despesa(phone_raw, usuario, texto)
@@ -674,6 +783,10 @@ def processar_texto(phone_raw, phone, texto):
 
         if any(p in t for p in ['splits','divididos','o que me devem','pendentes']):
             ver_splits(phone_raw, usuario); return
+
+        # ── DÍVIDAS ──
+        if any(p in t for p in ['devo ','deve-me','devem-me','me deve']) and tem_numero(texto):
+            processar_dividas(phone_raw, usuario, texto); return
 
         # ── MODO DISCRETO ──
         if any(p in t for p in ['limpa conversa','apaga mensagens','modo discreto','limpar chat']):
@@ -718,43 +831,60 @@ def processar_despesa(phone_raw, usuario, texto):
 
     mes=agora().month; ano=agora().year
     mes_ant=mes-1 if mes>1 else 12; ano_ant=ano if mes>1 else ano-1
-    total_cat     = gastos_cat_mes(usuario, categoria, mes, ano)
+    total_cat = gastos_cat_mes(usuario, categoria, mes, ano)
     total_cat_ant = gastos_cat_mes(usuario, categoria, mes_ant, ano_ant)
+
+    # Gasto na conjunta — mostra dados da conjunta, não do orçamento principal
+    if na_conjunta:
+        gc = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+            Despesa.descricao.like('[conjunta]%')).scalar() or 0
+        resta_conj = 50 - gc
+        pessoa_txt = f" (com {pessoa})" if pessoa else ""
+        msg = f"{emoji} {nome_loja} — {valor:.2f}€ 💑{pessoa_txt}\n"
+        msg += f"📊 Conjunta este mês: {gc:.2f}€ de 50€\n"
+        if resta_conj >= 0:
+            msg += f"💑 Resta: {resta_conj:.2f}€ na conjunta"
+        else:
+            msg += f"⚠️ Passaste {abs(resta_conj):.2f}€ na conjunta!"
+        enviar_mensagem(phone_raw, msg)
+        return
+
     disp, p = calcular_disponivel(usuario)
     gastar = p['gastar']
     pct_usado = ((gastar-disp)/gastar*100) if gastar>0 else 0
 
-    extra = ''
+    # Linha principal
+    pessoa_txt = f" (com {pessoa})" if pessoa else ""
+    msg = f"{emoji} {nome_loja} — {valor:.2f}€{pessoa_txt}\n"
+    msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.2f}€"
+
+    # Comentário de padrão
     inicio_semana = agora().replace(tzinfo=None) - timedelta(days=agora().weekday())
     vezes_semana = db.session.query(db.func.count(Despesa.id)).filter(
         Despesa.usuario_id==usuario.id, Despesa.categoria==categoria,
         Despesa.data>=inicio_semana).scalar() or 0
 
     if categoria=='fastfood' and vezes_semana>=3:
-        extra = f'\n😏 Ja e a {vezes_semana}a vez de fast food esta semana!'
+        msg += f"\n😏 Já é a {vezes_semana}.ª vez de fast food esta semana!"
     elif categoria=='gota' and total_cat>30:
-        extra = f'\n🧃 {total_cat:.0f}€ em bebidas este mes... abranda!'
-    elif categoria=='combustivel':
-        if total_cat>BASE_COMBUSTIVEL*1.5: extra=f'\n⛽ {total_cat:.0f}€ em gasolina, bem acima dos {BASE_COMBUSTIVEL}€!'
-        elif total_cat>BASE_COMBUSTIVEL: extra=f'\n⛽ Passaste a base de {BASE_COMBUSTIVEL}€ em gasolina'
+        msg += f"\n🧃 {total_cat:.0f}€ em bebidas este mês... abranda!"
+    elif categoria=='combustivel' and total_cat>BASE_COMBUSTIVEL:
+        msg += f"\n⛽ Passaste a base de {BASE_COMBUSTIVEL}€ em gasolina"
     elif agora().weekday() in [4,5] and agora().hour>=19 and categoria in ['restaurante','fastfood']:
-        extra = '\n🍻 Fim de semana a noite, la vem o costume!'
+        msg += "\n🍻 Fim de semana à noite, lá vem o costume!"
     elif total_cat_ant>0 and total_cat>total_cat_ant*1.3:
-        extra = f'\n⚠️ Ja gastaste mais em {categoria} que o mes passado todo!'
+        msg += f"\n⚠️ Já gastaste mais em {categoria} que o mês passado todo!"
     elif total_cat_ant>0 and total_cat<total_cat_ant*0.6:
-        extra = f'\n✅ Muito menos em {categoria} que o mes passado!'
+        msg += f"\n✅ Bem menos em {categoria} que o mês passado!"
 
-    aviso = ''
-    if pct_usado >= 100: aviso = f'\n\n🔴 Passaste o orcamento! {abs(disp):.0f}€ a mais.'
-    elif pct_usado >= 80: aviso = f'\n\n🔔 Ja usaste {pct_usado:.0f}% do orcamento!'
+    # Aviso orçamento
+    if pct_usado >= 100:
+        msg += f"\n⚠️ Passaste o orçamento em {abs(disp):.0f}€"
+    elif pct_usado >= 80:
+        msg += f"\n🔔 Usaste {pct_usado:.0f}% do orçamento"
 
-    conjunta_txt = ' (conjunta 💑)' if na_conjunta else ''
-    pessoa_txt   = f' (com {pessoa})' if pessoa else ''
-    modo = get_modo(usuario.id)
-    m_info = MODOS_POUPANCA[modo]
-    msg = (f"{emoji} Bora! {nome_loja} {valor:.2f}€{conjunta_txt}{pessoa_txt}\n"
-           f"{categoria.capitalize()}: {total_cat:.2f}€ este mes{extra}{aviso}\n"
-           f"💚 Disponivel: {disp:.2f}€ {m_info['emoji']}")
     enviar_mensagem(phone_raw, msg)
     verificar_badges(usuario, phone_raw)
 
@@ -867,16 +997,25 @@ def verificar_sobra_mes(phone_raw, usuario, mes, ano):
 def enviar_quanto_tenho(phone_raw, usuario):
     disp, p = calcular_disponivel(usuario)
     reserva = get_reserva(usuario.id)
-    modo = get_modo(usuario.id)
-    m = MODOS_POUPANCA[modo]
+    mes=agora().month; ano=agora().year
+    gc = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        Despesa.descricao.like('[conjunta]%')).scalar() or 0
+    resta_conj = 50 - gc
+    modo = get_modo(usuario.id); m = MODOS_POUPANCA[modo]
+
+    msg = f"💰 Resumo de saldos {m['emoji']}\n\n"
+    msg += f"💳 Para gastar: {disp:.2f}€"
+    if disp < 0: msg += " ⚠️"
+    msg += f"\n💑 Conjunta: {max(resta_conj,0):.2f}€ disponíveis"
+    msg += f"\n💎 Poupança prevista: {p['poupanca']:.0f}€"
+    msg += f"\n🛡️ Reserva emergência: {reserva:.2f}€"
+
     if disp < 0:
-        msg = f"😬 Passaste o orcamento em {abs(disp):.2f}€!\n🛡️ Reserva: {reserva:.2f}€"
-    elif disp < 20:
-        msg = f"💸 So tens {disp:.2f}€ para gastar. Aperta o cinto!\n🛡️ Reserva: {reserva:.2f}€"
-    else:
-        msg = (f"💚 Tens {disp:.2f}€ para gastar {m['emoji']}\n"
-               f"💎 Poupanca prevista: {p['poupanca']:.0f}€\n"
-               f"🛡️ Reserva emergencia: {reserva:.2f}€")
+        msg += f"\n\n⚠️ Passaste o orçamento em {abs(disp):.0f}€!"
+    elif disp < 30:
+        msg += f"\n\n😬 Tás quase no limite, vai com calma!"
     enviar_mensagem(phone_raw, msg)
 
 def enviar_conjunta(phone_raw, usuario):
@@ -914,6 +1053,7 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano
     ).group_by(Despesa.categoria).all()
+    por_cat_sorted = sorted(por_cat, key=lambda x:-x[1])
 
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
@@ -922,19 +1062,32 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     disp = p['gastar'] - gp
     nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
 
-    msg = f"📊 {nomes[mes-1]}\n\n💰 Receita: {receita:.0f}€\n🛒 Gastos: {gp:.2f}€"
-    if gc > 0: msg += f"\n💑 Conjunta: {gc:.2f}€"
-    msg += f"\n💚 Disponivel: {disp:.2f}€\n💎 Poupanca: {p['poupanca']:.0f}€\n\n📈 Categorias:"
-    for cat, total in sorted(por_cat, key=lambda x:-x[1]):
-        msg += f"\n{EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€"
+    msg = f"📊 {nomes[mes-1]}\n\n"
+    msg += f"💰 Receita: {receita:.0f}€\n"
+    msg += f"🛒 Gastos: {gp:.2f}€\n"
+    if gc > 0: msg += f"💑 Conjunta: {gc:.2f}€\n"
+    msg += f"💚 Disponível: {disp:.2f}€\n"
+    msg += f"💎 Poupança: {p['poupanca']:.0f}€\n"
+
+    if por_cat_sorted:
+        msg += "\n📈 Categorias:\n"
+        for i, (cat, total) in enumerate(por_cat_sorted, 1):
+            msg += f"{i}. {EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€\n"
 
     if not mes_override and agora().day > 3 and gp > 0:
         ritmo = gp/agora().day*30
-        msg += f"\n\n🔮 Ao ritmo atual: ~{ritmo:.0f}€ no fim do mes"
-        if por_cat:
-            top_cat, top_val = max(por_cat, key=lambda x:x[1])
+        msg += f"\n🔮 Ao ritmo atual: ~{ritmo:.0f}€ no fim do mês"
+        if por_cat_sorted:
+            top_cat, top_val = por_cat_sorted[0]
             if top_val > 50:
-                msg += f"\n💡 Reduz {top_cat} em 30% → poupa ~{top_val*0.3*12:.0f}€/ano"
+                msg += f"\n💡 Reduz {top_cat} 30% → poupa ~{top_val*0.3*12:.0f}€/ano"
+
+    msg += "\n\nResponde com o número para ver os detalhes de cada categoria"
+
+    # Guarda as categorias no estado para o utilizador poder selecionar
+    cats_estado = {str(i+1): cat for i, (cat, _) in enumerate(por_cat_sorted)}
+    phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+    set_estado(phone, 'resumo_categoria', {'cats': cats_estado, 'mes': mes, 'ano': ano})
     enviar_mensagem(phone_raw, msg)
 
 def enviar_plano_mes(phone_raw, usuario):
@@ -1035,7 +1188,7 @@ def processar_gasto_reserva(phone_raw, usuario, texto):
 # ─── ANIVERSÁRIOS ────────────────────────────────────────────
 def processar_aniversario(phone_raw, usuario, texto):
     t = texto.lower()
-    if any(p in t for p in ['ver','lista','quais','mostrar']) or t.strip() in ['aniversarios','aniversários']:
+    if re.search(r'\b(ver|lista|quais|mostrar)\b', t) or t.strip() in ['aniversarios','aniversários']:
         try:
             rows = db.session.execute(text(
                 "SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id ORDER BY EXTRACT(month FROM data_aniv), EXTRACT(day FROM data_aniv)"),
@@ -1324,7 +1477,7 @@ def processar_wishlist(phone_raw, usuario, texto):
                 est_txt   = f" [{r[6]}]" if r[6] else ""
                 link_txt  = f"\n   🔗 {r[3]}" if r[3] else ""
                 msg += f"{i}. {cat_e} {r[1]}{marca_txt}{preco_txt}{est_txt}{link_txt}\n"
-            msg += "\n'comprei o [nome]' | 'wishlist roupa' para filtrar"
+            msg += "\n'comprei o [nome]' | 'remove wishlist 1' | 'wishlist roupa' para filtrar"
             enviar_mensagem(phone_raw, msg)
         except Exception as e:
             log.error(f"wishlist ver: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
@@ -1334,22 +1487,51 @@ def processar_wishlist(phone_raw, usuario, texto):
     link_match = re.search(r'https?://\S+', texto)
     if link_match:
         link = link_match.group(0)
-        enviar_mensagem(phone_raw, "🔍 A analisar e a comparar precos...")
-        lojas = comparar_precos_tavily(texto.replace(link,'').strip() or 'produto')
-        cat, cat_e = detetar_cat_wishlist(texto)
-        est = detetar_estacao(texto)
-        preco_f = lojas[0]['preco'] if lojas else None
+        enviar_mensagem(phone_raw, "🔍 A analisar o produto...")
+        try:
+            import requests as req, urllib.parse
+            # Tenta buscar info do produto via Tavily
+            r2 = req.post("https://api.tavily.com/search",
+                json={'api_key':TAVILY_API_KEY,'query':link,'max_results':3,'search_depth':'basic'},
+                timeout=15)
+            nome_prod = 'Produto'; preco_prod = None
+            if r2.status_code == 200:
+                results = r2.json().get('results',[])
+                if results:
+                    res = results[0]
+                    nome_prod = res.get('title','Produto')[:60]
+                    # Limpa nome
+                    nome_prod = re.sub(r'\s*[\|\-]\s*.*$','',nome_prod).strip()
+                    conteudo = res.get('content','')
+                    pm = re.search(r'(\d{1,3}[.,]\d{2})\s*€|€\s*(\d{1,3}[.,]\d{2})', conteudo)
+                    if pm:
+                        try: preco_prod = float((pm.group(1) or pm.group(2)).replace(',','.'))
+                        except: pass
+            # Compara preços
+            lojas = comparar_precos_tavily(nome_prod)
+        except Exception as e:
+            log.error(f"link wishlist: {e}"); nome_prod = 'Produto'; preco_prod = None; lojas = []
+
+        cat, cat_e = detetar_cat_wishlist(nome_prod + ' ' + texto)
+        est = detetar_estacao(nome_prod + ' ' + texto)
+        preco_f = preco_prod or (lojas[0]['preco'] if lojas else None)
+
         try:
             db.session.execute(text("INSERT INTO wishlist (usuario_id,descricao,preco,link,categoria,estacao) VALUES (:u,:d,:p,:l,:c,:e)"),
-                {'u':usuario.id,'d':'Produto (link)','p':preco_f,'l':link,'c':cat,'e':est})
+                {'u':usuario.id,'d':nome_prod,'p':preco_f,'l':link,'c':cat,'e':est})
             db.session.commit()
         except Exception: db.session.rollback()
-        msg = f"🛍️ {cat_e} Guardado!\n"
+
+        preco_txt = f" — {preco_f:.2f}€" if preco_f else ""
+        msg = f"🛍️ {cat_e} {nome_prod}{preco_txt}\n"
         if lojas:
-            msg += "\n💰 Precos:\n"
+            msg += "\n💰 Comparação de preços:\n"
             for i, l in enumerate(lojas[:3]):
                 msg += f"{'🥇🥈🥉'[i]} {l['loja']}: {l['preco']:.2f}€\n"
             if len(lojas)>1: msg += f"\n✅ Mais barato: {lojas[0]['loja']} ({lojas[0]['preco']:.2f}€)!"
+        else:
+            msg += "Não encontrei comparação de preços 😕"
+        msg += "\n\nGuardado na wishlist! Diz 'wishlist' para ver 😊"
         enviar_mensagem(phone_raw, msg); return
 
     # Adicionar por texto
@@ -1455,9 +1637,28 @@ def marcar_wishlist_comprado(phone_raw, usuario, texto):
 
 def remover_wishlist(phone_raw, usuario, texto):
     t = texto.lower()
+    # Remove por número: "remove wishlist 1"
+    m_num = re.search(r'(?:remove|apaga|tira).*wishlist.*?(\d+)|wishlist.*?(\d+).*(?:remove|apaga)', t)
+    if m_num:
+        num = int(m_num.group(1) or m_num.group(2))
+        try:
+            rows = db.session.execute(text(
+                "SELECT id, descricao FROM wishlist WHERE usuario_id=:u AND comprado=FALSE ORDER BY criado_em DESC"),
+                {'u':usuario.id}).fetchall()
+            if 1 <= num <= len(rows):
+                item_id, item_desc = rows[num-1]
+                db.session.execute(text("DELETE FROM wishlist WHERE id=:id"), {'id':item_id})
+                db.session.commit()
+                enviar_mensagem(phone_raw, f"🗑️ '{item_desc}' removido!")
+            else:
+                enviar_mensagem(phone_raw, f"Não encontrei o item {num} 🤔 Diz 'wishlist' para ver a lista.")
+        except Exception as e:
+            log.error(f"wishlist remove num: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
     palavras = [w for w in re.findall(r'[a-zà-ú]+', t) if w not in {'remove','apaga','da','wishlist','o','a','tira'}]
     if not palavras:
-        enviar_mensagem(phone_raw, "O que queres remover? Ex: 'remove da wishlist o vestido'"); return
+        enviar_mensagem(phone_raw, "O que queres remover? Ex: 'remove wishlist 1' ou 'remove da wishlist o vestido'"); return
     chave = palavras[0]
     try:
         r = db.session.execute(text(
@@ -1465,7 +1666,7 @@ def remover_wishlist(phone_raw, usuario, texto):
             {'u':usuario.id,'c':f'%{chave}%'}).fetchone()
         db.session.commit()
         if r: enviar_mensagem(phone_raw, f"🗑️ '{r[0]}' removido!")
-        else: enviar_mensagem(phone_raw, f"Nao encontrei '{chave}' 🤔")
+        else: enviar_mensagem(phone_raw, f"Não encontrei '{chave}' 🤔")
     except Exception as e:
         log.error(f"wishlist remove: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
@@ -1532,9 +1733,54 @@ def processar_splitting(phone_raw, usuario, texto):
         db.session.execute(text("INSERT INTO splitting (usuario_id,descricao,valor_total,valor_cada,pessoa) VALUES (:u,:d,:vt,:vc,:p)"),
             {'u':usuario.id,'d':desc,'vt':valor,'vc':valor_cada,'p':pessoa})
         db.session.commit()
-        enviar_mensagem(phone_raw, f"✂️ Split!\n{desc}: {valor:.2f}€\nA tua parte: {valor_cada:.2f}€\n{pessoa} fica-te a dever: {valor_cada:.2f}€")
+        piadas = [
+            f"😏 Vamos ver se {pessoa} paga ou se vais ter de cobrar...",
+            f"🍀 Esperemos que {pessoa} tenha dinheiro!",
+            f"👀 {pessoa} ficou a dever-te {valor_cada:.2f}€. Boa sorte!",
+            f"😂 Já foste, {pessoa} nunca vai pagar mas tá registado!",
+        ]
+        import random
+        enviar_mensagem(phone_raw,
+            f"✂️ {desc}: {valor:.2f}€\n"
+            f"💸 {pessoa} deve-te {valor_cada:.2f}€\n"
+            f"{random.choice(piadas)}")
     except Exception as e:
         log.error(f"splitting: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+def processar_dividas(phone_raw, usuario, texto):
+    """Regista dívidas — 'devo X ao Y' ou 'Y deve-me X'"""
+    t = texto.lower()
+    valor = extrair_valor(texto)
+    if valor == 0:
+        enviar_mensagem(phone_raw, "Qual é o valor? Ex: 'devo 20€ ao João'"); return
+
+    # Deteta direção da dívida
+    eu_devo = any(p in t for p in ['devo','tenho que pagar','preciso pagar'])
+    m_pessoa = re.search(r'(?:ao|à|a|ao|para o|para a)\s+([A-Za-zÀ-ú]+)', texto, re.IGNORECASE)
+    if not m_pessoa:
+        m_pessoa = re.search(r'([A-Za-zÀ-ú]+)\s+deve', texto, re.IGNORECASE)
+        eu_devo = False
+
+    pessoa = m_pessoa.group(1).capitalize() if m_pessoa else 'Alguem'
+
+    stop = {'devo','deve','me','ao','à','a','euros','euro','pagar','tenho','preciso','para'}
+    palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
+    desc = ' '.join(palavras[:2]).capitalize() if palavras else 'Dívida'
+
+    try:
+        if eu_devo:
+            # Regista como splitting onde eu devo
+            db.session.execute(text("INSERT INTO splitting (usuario_id,descricao,valor_total,valor_cada,pessoa,pago) VALUES (:u,:d,:vt,:vc,:p,FALSE)"),
+                {'u':usuario.id,'d':f'[EU DEVO] {desc}','vt':valor,'vc':valor,'p':pessoa})
+            db.session.commit()
+            enviar_mensagem(phone_raw, f"📝 Anotado! Deves {valor:.2f}€ ao {pessoa}\nNão te esqueças de pagar! 😬")
+        else:
+            db.session.execute(text("INSERT INTO splitting (usuario_id,descricao,valor_total,valor_cada,pessoa,pago) VALUES (:u,:d,:vt,:vc,:p,FALSE)"),
+                {'u':usuario.id,'d':desc,'vt':valor,'vc':valor,'p':pessoa})
+            db.session.commit()
+            enviar_mensagem(phone_raw, f"📝 Anotado! {pessoa} deve-te {valor:.2f}€\n😏 Vamos ver quando aparece com o dinheiro...")
+    except Exception as e:
+        log.error(f"dividas: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
 def ver_splits(phone_raw, usuario):
     try:
@@ -1574,23 +1820,15 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
     valor = extrair_valor(texto)
     if valor == 0:
         enviar_mensagem(phone_raw, "Quanto queres poupar? Ex: 'quero poupar 500€ para ferias'"); return
-    stop = {'quero','poupar','para','objetivo','meta','de','poupanca','poupança'}
+    stop = {'quero','poupar','para','objetivo','meta','de','poupanca','poupança','euros','euro'}
     palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
     desc = ' '.join(palavras[:3]).capitalize() if palavras else 'Objetivo'
-    try:
-        db.session.execute(text(
-            "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,0)"),
-            {'u':usuario.id,'d':desc,'v':valor})
-        db.session.commit()
-        modo = get_modo(usuario.id)
-        p = calcular_plano(usuario.salario_liquido or 0, modo)
-        meses_est = round(valor/p['poupanca']) if p['poupanca']>0 else '?'
-        enviar_mensagem(phone_raw,
-            f"🎯 Objetivo criado!\n📌 {desc}: {valor:.0f}€\n"
-            f"⏱️ Ao ritmo atual (~{p['poupanca']:.0f}€/mes) chegas la em ~{meses_est} meses 💪\n"
-            f"Diz 'objetivos' para ver o progresso")
-    except Exception as e:
-        log.error(f"criar objetivo: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+    # Pergunta quando quer atingir
+    phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+    set_estado(phone, 'objetivo_data', {'valor': valor, 'desc': desc})
+    enviar_mensagem(phone_raw,
+        f"🎯 Boa! {desc}: {valor:.0f}€\n\n📅 Quando queres atingir este objetivo?\nEx: 'dezembro', 'março', 'daqui a 3 meses'")
 
 # ─── MODO DISCRETO ───────────────────────────────────────────
 def modo_discreto(phone_raw):
