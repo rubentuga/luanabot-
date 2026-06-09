@@ -1535,12 +1535,19 @@ def enviar_conjunta(phone_raw, usuario):
     parceiro_phone = get_parceiro_phone(usuario.phone)
     parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
     ids = [usuario.id] + ([parceiro.id] if parceiro else [])
+    # Buscar depositos por pessoa
+    depositos = []
     total = 0
     for uid in ids:
-        total += db.session.execute(text(
+        val = db.session.execute(text(
             "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
             "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
         ), {'u': uid, 'm': mes, 'y': ano}).scalar() or 0
+        if val > 0:
+            u_obj = Usuario.query.get(uid)
+            nome = NOMES_CASAL.get(u_obj.phone, u_obj.nome or 'Parceiro') if u_obj else 'Parceiro'
+            depositos.append(f"💸 {nome} meteu: {val:.0f}€")
+            total += val
     resta = total - gasto
     if total == 0:
         enviar_mensagem(phone_raw,
@@ -1549,12 +1556,14 @@ def enviar_conjunta(phone_raw, usuario):
             f"Para meter: 'metemos 80 na conjunta'")
         return
     status = "Dentro!" if resta >= 0 else f"Passaram {abs(resta):.0f} euros!"
+    depositos_txt = "\n".join(depositos)
     enviar_mensagem(phone_raw,
-        f"💑 Conta conjunta\n"
+        f"💑 Conta conjunta\n\n"
+        f"{depositos_txt}\n\n"
         f"💰 Total: {total:.0f}€\n"
         f"🛒 Gasto: {gasto:.2f}€\n"
         f"💚 Resta: {max(resta,0):.2f}€ {status}\n\n"
-        f"Para meter mais: 'metemos 50 na conjunta'")
+        f"Para meter mais: 'metemos X na conjunta'")
 
 def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     mes = mes_override or agora().month
