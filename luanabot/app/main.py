@@ -1079,7 +1079,7 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in gasolina_keywords) or e_municipio_gas or e_na_local:
             gasolina_barata(phone_raw, t); return
 
-        if any(p in t for p in ['recebemos','metemos na conjunta']) and 'conjunta' in t and tem_numero(texto):
+        if any(p in t for p in ['recebemos','metemos','depositamos','deposito']) and 'conjunta' in t and tem_numero(texto):
             registar_deposito_conjunta(phone_raw, usuario, texto); return
         # ── CONJUNTA ──
         if 'conjunta' in t and any(p in t for p in ['quanto','tenho','sobra','resta','ver']):
