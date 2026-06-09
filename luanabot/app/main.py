@@ -116,6 +116,14 @@ MODOS_POUPANCA = {
 }
 MODO_DEFAULT = 'equilibrado'
 
+# ─── HORÁRIO RUBEN (horas extras) ───────────────────────────
+HORARIO_RUBEN = {
+    'dias_normais': [1, 2, 3, 4, 5],  # Ter Qua Qui Sex Sab
+    'dias_folga':   [0, 6],            # Seg Dom
+    'horas_dia':    7,
+    'hora_entrada': 9,
+}
+
 scheduler = BackgroundScheduler()
 
 def agora():
@@ -278,6 +286,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS picos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50) NOT NULL, data DATE NOT NULL, entrada TIMESTAMP, saida TIMESTAMP, horas_trabalhadas FLOAT DEFAULT 0, horas_extra FLOAT DEFAULT 0, dia_folga BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_phone, data))",
         "CREATE TABLE IF NOT EXISTS aniversarios (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), data_aniv DATE)",
         "CREATE TABLE IF NOT EXISTS wishlist (id SERIAL PRIMARY KEY, usuario_id INTEGER, descricao VARCHAR(200), preco FLOAT, link VARCHAR(500), marca VARCHAR(100), categoria VARCHAR(50), estacao VARCHAR(20), comprado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS splitting (id SERIAL PRIMARY KEY, usuario_id INTEGER, descricao VARCHAR(200), valor_total FLOAT, valor_cada FLOAT, pessoa VARCHAR(100), pago BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
@@ -659,6 +668,121 @@ def ler_pdf_salario(url):
     except Exception as e:
         log.error(f'PDF: {e}'); return None
 
+
+# ─── PICOS / HORAS EXTRAS ────────────────────────────────────
+def _parse_hora_pico(texto):
+    m = re.search(r"(\d{1,2})(?:[h:](\d{0,2}))?", texto.strip().lower())
+    if not m: return None
+    hora = int(m.group(1)); minuto = int(m.group(2)) if m.group(2) else 0
+    return (hora, minuto) if 0 <= hora <= 23 and 0 <= minuto <= 59 else None
+
+def _eh_dia_folga_ruben(d):
+    return d.weekday() in HORARIO_RUBEN["dias_folga"]
+
+def pico_entrada(phone, texto):
+    agora_dt = agora().replace(tzinfo=None); hora_entrada = agora_dt
+    parte = re.sub(r"entr(ei|e|a)", "", texto.lower()).strip()
+    if parte:
+        h = _parse_hora_pico(parte)
+        if h: hora_entrada = agora_dt.replace(hour=h[0], minute=h[1], second=0, microsecond=0)
+    hoje = hora_entrada.date(); folga = _eh_dia_folga_ruben(hoje)
+    dias_pt = ["Seg","Ter","Qua","Qui","Sex","Sab","Dom"]
+    try:
+        db.session.execute(text(
+            "INSERT INTO picos (user_phone,data,entrada,dia_folga) VALUES (:p,:d,:e,:f) "
+            "ON CONFLICT (user_phone,data) DO UPDATE SET entrada=EXCLUDED.entrada,dia_folga=EXCLUDED.dia_folga"),
+            {"p":phone,"d":hoje,"e":hora_entrada,"f":folga})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"pico_entrada: {e}"); db.session.rollback(); return "Erro ao registar entrada"
+    aviso = "\n📌 Dia de folga - tudo conta como extra!" if folga else ""
+    return (f"Entrada: {hora_entrada.strftime('%H:%M')} "
+            f"({dias_pt[hoje.weekday()]} {hoje.strftime('%d/%m')}){aviso}\nDiz sai quando saíres.")
+
+def pico_saida(phone, texto):
+    agora_dt = agora().replace(tzinfo=None); hora_saida = agora_dt
+    parte = re.sub(r"sa[ii]u?", "", texto.lower()).strip()
+    if parte:
+        h = _parse_hora_pico(parte)
+        if h: hora_saida = agora_dt.replace(hour=h[0], minute=h[1], second=0, microsecond=0)
+    hoje = hora_saida.date()
+    try:
+        row = db.session.execute(text(
+            "SELECT entrada,dia_folga FROM picos WHERE user_phone=:p AND data=:d"),
+            {"p":phone,"d":hoje}).fetchone()
+    except Exception as e:
+        log.error(f"pico_saida: {e}"); db.session.rollback(); return "Erro"
+    if not row or not row[0]:
+        return "Nao encontrei entrada de hoje.\nRegista primeiro: entrei 9h"
+    entrada = row[0]; folga = row[1]
+    horas_total = (hora_saida - entrada).total_seconds() / 3600
+    horas_extra = round(horas_total if folga else max(0, horas_total - HORARIO_RUBEN["horas_dia"]), 2)
+    try:
+        db.session.execute(text(
+            "UPDATE picos SET saida=:s,horas_trabalhadas=:ht,horas_extra=:he WHERE user_phone=:p AND data=:d"),
+            {"s":hora_saida,"ht":round(horas_total,2),"he":horas_extra,"p":phone,"d":hoje})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"pico_saida update: {e}"); db.session.rollback(); return "Erro"
+    dias_pt = ["Seg","Ter","Qua","Qui","Sex","Sab","Dom"]
+    dia_nome = dias_pt[hoje.weekday()]
+    h = int(horas_extra); m_min = int((horas_extra-h)*60)
+    extra_str = f"{h}h{m_min:02d}" if m_min else f"{h}h"
+    if horas_extra > 0:
+        return (f"Saida: {hora_saida.strftime('%H:%M')} ({dia_nome} {hoje.strftime('%d/%m')})"
+                f"\nTrabalhaste {horas_total:.1f}h - {extra_str} extra registado!")
+    return (f"Saida: {hora_saida.strftime('%H:%M')} ({dia_nome} {hoje.strftime('%d/%m')})"
+            f"\nTrabalhaste {horas_total:.1f}h - sem extras hoje.")
+
+def picos_hoje_fn(phone):
+    hoje = agora().date()
+    dias_pt = ["Seg","Ter","Qua","Qui","Sex","Sab","Dom"]
+    folga = _eh_dia_folga_ruben(hoje)
+    prefixo = f"Hoje - {dias_pt[hoje.weekday()]} {hoje.strftime('%d/%m')}"
+    if folga: prefixo += " (folga - tudo e extra)"
+    try:
+        row = db.session.execute(text(
+            "SELECT entrada,saida,horas_trabalhadas,horas_extra FROM picos WHERE user_phone=:p AND data=:d"),
+            {"p":phone,"d":hoje}).fetchone()
+    except Exception as e:
+        log.error(f"picos_hoje: {e}"); db.session.rollback(); return "Erro"
+    if not row or not row[0]:
+        return f"{prefixo}\nSem entrada. Diz entrei quando chegares."
+    entrada, saida, horas, extra = row
+    if not saida:
+        decorrido = (agora().replace(tzinfo=None) - entrada).total_seconds() / 3600
+        return f"{prefixo}\nEntrada: {entrada.strftime('%H:%M')} - a trabalhar ha {decorrido:.1f}h"
+    h = int(extra); m_min = int((extra-h)*60)
+    extra_str = f"{h}h{m_min:02d}" if m_min else f"{h}h"
+    msg_extra = f"{extra_str} extra" if extra > 0 else "sem horas extra"
+    return f"{prefixo}\n{entrada.strftime('%H:%M')} -> {saida.strftime('%H:%M')} ({horas:.1f}h) - {msg_extra}"
+
+def picos_resumo_fn(phone, mes=None, ano=None):
+    import calendar
+    hoje = agora().date(); mes = mes or hoje.month; ano = ano or hoje.year
+    _, ultimo_dia = calendar.monthrange(ano, mes)
+    try:
+        rows = db.session.execute(text(
+            "SELECT data,horas_extra,dia_folga FROM picos "
+            "WHERE user_phone=:p AND data>=:ini AND data<=:fim AND horas_extra>0 ORDER BY data"),
+            {"p":phone,"ini":f"{ano}-{mes:02d}-01","fim":f"{ano}-{mes:02d}-{ultimo_dia:02d}"}).fetchall()
+    except Exception as e:
+        log.error(f"picos_resumo: {e}"); db.session.rollback(); return "Erro"
+    nomes_m = ["","Janeiro","Fevereiro","Marco","Abril","Maio","Junho",
+               "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"]
+    dias_pt = ["Seg","Ter","Qua","Qui","Sex","Sab","Dom"]
+    if not rows: return f"Sem horas extra em {nomes_m[mes]}."
+    linhas = []; total = 0
+    for data, extra, folga in rows:
+        sufixo = " (folga)" if folga else ""
+        h = int(extra); m_min = int((extra-h)*60)
+        extra_str = f"{h}h{m_min:02d}" if m_min else f"{h}h"
+        linhas.append(f"{data.strftime('%d/%m')} ({dias_pt[data.weekday()]}{sufixo}) - {extra_str} extra")
+        total += extra
+    th = int(total); tm = int((total-th)*60)
+    total_str = f"{th}h{tm:02d}" if tm else f"{th}h"
+    return f"Horas extra {nomes_m[mes]}:\n\n" + "\n".join(linhas) + f"\n\nTotal: {total_str}"
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -888,6 +1012,23 @@ def processar_texto(phone_raw, phone, texto):
             r = get_reserva(usuario.id)
             enviar_mensagem(phone_raw, f"🛡️ Reserva de emergencia: {r:.2f}€\n\nPara usar: 'gastei 30 da reserva'"); return
 
+        # ── PICOS / HORAS EXTRAS (so Ruben) ──────────────────────────
+        if phone == PHONE_RUBEN:
+            if re.match(r'^entr(ei|e|a)', t):
+                enviar_mensagem(phone_raw, pico_entrada(phone, t)); return
+            if re.match(r'^sa[ii]', t) or t.strip() in ['sai','saiu']:
+                enviar_mensagem(phone_raw, pico_saida(phone, t)); return
+            if t.strip() == 'picos hoje':
+                enviar_mensagem(phone_raw, picos_hoje_fn(phone)); return
+            if re.match(r'^picos', t):
+                meses_map = {
+                    'janeiro':1,'fevereiro':2,'marco':3,'marco':3,'abril':4,
+                    'maio':5,'junho':6,'julho':7,'agosto':8,'setembro':9,
+                    'outubro':10,'novembro':11,'dezembro':12
+                }
+                mes_n = next((v for k,v in meses_map.items() if k in t), None)
+                enviar_mensagem(phone_raw, picos_resumo_fn(phone, mes=mes_n)); return
+        # ──────────────────────────────────────────────────────────────
         # ── ANIVERSÁRIOS ──
         if any(p in t for p in ['aniversario','aniversário','faz anos']) or t.strip() == 'aniversarios':
             processar_aniversario(phone_raw, usuario, texto); return
