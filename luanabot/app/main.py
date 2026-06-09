@@ -1535,24 +1535,26 @@ def enviar_conjunta(phone_raw, usuario):
     parceiro_phone = get_parceiro_phone(usuario.phone)
     parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
     ids = [usuario.id] + ([parceiro.id] if parceiro else [])
-    extra = 0
+    total = 0
     for uid in ids:
-        extra += db.session.execute(text(
+        total += db.session.execute(text(
             "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
             "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
         ), {'u': uid, 'm': mes, 'y': ano}).scalar() or 0
-    base = 50 * len(ids)
-    total = base + extra
     resta = total - gasto
+    if total == 0:
+        enviar_mensagem(phone_raw,
+            f"💑 Conta conjunta\n"
+            f"📭 Ainda nao meteram dinheiro este mes.\n\n"
+            f"Para meter: 'metemos 80 na conjunta'")
+        return
     status = "Dentro!" if resta >= 0 else f"Passaram {abs(resta):.0f} euros!"
-    extra_txt = f"\n💸 Extra este mes: +{extra:.0f}€" if extra > 0 else ""
     enviar_mensagem(phone_raw,
         f"💑 Conta conjunta\n"
-        f"🏦 Base mensal: {base:.0f}€{extra_txt}\n"
-        f"💰 Total disponivel: {total:.0f}€\n"
+        f"💰 Total: {total:.0f}€\n"
         f"🛒 Gasto: {gasto:.2f}€\n"
         f"💚 Resta: {max(resta,0):.2f}€ {status}\n\n"
-        f"Extra? Diz: recebemos 100 euros na conjunta")
+        f"Para meter mais: 'metemos 50 na conjunta'")
 
 def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     mes = mes_override or agora().month
