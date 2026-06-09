@@ -286,6 +286,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS conjunta_depositos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT NOT NULL, descricao VARCHAR(200), data TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS picos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50) NOT NULL, data DATE NOT NULL, entrada TIMESTAMP, saida TIMESTAMP, horas_trabalhadas FLOAT DEFAULT 0, horas_extra FLOAT DEFAULT 0, dia_folga BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_phone, data))",
         "CREATE TABLE IF NOT EXISTS aniversarios (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), data_aniv DATE)",
         "CREATE TABLE IF NOT EXISTS wishlist (id SERIAL PRIMARY KEY, usuario_id INTEGER, descricao VARCHAR(200), preco FLOAT, link VARCHAR(500), marca VARCHAR(100), categoria VARCHAR(50), estacao VARCHAR(20), comprado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
@@ -1078,6 +1079,8 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in gasolina_keywords) or e_municipio_gas or e_na_local:
             gasolina_barata(phone_raw, t); return
 
+        if any(p in t for p in ['recebemos','metemos na conjunta']) and 'conjunta' in t and tem_numero(texto):
+            registar_deposito_conjunta(phone_raw, usuario, texto); return
         # ── CONJUNTA ──
         if 'conjunta' in t and any(p in t for p in ['quanto','tenho','sobra','resta','ver']):
             enviar_conjunta(phone_raw, usuario); return
@@ -1499,18 +1502,57 @@ def enviar_quanto_tenho(phone_raw, usuario):
         msg += f"\n\n😬 Tás quase no limite!"
     enviar_mensagem(phone_raw, msg)
 
+def registar_deposito_conjunta(phone_raw, usuario, texto):
+    valor = extrair_valor(texto)
+    if valor == 0:
+        enviar_mensagem(phone_raw, "Quanto receberam? Ex: recebemos 100 euros na conjunta"); return
+    stop = {'recebemos','metemos','deposito','euros','euro','na','conjunta','para','a','da'}
+    palavras = [w for w in texto.split()
+                if not re.match(r'[0-9€,.]', w) and len(w) > 2 and w.lower() not in stop]
+    desc = ' '.join(palavras[:3]).capitalize() if palavras else 'Deposito'
+    try:
+        db.session.execute(text(
+            "INSERT INTO conjunta_depositos (usuario_id, valor, descricao) VALUES (:u, :v, :d)"
+        ), {'u': usuario.id, 'v': valor, 'd': desc})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"deposito_conjunta: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro 😕"); return
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'O parceiro')
+    notificar_parceiro(usuario.phone, f"💑 {meu_nome} adicionou {valor:.0f}€ à conjunta ({desc})")
+    enviar_mensagem(phone_raw,
+        f"💑 +{valor:.0f}€ adicionado à conjunta!\n"
+        f"📌 {desc}\n"
+        f"Diz 'quanto tenho na conjunta' para ver o saldo 💚")
+
 def enviar_conjunta(phone_raw, usuario):
-    mes=agora().month; ano=agora().year
+    mes = agora().month; ano = agora().year
     gasto = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
-        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        db.extract('month',Despesa.data)==mes,
+        db.extract('year',Despesa.data)==ano,
         Despesa.descricao.like('[conjunta]%')).scalar() or 0
-    resta = 50 - gasto
-    estado_txt = "✅ Dentro!" if resta >= 0 else f"⚠️ Passaste {abs(resta):.0f}€!"
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    ids = [usuario.id] + ([parceiro.id] if parceiro else [])
+    extra = 0
+    for uid in ids:
+        extra += db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
+            "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
+        ), {'u': uid, 'm': mes, 'y': ano}).scalar() or 0
+    base = 50 * len(ids)
+    total = base + extra
+    resta = total - gasto
+    status = "Dentro!" if resta >= 0 else f"Passaram {abs(resta):.0f} euros!"
+    extra_txt = f"\n💸 Extra este mes: +{extra:.0f}€" if extra > 0 else ""
     enviar_mensagem(phone_raw,
-        f"💑 Conjunta (jantares, cinema, lanches):\n💰 Tua parte: 50€\n"
-        f"🛒 Gastaste: {gasto:.2f}€\n💚 Resta: {max(resta,0):.2f}€ {estado_txt}\n\n"
-        f"Para marcar: 'jantar 30 na conjunta'")
+        f"💑 Conta conjunta\n"
+        f"🏦 Base mensal: {base:.0f}€{extra_txt}\n"
+        f"💰 Total disponivel: {total:.0f}€\n"
+        f"🛒 Gasto: {gasto:.2f}€\n"
+        f"💚 Resta: {max(resta,0):.2f}€ {status}\n\n"
+        f"Extra? Diz: recebemos 100 euros na conjunta")
 
 def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     mes = mes_override or agora().month
