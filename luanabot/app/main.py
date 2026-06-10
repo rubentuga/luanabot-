@@ -312,6 +312,8 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS assinaturas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, nome VARCHAR(100), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
+        "CREATE TABLE IF NOT EXISTS metas_categoria (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, categoria VARCHAR(50), limite FLOAT, mes INTEGER, ano INTEGER, UNIQUE(usuario_id, categoria, mes, ano))",
         "CREATE TABLE IF NOT EXISTS conjunta_depositos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT NOT NULL, descricao VARCHAR(200), data TIMESTAMP DEFAULT NOW())",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dia_pagamento INTEGER DEFAULT 21",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_nome VARCHAR(100) DEFAULT ''",
@@ -454,7 +456,7 @@ def tem_numero(texto):
 
 def eh_gasto(texto):
     t = texto.lower()
-    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','meti','abasteci','lanchei','fui ao','fui à']
+    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','meti','abasteci','lanchei','fui ao','fui à','deixei','torrei','dei','fui no','fui na','comi no','comi na','bebi','tomei']
     if any(v in t for v in verbos): return True
     if '€' in t or ' euro' in t or 'euros' in t: return True
     cat, _, _ = categorizar(texto)
@@ -816,6 +818,278 @@ def picos_resumo_fn(phone, mes=None, ano=None):
     total_str = f"{th}h{tm:02d}" if tm else f"{th}h"
     return f"Horas extra {nomes_m[mes]}:\n\n" + "\n".join(linhas) + f"\n\nTotal: {total_str}"
 
+
+# ─── COMO ESTOU? — Dashboard natural ─────────────────────────
+def como_estou(phone_raw, usuario):
+    mes = agora().month; ano = agora().year
+    nomes_m = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho',
+               'Agosto','Setembro','Outubro','Novembro','Dezembro']
+
+    # Disponível principal
+    disp, p = calcular_disponivel(usuario)
+
+    # Gastos totais do mês (sem conjunta)
+    gasto_mes = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        ~Despesa.descricao.like('[conjunta]%'),
+        ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+
+    # Conjunta — saldo
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    ids = [usuario.id] + ([parceiro.id] if parceiro else [])
+    conj_dep = 0; conj_gasto = 0
+    for uid in ids:
+        conj_dep += db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
+        ), {'u':uid,'m':mes,'y':ano}).scalar() or 0
+        conj_gasto += db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==uid,
+            db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+            Despesa.descricao.like('[conjunta]%')).scalar() or 0
+    conj_saldo = conj_dep - conj_gasto
+
+    # Reserva
+    reserva = get_reserva(usuario.id)
+
+    # Categoria top
+    por_cat = db.session.query(Despesa.categoria, db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        ~Despesa.descricao.like('[conjunta]%')).group_by(Despesa.categoria).order_by(db.func.sum(Despesa.valor).desc()).all()
+
+    dias = dias_para_salario(usuario)
+
+    msg = f"📊 Situacao — {nomes_m[mes-1]}\n\n"
+    msg += f"💳 Disponivel: {disp:.0f}€"
+    if disp < 0: msg += " ⚠️"
+    msg += "\n"
+    if conj_dep > 0 or conj_gasto > 0:
+        msg += f"💑 Conjunta: {max(conj_saldo,0):.0f}€\n"
+    msg += f"💎 Poupanca prevista: {p['poupanca']:.0f}€\n"
+    msg += f"🛡️ Reserva: {reserva:.0f}€\n"
+    msg += f"\n🛒 Gastaste este mes: {gasto_mes:.0f}€\n"
+
+    if por_cat:
+        top_cat, top_val = por_cat[0]
+        msg += f"🔥 Categoria principal: {EMOJI_CAT.get(top_cat,'💳')} {top_cat.capitalize()} ({top_val:.0f}€)\n"
+
+    # Metas de categoria ativas
+    try:
+        metas = db.session.execute(text(
+            "SELECT categoria, limite FROM metas_categoria WHERE usuario_id=:u AND mes=:m AND ano=:y"),
+            {'u':usuario.id,'m':mes,'y':ano}).fetchall()
+        for cat_m, lim in metas:
+            atual = next((v for c,v in por_cat if c==cat_m), 0)
+            if atual > lim:
+                msg += f"⚠️ {cat_m.capitalize()} acima do objetivo ({atual:.0f}€/{lim:.0f}€)\n"
+    except Exception: pass
+
+    # Objetivos
+    try:
+        objs = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE LIMIT 2"),
+            {'id':usuario.id}).fetchall()
+        for o in objs:
+            pct = round(o[2]/o[1]*100) if o[1] else 0
+            nome_o = o[0].replace('[casal] ','')
+            msg += f"🎯 {nome_o}: {pct}% concluido\n"
+    except Exception: pass
+
+    # Dívidas a receber
+    try:
+        divs = db.session.execute(text(
+            "SELECT pessoa, SUM(valor_cada) FROM splitting WHERE usuario_id=:u AND pago=FALSE AND descricao NOT LIKE '[EU DEVO]%' GROUP BY pessoa"),
+            {'u':usuario.id}).fetchall()
+        for pessoa, val in divs:
+            msg += f"💸 {pessoa} deve-te {val:.0f}€\n"
+    except Exception: pass
+
+    msg += f"\n📅 Faltam {dias} dias para o salario"
+    if disp > 0 and dias > 0:
+        msg += f" — {disp/dias:.0f}€/dia"
+
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── ASSINATURAS ─────────────────────────────────────────────
+def processar_assinaturas(phone_raw, usuario, texto):
+    t = texto.lower()
+
+    # Adicionar: "assinatura netflix 12" ou "adiciona spotify 7"
+    m_add = re.search(r'(?:assinatura|adiciona|nova)\s+([a-zà-ú+]+)\s+(\d+(?:[.,]\d+)?)', t)
+    if m_add and any(p in t for p in ['assinatura','adiciona','nova']):
+        nome = m_add.group(1).capitalize()
+        valor = float(m_add.group(2).replace(',','.'))
+        try:
+            db.session.execute(text(
+                "INSERT INTO assinaturas (usuario_id, nome, valor) VALUES (:u,:n,:v)"),
+                {'u':usuario.id,'n':nome,'v':valor})
+            db.session.commit()
+            enviar_mensagem(phone_raw, f"📺 Assinatura adicionada!\n{nome} — {valor:.2f}€/mês\n\nDiz 'assinaturas' para ver o total.")
+        except Exception as e:
+            log.error(f"assinatura add: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Remover: "remove assinatura netflix"
+    m_rem = re.search(r'(?:remove|apaga|cancela)\s+(?:assinatura\s+)?([a-zà-ú+]+)', t)
+    if m_rem and any(p in t for p in ['remove','apaga','cancela']):
+        nome = m_rem.group(1)
+        try:
+            r = db.session.execute(text(
+                "DELETE FROM assinaturas WHERE usuario_id=:u AND LOWER(nome) LIKE :n RETURNING nome"),
+                {'u':usuario.id,'n':f'%{nome}%'}).fetchone()
+            db.session.commit()
+            if r: enviar_mensagem(phone_raw, f"🗑️ '{r[0]}' removida das assinaturas!")
+            else: enviar_mensagem(phone_raw, f"Nao encontrei '{nome}' nas assinaturas.")
+        except Exception as e:
+            log.error(f"assinatura rem: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Listar
+    try:
+        rows = db.session.execute(text(
+            "SELECT nome, valor FROM assinaturas WHERE usuario_id=:u ORDER BY valor DESC"),
+            {'u':usuario.id}).fetchall()
+        if not rows:
+            enviar_mensagem(phone_raw, "📺 Sem assinaturas registadas.\n\nAdiciona: 'assinatura netflix 12'")
+            return
+        total = sum(r[1] for r in rows)
+        emojis_ass = {'netflix':'📺','spotify':'🎵','icloud':'☁️','chatgpt':'🤖','disney':'🏰',
+                      'hbo':'🎬','youtube':'▶️','amazon':'📦','apple':'🍎','google':'🔍'}
+        msg = "📺 Assinaturas mensais\n\n"
+        for nome, valor in rows:
+            e = next((v for k,v in emojis_ass.items() if k in nome.lower()), '🔹')
+            msg += f"{e} {nome} — {valor:.2f}€\n"
+        msg += f"\n💰 Total: {total:.2f}€/mês"
+        msg += f"\n📅 Por ano: {total*12:.0f}€"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"assinaturas: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+
+# ─── GRUPOS DE CATEGORIAS (Casa / Carro) ─────────────────────
+GRUPOS_CAT = {
+    'casa': {
+        'emoji': '🏠', 'nome': 'Casa',
+        'cats': ['casa'],
+        'lojas': ['ikea','zara home','leroy','aki','conforama','worten casa'],
+        'sub': {'mobilia':'🛋️','decoracao':'🏡','iluminacao':'💡','eletro':'🔌','cozinha':'🍴'}
+    },
+    'carro': {
+        'emoji': '🚗', 'nome': 'Carro',
+        'cats': ['combustivel','carro'],
+        'lojas': [],
+        'sub': {'combustivel':'⛽','seguro':'🛡️','manutencao':'🔧','portagem':'🛣️','estacionamento':'🅿️'}
+    },
+}
+
+def mostrar_grupo(phone_raw, usuario, grupo_key):
+    g = GRUPOS_CAT.get(grupo_key)
+    if not g: return
+    mes = agora().month; ano = agora().year
+    nomes_m = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho',
+               'Agosto','Setembro','Outubro','Novembro','Dezembro']
+
+    # Gastos das categorias do grupo
+    rows = db.session.query(Despesa).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        Despesa.categoria.in_(g['cats'])).order_by(Despesa.data.desc()).all()
+
+    if not rows:
+        enviar_mensagem(phone_raw, f"{g['emoji']} {g['nome']} — sem gastos em {nomes_m[mes-1]}.")
+        return
+
+    total = sum(d.valor for d in rows)
+    # Agrupar por categoria
+    por_c = {}
+    for d in rows:
+        por_c.setdefault(d.categoria, 0)
+        por_c[d.categoria] += d.valor
+
+    msg = f"{g['emoji']} {g['nome']} — {nomes_m[mes-1]}\n\n"
+    for cat, val in sorted(por_c.items(), key=lambda x:-x[1]):
+        msg += f"{EMOJI_CAT.get(cat,'🔹')} {cat.capitalize()}: {val:.0f}€\n"
+    msg += f"\n💰 Total: {total:.0f}€"
+
+    # Últimos gastos
+    msg += "\n\nÚltimos:\n"
+    for d in rows[:5]:
+        desc = d.descricao.replace('[conjunta] ','')[:25]
+        msg += f"• {d.valor:.0f}€ — {desc}\n"
+
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── METAS DE CATEGORIA ──────────────────────────────────────
+def processar_meta_categoria(phone_raw, usuario, texto):
+    t = texto.lower()
+    mes = agora().month; ano = agora().year
+
+    # Ver metas: "metas" ou "desafios"
+    if any(p in t for p in ['ver metas','metas categoria','desafios','meus desafios']) or t.strip() in ['metas','desafios']:
+        try:
+            rows = db.session.execute(text(
+                "SELECT categoria, limite FROM metas_categoria WHERE usuario_id=:u AND mes=:m AND ano=:y"),
+                {'u':usuario.id,'m':mes,'y':ano}).fetchall()
+            if not rows:
+                enviar_mensagem(phone_raw, "🏆 Sem metas este mês.\n\nCria: 'máximo fast food 50€'")
+                return
+            nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            msg = f"🏆 Desafios — {nomes_m[mes-1]}\n\n"
+            for cat, lim in rows:
+                atual = gastos_cat_mes(usuario, cat, mes, ano)
+                falta = lim - atual
+                pct = round(atual/lim*100) if lim else 0
+                barra = '█'*min(int(pct/10),10) + '░'*max(10-int(pct/10),0)
+                emoji_c = EMOJI_CAT.get(cat,'💳')
+                if atual <= lim:
+                    estado = f"✅ Faltam {falta:.0f}€"
+                else:
+                    estado = f"🔴 Passaste {abs(falta):.0f}€!"
+                msg += f"{emoji_c} {cat.capitalize()}\n{barra} {pct}%\n{atual:.0f}€ de {lim:.0f}€ — {estado}\n\n"
+            enviar_mensagem(phone_raw, msg)
+        except Exception as e:
+            log.error(f"metas ver: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Criar meta: "máximo fast food 50" ou "limite roupa 150"
+    valor = extrair_valor(texto)
+    if valor == 0:
+        enviar_mensagem(phone_raw, "Qual o limite? Ex: 'máximo fast food 50€'"); return
+
+    # Detetar categoria
+    cat_alvo = None
+    for cat in CATEGORIAS_VALIDAS:
+        if cat in t:
+            cat_alvo = cat; break
+    if not cat_alvo:
+        cat_alvo = ALIAS_CAT.get(next((w for w in t.split() if w in ALIAS_CAT), ''), None)
+    if not cat_alvo:
+        # tentar via categorizar
+        c, _, _ = categorizar(texto)
+        if c != 'outros': cat_alvo = c
+
+    if not cat_alvo:
+        enviar_mensagem(phone_raw, f"Que categoria? Ex: 'máximo fast food 50€'\nCategorias: {', '.join(CATEGORIAS_VALIDAS[:8])}...")
+        return
+
+    try:
+        db.session.execute(text(
+            "INSERT INTO metas_categoria (usuario_id, categoria, limite, mes, ano) VALUES (:u,:c,:l,:m,:y) "
+            "ON CONFLICT (usuario_id, categoria, mes, ano) DO UPDATE SET limite=:l"),
+            {'u':usuario.id,'c':cat_alvo,'l':valor,'m':mes,'y':ano})
+        db.session.commit()
+        atual = gastos_cat_mes(usuario, cat_alvo, mes, ano)
+        enviar_mensagem(phone_raw,
+            f"🎯 Desafio criado!\n{EMOJI_CAT.get(cat_alvo,'💳')} {cat_alvo.capitalize()}: máximo {valor:.0f}€\n"
+            f"Atual: {atual:.0f}€ — Faltam {valor-atual:.0f}€\n\nVou avisar se te aproximares! 💪")
+    except Exception as e:
+        log.error(f"meta criar: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -1095,6 +1369,22 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['quem criou','quem te fez','quem te criou','criador','quem te programou']):
             enviar_mensagem(phone_raw, "Fui criado pelo tuga27 🚀\nO mesmo genio por tras do Zeflix e agora do teu gestor financeiro 😎"); return
 
+        # ── COMO ESTOU? (dashboard natural) ──
+        if any(p in t for p in ['como estou','como e que estou','situacao atual','dashboard','overview','resumo geral','visao geral']):
+            como_estou(phone_raw, usuario); return
+        # ── ASSINATURAS ──
+        if any(p in t for p in ['assinatura','assinaturas','subscricoes','subscricao']):
+            processar_assinaturas(phone_raw, usuario, texto); return
+        # ── GRUPO CASA ──
+        if t.strip() == 'casa' or t.strip() == 'gastos casa' or (t.startswith('casa') and len(t) < 12 and not tem_numero(texto)):
+            mostrar_grupo(phone_raw, usuario, 'casa'); return
+        # ── GRUPO CARRO ──
+        if t.strip() == 'carro' or t.strip() == 'gastos carro' or (t.startswith('carro') and len(t) < 12 and not tem_numero(texto)):
+            mostrar_grupo(phone_raw, usuario, 'carro'); return
+        # ── METAS / DESAFIOS DE CATEGORIA ──
+        if any(p in t for p in ['maximo ','máximo ','limite ','desafio','meta de ','metas','desafios']) and (tem_numero(texto) or t.strip() in ['metas','desafios']):
+            if not any(p in t for p in ['poupar','objetivo']):
+                processar_meta_categoria(phone_raw, usuario, texto); return
         # ── AJUDA / BOAS VINDAS ──
         if any(p in t for p in ['ajuda','help','/start','comandos']):
             enviar_ajuda(phone_raw); return
@@ -2978,9 +3268,19 @@ def enviar_ajuda(phone_raw):
 • splits → pendentes
 
 📊 Consultas:
+• como estou → dashboard completo
 • resumo | plano | quanto tenho
 • quanto tenho na conjunta | score
 • resumo anterior
+📺 Assinaturas:
+• assinatura netflix 12
+• assinaturas → ver total
+🏆 Desafios:
+• máximo fast food 50€
+• metas → ver progresso
+🏠 Grupos:
+• casa → gastos casa
+• carro → gastos carro
 
 🎂 Aniversarios:
 • aniversario da Ana 15/3
