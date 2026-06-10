@@ -1826,14 +1826,20 @@ def processar_texto(phone_raw, phone, texto):
                 despesa = Despesa(usuario_id=usuario.id, valor=valor_pago, categoria='outros',
                     descricao=f'Pagamento divida {credor}', data=agora().replace(tzinfo=None))
                 db.session.add(despesa); db.session.commit()
+                meu_nome = NOMES_CASAL.get(usuario.phone, 'Parceiro')
                 if novo_saldo > 0:
                     meses_rest = int(novo_saldo / parcela) + (1 if novo_saldo % parcela > 0 else 0)
-                    enviar_mensagem(phone_raw,
-                        f"✅ Pago {valor_pago:.0f}€ à {credor}\n"
-                        f"💳 Saldo restante: {novo_saldo:.0f}€\n"
-                        f"📅 ~{meses_rest} mes(es) para terminar")
+                    msg_eu = (f"✅ Pago {valor_pago:.0f}€ à {credor}\n"
+                              f"💳 Saldo restante: {novo_saldo:.0f}€\n"
+                              f"📅 ~{meses_rest} mes(es) para terminar")
+                    msg_parceiro = (f"💸 {meu_nome} pagou {valor_pago:.0f}€ da dívida\n"
+                                    f"💳 Falta: {novo_saldo:.0f}€\n"
+                                    f"📅 ~{meses_rest} mes(es) para terminar")
                 else:
-                    enviar_mensagem(phone_raw, f"🎉 Dívida à {credor} paga! Zero euros em dívida 💪")
+                    msg_eu = f"🎉 Dívida à {credor} paga! Zero euros em dívida 💪"
+                    msg_parceiro = f"🎉 {meu_nome} pagou a dívida toda! Estão quites 💪"
+                enviar_mensagem(phone_raw, msg_eu)
+                notificar_parceiro(usuario.phone, msg_parceiro)
                 return
         # ──────────────────────────────────────────────────────────────
         if t.strip() in ['gastos','gastos?']:
