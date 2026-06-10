@@ -284,6 +284,32 @@ def normalizar_categoria(cat):
     if cat in CATEGORIAS_VALIDAS: return cat
     return ALIAS_CAT.get(cat, cat)
 
+def categorizar_ia(texto):
+    """Fallback IA para categorias desconhecidas — usa Groq Llama 3 8B."""
+    try:
+        from groq import Groq
+        cats_str = ', '.join(CATEGORIAS_VALIDAS)
+        resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
+            model='llama-3.1-8b-instant',
+            max_tokens=10,
+            temperature=0,
+            messages=[
+                {'role':'system','content':f'Responde APENAS com uma palavra da lista: {cats_str}'},
+                {'role':'user','content':f'Categoria financeira de: "{texto}"'}
+            ])
+        cat = resp.choices[0].message.content.strip().lower()
+        # Valida que é uma categoria conhecida
+        if cat in CATEGORIAS_VALIDAS:
+            # Guarda a palavra-chave mais relevante para aprender
+            stop = {'gastei','paguei','comprei','euros','euro','no','na','em','de','da','do','num','uma','uns','umas'}
+            tokens = [w for w in re.findall(r"[a-zà-ú]+", texto.lower()) if len(w)>3 and w not in stop]
+            if tokens:
+                guardar_aprendida(tokens[0], cat)
+            return cat, EMOJI_CAT.get(cat,'💳'), texto.split()[0].capitalize()
+    except Exception as e:
+        log.error(f"categorizar_ia: {e}")
+    return 'outros', '💳', 'Gasto'
+
 def categorizar(texto):
     t = texto.lower()
     aprendidas = carregar_aprendidas()
@@ -301,7 +327,8 @@ def categorizar(texto):
     for chave, cat in LOJAS.items():
         if ' ' not in chave and len(chave) > 3 and chave in t:
             return cat, EMOJI_CAT.get(cat,'💳'), LOJAS_NOME.get(chave, chave.capitalize())
-    return 'outros', '💳', 'Gasto'
+    # Fallback IA — só quando nada foi reconhecido
+    return categorizar_ia(texto)
 
 # ─── BD: TABELAS E HELPERS ───────────────────────────────────
 def criar_tabelas():
