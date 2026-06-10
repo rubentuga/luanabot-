@@ -131,9 +131,28 @@ def agora():
 
 # ─── DATAS ───────────────────────────────────────────────────
 def dia_pagamento_mes(ano, mes):
+    """Compatibilidade — usa dia 21 com lógica day_before."""
     d = datetime(ano, mes, 21)
-    if d.weekday() == 5: d -= timedelta(days=1)
-    elif d.weekday() == 6: d -= timedelta(days=2)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+def dia_pagamento_usuario(usuario, ano=None, mes=None):
+    """Calcula dia de pagamento conforme perfil do utilizador."""
+    hoje = agora()
+    ano = ano or hoje.year; mes = mes or hoje.month
+    dia_base = getattr(usuario, 'dia_pagamento', None) or 21
+    tipo = getattr(usuario, 'pagamento_tipo', None) or 'day_before'
+    try:
+        d = datetime(ano, mes, dia_base)
+    except ValueError:
+        d = datetime(ano, mes, 21)
+    if tipo == 'day_before':
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+    else:  # day_after
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
     return d
 
 def dia_recibo_mes(ano, mes):
@@ -143,13 +162,20 @@ def dia_recibo_mes(ano, mes):
         d -= timedelta(days=1)
     return d
 
-def dias_para_salario():
+def dias_para_salario(usuario=None):
     hoje = agora()
-    pag = dia_pagamento_mes(hoje.year, hoje.month)
-    if pag.date() <= hoje.date():
-        mes_prox = hoje.month + 1 if hoje.month < 12 else 1
-        ano_prox = hoje.year if hoje.month < 12 else hoje.year + 1
-        pag = dia_pagamento_mes(ano_prox, mes_prox)
+    if usuario:
+        pag = dia_pagamento_usuario(usuario, hoje.year, hoje.month)
+        if pag.date() <= hoje.date():
+            mes_prox = hoje.month + 1 if hoje.month < 12 else 1
+            ano_prox = hoje.year if hoje.month < 12 else hoje.year + 1
+            pag = dia_pagamento_usuario(usuario, ano_prox, mes_prox)
+    else:
+        pag = dia_pagamento_mes(hoje.year, hoje.month)
+        if pag.date() <= hoje.date():
+            mes_prox = hoje.month + 1 if hoje.month < 12 else 1
+            ano_prox = hoje.year if hoje.month < 12 else hoje.year + 1
+            pag = dia_pagamento_mes(ano_prox, mes_prox)
     return (pag.date() - hoje.date()).days
 
 # ─── CATEGORIAS E LOJAS ──────────────────────────────────────
@@ -287,6 +313,12 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
         "CREATE TABLE IF NOT EXISTS conjunta_depositos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT NOT NULL, descricao VARCHAR(200), data TIMESTAMP DEFAULT NOW())",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dia_pagamento INTEGER DEFAULT 21",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_nome VARCHAR(100) DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_consumo_l100 FLOAT DEFAULT 6.0",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS pagamento_tipo VARCHAR(20) DEFAULT 'day_before'",
+        "UPDATE usuarios SET dia_pagamento=22, carro_nome='Ibiza 6J', carro_consumo_l100=7.5, pagamento_tipo='day_after' WHERE phone='264909371768998'",
+        "UPDATE usuarios SET dia_pagamento=21, carro_nome='Taigo', carro_consumo_l100=5.5, pagamento_tipo='day_before' WHERE phone='84516500680875'",
         "CREATE TABLE IF NOT EXISTS picos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50) NOT NULL, data DATE NOT NULL, entrada TIMESTAMP, saida TIMESTAMP, horas_trabalhadas FLOAT DEFAULT 0, horas_extra FLOAT DEFAULT 0, dia_folga BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_phone, data))",
         "CREATE TABLE IF NOT EXISTS aniversarios (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), data_aniv DATE)",
         "CREATE TABLE IF NOT EXISTS wishlist (id SERIAL PRIMARY KEY, usuario_id INTEGER, descricao VARCHAR(200), preco FLOAT, link VARCHAR(500), marca VARCHAR(100), categoria VARCHAR(50), estacao VARCHAR(20), comprado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
@@ -590,7 +622,7 @@ def api_dashboard():
         'wishlist': [{'nome': r[0], 'preco': r[1], 'marca': r[2], 'cat': r[3]} for r in wishlist],
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
-        'dias_salario': dias_para_salario(),
+        'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else ''} for r in transacoes],
     })
 
@@ -797,6 +829,11 @@ def processar_texto(phone_raw, phone, texto):
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
+        if estado == 'conjunta_sem_desc':
+            valor_c = dados_estado.get('valor', 0)
+            limpar_estado(phone)
+            processar_despesa(phone_raw, usuario, f"{texto} {valor_c} na conjunta")
+            return
         if estado == 'wishlist_tipo_pendente':
             dados_t = dados_estado
             tipo_escolha = t.strip()
@@ -1081,6 +1118,14 @@ def processar_texto(phone_raw, phone, texto):
 
         if any(p in t for p in ['recebemos','metemos','depositamos','deposito']) and 'conjunta' in t and tem_numero(texto):
             registar_deposito_conjunta(phone_raw, usuario, texto); return
+        # Gasto conjunta sem descricao clara — perguntar em que
+        if 'conjunta' in t and tem_numero(texto) and not any(p in t for p in ['quanto','tenho','sobra','resta','ver','recebemos','metemos','depositamos']):
+            cat_c, _, nome_loja_c = categorizar(texto)
+            if cat_c == 'outros' and nome_loja_c == 'Gasto':
+                valor_c = extrair_valor(texto)
+                set_estado(phone, 'conjunta_sem_desc', {'valor': valor_c})
+                enviar_mensagem(phone_raw, f"💑 {valor_c:.0f}€ na conjunta — em que? (ex: cinema, jantar, farmacia)")
+                return
         # ── CONJUNTA ──
         if 'conjunta' in t and any(p in t for p in ['quanto','tenho','sobra','resta','ver']):
             enviar_conjunta(phone_raw, usuario); return
@@ -1213,10 +1258,12 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['abasteci','meti gasolina','pus gasolina']) and tem_numero(texto):
             valor_gas = extrair_valor(texto)
             if valor_gas > 5:
+                consumo = getattr(usuario, 'carro_consumo_l100', None) or 6.0
+                carro = getattr(usuario, 'carro_nome', None) or 'carro'
                 litros = round(valor_gas / 1.9, 1)
-                km_est = round(litros / 5.4 * 100)
+                km_est = round(litros / consumo * 100)
                 processar_despesa(phone_raw, usuario, texto)
-                enviar_mensagem(phone_raw, f"🚗 Com {valor_gas:.0f}€ tens ~{litros:.1f}L\n📍 Dá para ~{km_est} km no Taigo!\nManda foto do odómetro 📸")
+                enviar_mensagem(phone_raw, f"🚗 Com {valor_gas:.0f}€ tens ~{litros:.1f}L\n📍 Dá para ~{km_est} km no {carro}!\nManda foto do odómetro 📸")
                 return
 
         # ── RESPOSTAS CURTAS ──
@@ -1651,6 +1698,7 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     enviar_mensagem(phone_raw, msg)
 
 def enviar_plano_mes(phone_raw, usuario):
+    _dias_sal = dias_para_salario(usuario)
     if not usuario.salario_liquido:
         enviar_mensagem(phone_raw, "Ainda nao sei o teu salario 🤔 Diz: recebi 1300 euros"); return
     enviar_plano_salario(phone_raw, usuario, usuario.salario_liquido)
