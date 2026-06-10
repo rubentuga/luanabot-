@@ -484,7 +484,10 @@ def tem_numero(texto):
 
 def eh_gasto(texto):
     t = texto.lower()
-    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','meti','abasteci','lanchei','fui ao','fui à','deixei','torrei','dei','fui no','fui na','comi no','comi na','bebi','tomei']
+    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','abasteci','lanchei','fui ao','fui à','deixei','torrei','dei','fui no','fui na','comi no','comi na','bebi','tomei']
+    # "meti" só é gasto se não for na conta
+    if 'meti' in t and not any(p in t for p in ['na conta','no banco','no bpi','no revolut','na minha']):
+        verbos.append('meti')
     if any(v in t for v in verbos): return True
     if '€' in t or ' euro' in t or 'euros' in t: return True
     cat, _, _ = categorizar(texto)
@@ -1727,6 +1730,8 @@ def processar_texto(phone_raw, phone, texto):
             if not any(p in t for p in ['poupar','objetivo']):
                 processar_meta_categoria(phone_raw, usuario, texto); return
         # ── AJUDA / BOAS VINDAS ──
+        if t.strip() in ['gastos','gastos?']:
+            enviar_resumo(phone_raw, usuario); return
         if any(p in t for p in ['ajuda','help','/start','comandos']):
             enviar_ajuda(phone_raw); return
 
@@ -1771,7 +1776,7 @@ def processar_texto(phone_raw, phone, texto):
             ano_ant = agora().year if agora().month>1 else agora().year-1
             enviar_resumo(phone_raw, usuario, mes_ant, ano_ant); return
 
-        if any(p in t for p in ['resumo','como estou','quanto gastei','situacao','situação']):
+        if any(p in t for p in ['resumo','como estou','quanto gastei','situacao','situação','gastos do mes','gastos deste mes','ver gastos']):
             enviar_resumo(phone_raw, usuario); return
 
         # ── PLANO ──
@@ -1805,6 +1810,13 @@ def processar_texto(phone_raw, phone, texto):
             simular_compra(phone_raw, usuario, texto); return
 
         # ── RECEITA ──
+        if any(p in t for p in ['meti','entrou','depositei']) and any(p in t for p in ['na minha conta','na conta','no banco','no bpi','no revolut']) and tem_numero(texto):
+            valor_extra = extrair_valor(texto)
+            if valor_extra > 0:
+                db.session.add(Receita(usuario_id=usuario.id, valor=valor_extra, descricao='Extra', data=agora().replace(tzinfo=None)))
+                db.session.commit()
+                enviar_mensagem(phone_raw, f"💰 +{valor_extra:.0f}€ registado na tua conta!\nSe quiseres atualizar o disponível diz 'quanto tenho' 😊")
+                return
         if any(p in t for p in ['recebi','ordenado','salario','salário','vencimento']) and tem_numero(texto):
             processar_receita(phone_raw, usuario, texto); return
 
@@ -3792,11 +3804,12 @@ def verificar_aniversarios():
         hoje = agora()
         try:
             rows = db.session.execute(text("""
-                SELECT u.phone, a.nome, a.data_aniv
+                SELECT DISTINCT ON (u.phone, a.nome) u.phone, a.nome, a.data_aniv
                 FROM aniversarios a
                 JOIN usuarios u ON a.usuario_id=u.id
                 WHERE EXTRACT(month FROM a.data_aniv)=:m
                 AND EXTRACT(day FROM a.data_aniv) IN (:d0, :d1, :d5)
+                ORDER BY u.phone, a.nome, a.id
             """), {'m':hoje.month,'d0':hoje.day,'d1':hoje.day+1,'d5':hoje.day+5}).fetchall()
             for r in rows:
                 phone, nome, data = r
