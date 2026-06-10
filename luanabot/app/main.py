@@ -339,6 +339,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS dividas_pessoais (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, credor VARCHAR(100), saldo FLOAT DEFAULT 0, parcela_mensal FLOAT DEFAULT 0, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, credor))",
         "CREATE TABLE IF NOT EXISTS recorrentes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, descricao VARCHAR(200), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, descricao))",
         "CREATE TABLE IF NOT EXISTS assinaturas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, nome VARCHAR(100), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS metas_categoria (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, categoria VARCHAR(50), limite FLOAT, mes INTEGER, ano INTEGER, UNIQUE(usuario_id, categoria, mes, ano))",
@@ -431,9 +432,65 @@ def set_reserva(usuario_id, saldo):
         log.error(f"set_reserva: {e}"); db.session.rollback()
 
 # ─── CÁLCULOS ────────────────────────────────────────────────
-def calcular_plano(salario, modo='equilibrado', despesas_futuras_valor=0):
+def get_saldo_divida(usuario_id, credor):
+    """Busca saldo de uma dívida pessoal na BD."""
+    try:
+        r = db.session.execute(text(
+            "SELECT saldo, parcela_mensal FROM dividas_pessoais WHERE usuario_id=:u AND LOWER(credor)=LOWER(:c)"),
+            {'u': usuario_id, 'c': credor}).fetchone()
+        return (float(r[0]), float(r[1])) if r else (0.0, 0.0)
+    except Exception:
+        db.session.rollback(); return (0.0, 0.0)
+
+def set_saldo_divida(usuario_id, credor, saldo, parcela_mensal=500):
+    """Atualiza ou cria saldo de dívida."""
+    try:
+        db.session.execute(text(
+            "INSERT INTO dividas_pessoais (usuario_id, credor, saldo, parcela_mensal) "
+            "VALUES (:u,:c,:s,:p) ON CONFLICT (usuario_id, credor) "
+            "DO UPDATE SET saldo=:s, parcela_mensal=:p"),
+            {'u': usuario_id, 'c': credor, 's': max(0, saldo), 'p': parcela_mensal})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"set_saldo_divida: {e}"); db.session.rollback()
+
+def get_fixos_usuario(phone, mes, usuario_id=None):
+    """Devolve os fixos mensais do utilizador."""
+    if phone == PHONE_RUBEN:
+        fixos = {
+            'mae':        100,
+            'credito1':    50,
+            'credito2':    50,
+            'carro':      200 if mes <= 7 else 0,
+            'conjunta':    50,
+            'combustivel': 50,
+        }
+        # Dívida à Luana — usa saldo real da BD se disponível
+        if usuario_id:
+            saldo, parcela = get_saldo_divida(usuario_id, 'luana')
+            if saldo <= 0:
+                # Inicializar com 1720€ se ainda não existe na BD
+                r = db.session.execute(text(
+                    "SELECT COUNT(*) FROM dividas_pessoais WHERE usuario_id=:u AND LOWER(credor)='luana'"),
+                    {'u': usuario_id}).scalar()
+                if r == 0:
+                    set_saldo_divida(usuario_id, 'luana', 1720, 500)
+                    saldo, parcela = 1720.0, 500.0
+            if saldo > 0:
+                fixos['divida_luana'] = min(parcela, saldo)
+        return fixos
+    else:  # Luana (default)
+        return {
+            'carro':       350,
+            'ordem':        20,
+            'unhas':        50 if mes <= 9 else 25,
+            'conjunta':     50,
+            'combustivel':  BASE_COMBUSTIVEL,
+        }
+
+def calcular_plano(salario, modo='equilibrado', despesas_futuras_valor=0, phone=None, usuario_id=None):
     mes = agora().month
-    fixos = {'carro':350,'ordem':20,'conjunta':50,'unhas':50 if mes<=9 else 25,'combustivel':BASE_COMBUSTIVEL}
+    fixos = get_fixos_usuario(phone, mes, usuario_id) if phone else get_fixos_usuario(PHONE_LUANA, mes)
     if despesas_futuras_valor > 0:
         fixos['despesas_mes'] = despesas_futuras_valor
     total_fixos = sum(fixos.values())
@@ -442,15 +499,16 @@ def calcular_plano(salario, modo='equilibrado', despesas_futuras_valor=0):
     m = MODOS_POUPANCA.get(modo, MODOS_POUPANCA[MODO_DEFAULT])
     gastar   = round(sobra * m['gastar_pct'], 2)
     poupanca = round(sobra * m['poupar_pct'], 2)
-    return {**fixos,'total_fixos':total_fixos,'salario':salario,'fundo':fundo,'sobra':sobra,
-            'gastar':gastar,'poupanca':poupanca,'modo':modo,'subsidio':mes in [6,11]}
+    meses_subsidio = [6, 11] if phone != PHONE_RUBEN else [6, 12]
+    return {**fixos, 'total_fixos':total_fixos, 'salario':salario, 'fundo':fundo, 'sobra':sobra,
+            'gastar':gastar, 'poupanca':poupanca, 'modo':modo, 'subsidio':mes in meses_subsidio}
 
 def calcular_disponivel(usuario):
     mes=agora().month; ano=agora().year
     modo = get_modo(usuario.id)
     futuras = db.session.query(db.func.sum(DespesaFutura.valor_reserva_mensal)).filter(
         DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).scalar() or 0
-    p = calcular_plano(usuario.salario_liquido or 0, modo, futuras)
+    p = calcular_plano(usuario.salario_liquido or 0, modo, futuras, phone=usuario.phone, usuario_id=usuario.id)
     gastos = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
@@ -614,7 +672,7 @@ def api_dashboard():
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
-    p = calcular_plano(usuario.salario_liquido or 0, modo, total_fut)
+    p = calcular_plano(usuario.salario_liquido or 0, modo, total_fut, phone=usuario.phone)
     gastos_mes = sum(v for _, v in por_cat)
     disp = p['gastar'] - gastos_mes
     reserva = get_reserva(usuario.id)
@@ -1386,6 +1444,31 @@ def processar_recorrentes(phone_raw, usuario, texto):
         log.error(f"recorrentes: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
 
+
+def enviar_plano_contas(phone_raw, usuario):
+    """Mostra o plano de contas definido pelo utilizador."""
+    msg = (
+        "🏦 Plano de Contas\n\n"
+        "📍 *BPI* — Operacional\n"
+        "   Receber salário + pagar fixos + buffer 200€\n\n"
+        "🛡️ *Bankinter* — Fundo de Emergência\n"
+        "   Meta: 2.000-2.500€ · 5% no 1º ano\n"
+        "   Só usar em emergências reais\n\n"
+        "💰 *Trade Republic* — Poupança\n"
+        "   Cash (2%): objetivos a 1-3 anos\n"
+        "   ETF (MSCI World/VUAA): longo prazo 5+ anos\n\n"
+        "💑 *Revolut* — Dia a dia\n"
+        "   Orçamento variável + conjunta + vaults\n\n"
+        "📊 *Fluxo mensal:*\n"
+        "   Salário → BPI\n"
+        "   → Fixos ficam no BPI\n"
+        "   → Variável → Revolut\n"
+        "   → Conjunta 50€ → Revolut\n"
+        "   → Poupança → Bankinter (fundo incompleto)\n"
+        "              → Trade Republic (fundo completo)"
+    )
+    enviar_mensagem(phone_raw, msg)
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -1730,6 +1813,29 @@ def processar_texto(phone_raw, phone, texto):
             if not any(p in t for p in ['poupar','objetivo']):
                 processar_meta_categoria(phone_raw, usuario, texto); return
         # ── AJUDA / BOAS VINDAS ──
+        # ── PAGAMENTO DÍVIDA PESSOAL ──────────────────────────────────
+        m_divida = re.search(r'paguei\s+(\d+(?:[.,]\d+)?)\s+[àa]\s+([a-záàâãéêíóôõúç]+)', t)
+        if m_divida:
+            valor_pago = float(m_divida.group(1).replace(',','.'))
+            credor = m_divida.group(2).capitalize()
+            saldo_atual, parcela = get_saldo_divida(usuario.id, credor)
+            if saldo_atual > 0:
+                novo_saldo = max(0, saldo_atual - valor_pago)
+                set_saldo_divida(usuario.id, credor, novo_saldo, parcela)
+                # Registar como gasto
+                despesa = Despesa(usuario_id=usuario.id, valor=valor_pago, categoria='outros',
+                    descricao=f'Pagamento divida {credor}', data=agora().replace(tzinfo=None))
+                db.session.add(despesa); db.session.commit()
+                if novo_saldo > 0:
+                    meses_rest = int(novo_saldo / parcela) + (1 if novo_saldo % parcela > 0 else 0)
+                    enviar_mensagem(phone_raw,
+                        f"✅ Pago {valor_pago:.0f}€ à {credor}\n"
+                        f"💳 Saldo restante: {novo_saldo:.0f}€\n"
+                        f"📅 ~{meses_rest} mes(es) para terminar")
+                else:
+                    enviar_mensagem(phone_raw, f"🎉 Dívida à {credor} paga! Zero euros em dívida 💪")
+                return
+        # ──────────────────────────────────────────────────────────────
         if t.strip() in ['gastos','gastos?']:
             enviar_resumo(phone_raw, usuario); return
         if any(p in t for p in ['ajuda','help','/start','comandos']):
@@ -1780,6 +1886,8 @@ def processar_texto(phone_raw, phone, texto):
             enviar_resumo(phone_raw, usuario); return
 
         # ── PLANO ──
+        if any(p in t for p in ['plano contas','plano de contas','onde poupar','contas bancarias','minhas contas']):
+            enviar_plano_contas(phone_raw, usuario); return
         if any(p in t for p in ['plano','transferencia','transferência','distribuicao','ver plano']):
             enviar_plano_mes(phone_raw, usuario); return
 
@@ -2091,7 +2199,7 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
-    p = calcular_plano(salario, modo, total_fut)
+    p = calcular_plano(salario, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
     m = MODOS_POUPANCA[modo]
 
     msg  = f"💰 Boa, recebeste {salario:.2f}€! {m['emoji']}\n\n📋 Plano:\n"
@@ -2185,7 +2293,7 @@ def verificar_sobra_mes(phone_raw, usuario, mes, ano):
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
     if not usuario.salario_liquido: return
-    p = calcular_plano(usuario.salario_liquido, modo, total_fut)
+    p = calcular_plano(usuario.salario_liquido, modo, total_fut, phone=usuario.phone)
     gastos_mes = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
@@ -2359,7 +2467,7 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
-    p = calcular_plano(receita or 0, modo, total_fut)
+    p = calcular_plano(receita or 0, modo, total_fut, phone=usuario.phone)
     disp = p['gastar'] - gp
     nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
 
