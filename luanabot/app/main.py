@@ -3865,11 +3865,94 @@ def wrapped_anual():
                     enviar_mensagem(f"{u.phone}@lid", msg)
                 except Exception as e: log.error(f"wrapped: {e}")
 
+
+# ─── WAHA AUTO-RECOVERY ──────────────────────────────────────
+def configurar_webhook():
+    """Configura o webhook no WAHA. Chamado no arranque e pelo watchdog."""
+    import requests as req
+    import time
+    try:
+        # Verifica estado da sessão
+        r = req.get(
+            f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+            headers={'X-Api-Key': WAHA_API_KEY},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log.warning(f"WAHA sessão não encontrada, a iniciar...")
+            req.post(
+                f"{WAHA_URL}/api/sessions/{WAHA_SESSION}/start",
+                headers={'X-Api-Key': WAHA_API_KEY, 'Content-Type': 'application/json'},
+                json={}, timeout=10
+            )
+            time.sleep(5)
+
+        # Configura webhook
+        webhook_url = os.environ.get('BOT_URL', 'https://luanabot-production.up.railway.app') + '/webhook'
+        r2 = req.put(
+            f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+            headers={'X-Api-Key': WAHA_API_KEY, 'Content-Type': 'application/json'},
+            json={"config": {"webhooks": [{"url": webhook_url, "events": ["message"], "retries": None, "customHeaders": None}]}},
+            timeout=10
+        )
+        if r2.status_code in [200, 201]:
+            log.info(f"Webhook configurado: {webhook_url}")
+            return True
+        else:
+            log.error(f"Webhook falhou: {r2.status_code}")
+            return False
+    except Exception as e:
+        log.error(f"configurar_webhook: {e}")
+        return False
+
+
+def watchdog_waha():
+    """Verifica WAHA a cada 10 minutos e reconfigura se necessário."""
+    with app.app_context():
+        import requests as req
+        try:
+            r = req.get(
+                f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+                headers={'X-Api-Key': WAHA_API_KEY},
+                timeout=8
+            )
+            if r.status_code != 200:
+                log.warning("Watchdog: WAHA não responde, a reconfigurar...")
+                configurar_webhook()
+                return
+
+            data = r.json()
+            status = data.get('status', '')
+            webhook_ok = False
+
+            # Verifica se webhook está configurado
+            config = data.get('config') or {}
+            webhooks = config.get('webhooks', []) if config else []
+            if webhooks:
+                webhook_ok = True
+
+            if status != 'WORKING':
+                log.warning(f"Watchdog: status={status}, a reconfigurar...")
+                configurar_webhook()
+            elif not webhook_ok:
+                log.warning("Watchdog: webhook em falta, a reconfigurar...")
+                configurar_webhook()
+            else:
+                log.info(f"Watchdog: WAHA OK ({status})")
+        except Exception as e:
+            log.error(f"watchdog_waha: {e}")
+
 # ─── ARRANQUE ────────────────────────────────────────────────
 with app.app_context():
     try: db.create_all()
     except Exception as e: log.warning(f"db: {e}")
     criar_tabelas()
+    # Configura webhook automaticamente no arranque
+    import threading
+    def _init_webhook():
+        import time; time.sleep(8)
+        configurar_webhook()
+    threading.Thread(target=_init_webhook, daemon=True).start()
 
 import os
 if os.environ.get('SERVER_SOFTWARE','').startswith('gunicorn') and os.getpid() != os.getppid():
@@ -3885,6 +3968,7 @@ else:
     scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
     scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
     scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
+    scheduler.add_job(watchdog_waha,              'interval', minutes=10)
     scheduler.start()
 log.info("Ze das Financas v7 iniciado")
 
