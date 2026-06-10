@@ -1292,22 +1292,36 @@ def processar_despesa(phone_raw, usuario, texto):
             Despesa.usuario_id==usuario.id,
             db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
             Despesa.descricao.like('[conjunta]%')).scalar() or 0
-        resta_conj = 50 - gc
+        # Total depositado na conjunta este mês (ambos os utilizadores)
+        parceiro_phone_c = get_parceiro_phone(usuario.phone)
+        parceiro_c = Usuario.query.filter_by(phone=parceiro_phone_c).first() if parceiro_phone_c else None
+        ids_c = [usuario.id] + ([parceiro_c.id] if parceiro_c else [])
+        total_dep = 0
+        for uid_c in ids_c:
+            total_dep += db.session.execute(text(
+                "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
+                "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
+            ), {'u': uid_c, 'm': mes, 'y': ano}).scalar() or 0
+        # Se não há depósitos usa 0 como referência
+        resta_conj = total_dep - gc
         pessoa_txt = f" (com {pessoa})" if pessoa else ""
         msg = f"{emoji} {nome_loja} — {valor:.2f}€ 💑{pessoa_txt}\n"
-        msg += f"📊 Conjunta este mês: {gc:.2f}€ de 50€\n"
-        if resta_conj >= 0:
-            msg += f"💑 Resta: {resta_conj:.2f}€ na conjunta"
+        if total_dep > 0:
+            msg += f"📊 Conjunta: {gc:.2f}€ gastos de {total_dep:.0f}€\n"
+            if resta_conj >= 0:
+                msg += f"💚 Resta: {resta_conj:.2f}€"
+            else:
+                msg += f"⚠️ Passaram {abs(resta_conj):.2f}€ do que meteram!"
         else:
-            msg += f"⚠️ Passaste {abs(resta_conj):.2f}€ na conjunta!"
+            msg += f"📊 Gastos conjunta este mês: {gc:.2f}€\n"
+            msg += f"💡 Ainda não meteram dinheiro este mês"
         enviar_mensagem(phone_raw, msg)
 
         # Notifica o parceiro
         meu_nome = NOMES_CASAL.get(usuario.phone, 'O parceiro')
-        emoji_aviso = "💑"
-        notif_msg = (f"{emoji_aviso} *{meu_nome}* gastou {valor:.2f}€ na conjunta\n"
+        notif_msg = (f"💑 *{meu_nome}* gastou {valor:.2f}€ na conjunta\n"
                      f"📍 {nome_loja}\n"
-                     f"💑 Conjunta este mês: {gc:.2f}€ de 50€ · Resta {max(resta_conj,0):.2f}€")
+                     f"💚 Resta: {max(resta_conj,0):.2f}€ de {total_dep:.0f}€")
         notificar_parceiro(usuario.phone, notif_msg)
         return
 
@@ -1480,14 +1494,25 @@ def enviar_quanto_tenho(phone_raw, usuario):
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         Despesa.descricao.like('[conjunta]%')).scalar() or 0
-    resta_conj = 50 - gc
+    # Total depositado na conjunta este mês
+    parceiro_phone_q = get_parceiro_phone(usuario.phone)
+    parceiro_q = Usuario.query.filter_by(phone=parceiro_phone_q).first() if parceiro_phone_q else None
+    ids_q = [usuario.id] + ([parceiro_q.id] if parceiro_q else [])
+    total_dep_q = 0
+    for uid_q in ids_q:
+        total_dep_q += db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
+            "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
+        ), {'u': uid_q, 'm': mes, 'y': ano}).scalar() or 0
+    resta_conj = total_dep_q - gc
     modo = get_modo(usuario.id); m = MODOS_POUPANCA[modo]
     dias = dias_para_salario()
 
     msg = f"💰 Resumo de saldos {m['emoji']}\n\n"
     msg += f"💳 Para gastar: {disp:.2f}€"
     if disp < 0: msg += " ⚠️"
-    msg += f"\n💑 Conjunta: {max(resta_conj,0):.2f}€ disponíveis"
+    conj_txt = f"{max(resta_conj,0):.0f}€ de {total_dep_q:.0f}€" if total_dep_q > 0 else "sem depósito este mês"
+    msg += f"\n💑 Conjunta: {conj_txt}"
     msg += f"\n💎 Poupança prevista: {p['poupanca']:.0f}€"
     msg += f"\n🛡️ Reserva: {reserva:.2f}€"
     msg += f"\n\n📅 Faltam {dias} dia{'s' if dias!=1 else ''} para o salário"
