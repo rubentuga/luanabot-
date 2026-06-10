@@ -1268,7 +1268,7 @@ def simular_compra(phone_raw, usuario, texto):
 def verificar_aniversarios_proximo_mes(phone_raw, usuario, salario):
     """Chamado quando o salário é registado — verifica aniversários próximos."""
     hoje = agora().date()
-    em_30_dias = hoje + __import__('datetime').timedelta(days=30)
+    em_30_dias = hoje + timedelta(days=30)
     try:
         rows = db.session.execute(text("""
             SELECT nome, data_aniv FROM aniversarios
@@ -2082,7 +2082,10 @@ def processar_receita(phone_raw, usuario, texto):
     db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
     db.session.commit()
     enviar_plano_salario(phone_raw, usuario, valor)
-    verificar_aniversarios_proximo_mes(phone_raw, usuario, valor)
+    try:
+        verificar_aniversarios_proximo_mes(phone_raw, usuario, valor)
+    except Exception as e:
+        log.error(f"aniv_proximo: {e}")
 
 def enviar_plano_salario(phone_raw, usuario, salario):
     modo = get_modo(usuario.id)
