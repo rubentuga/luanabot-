@@ -3871,17 +3871,21 @@ with app.app_context():
     except Exception as e: log.warning(f"db: {e}")
     criar_tabelas()
 
-scheduler.add_job(lembrete_recibo,            'cron', hour=11, minute=0)
-scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
-scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
-scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
-scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
-scheduler.add_job(aviso_fim_mes_wishlist,     'cron', hour=11, minute=0)
-scheduler.add_job(resumo_semanal,             'cron', hour=9,  minute=30, day_of_week='mon')
-scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
-scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
-scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
-scheduler.start()
+import os
+if os.environ.get('SERVER_SOFTWARE','').startswith('gunicorn') and os.getpid() != os.getppid():
+    pass  # worker secundário — não inicia scheduler
+else:
+    scheduler.add_job(lembrete_recibo,            'cron', hour=11, minute=0)
+    scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
+    scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
+    scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
+    scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
+    scheduler.add_job(aviso_fim_mes_wishlist,     'cron', hour=11, minute=0)
+    scheduler.add_job(resumo_semanal,             'cron', hour=9,  minute=30, day_of_week='mon')
+    scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
+    scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
+    scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
+    scheduler.start()
 log.info("Ze das Financas v7 iniciado")
 
 if __name__ == '__main__':
