@@ -312,6 +312,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS recorrentes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, descricao VARCHAR(200), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, descricao))",
         "CREATE TABLE IF NOT EXISTS assinaturas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, nome VARCHAR(100), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS metas_categoria (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, categoria VARCHAR(50), limite FLOAT, mes INTEGER, ano INTEGER, UNIQUE(usuario_id, categoria, mes, ano))",
         "CREATE TABLE IF NOT EXISTS conjunta_depositos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT NOT NULL, descricao VARCHAR(200), data TIMESTAMP DEFAULT NOW())",
@@ -1090,6 +1091,271 @@ def processar_meta_categoria(phone_raw, usuario, texto):
         log.error(f"meta criar: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
 
+
+# ─── PREVISÕES / "AO RITMO ATUAL" ────────────────────────────
+def previsao_fim_mes(phone_raw, usuario):
+    hoje = agora()
+    mes = hoje.month; ano = hoje.year
+    dia_atual = hoje.day
+    import calendar
+    _, ultimo_dia = calendar.monthrange(ano, mes)
+    dias_restantes = ultimo_dia - dia_atual
+
+    gasto_mes = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes,
+        db.extract('year',Despesa.data)==ano,
+        ~Despesa.descricao.like('[conjunta]%'),
+        ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+
+    disp, p = calcular_disponivel(usuario)
+    gastar = p['gastar']
+
+    if dia_atual == 0 or gasto_mes == 0:
+        enviar_mensagem(phone_raw, "Ainda sem dados suficientes este mês 😊"); return
+
+    ritmo_diario = gasto_mes / dia_atual
+    previsao_total = ritmo_diario * ultimo_dia
+    previsao_fim = gastar - previsao_total
+
+    # Comparação com mês anterior
+    mes_ant = mes-1 if mes>1 else 12
+    ano_ant = ano if mes>1 else ano-1
+    gasto_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        db.extract('month',Despesa.data)==mes_ant,
+        db.extract('year',Despesa.data)==ano_ant,
+        ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
+
+    msg = f"🔮 Previsão\n\n"
+    msg += f"📅 Dia {dia_atual} de {ultimo_dia}\n"
+    msg += f"🛒 Gasto até agora: {gasto_mes:.0f}€\n"
+    msg += f"📈 Ritmo diário: ~{ritmo_diario:.1f}€/dia\n\n"
+
+    if previsao_fim >= 0:
+        msg += f"✅ Ao ritmo atual vais terminar o mês com ~{previsao_fim:.0f}€ disponíveis."
+    else:
+        msg += f"⚠️ Ao ritmo atual vais ultrapassar o orçamento em ~{abs(previsao_fim):.0f}€!"
+
+    if gasto_ant > 0 and dia_atual >= 5:
+        gasto_ant_proporcional = gasto_ant / ultimo_dia * dia_atual
+        diff_pct = round((gasto_mes - gasto_ant_proporcional) / gasto_ant_proporcional * 100)
+        if diff_pct < 0:
+            msg += f"\n🎉 Estás a gastar {abs(diff_pct)}% menos que no mês passado à mesma altura!"
+        elif diff_pct > 10:
+            msg += f"\n😬 Estás a gastar {diff_pct}% mais que no mês passado à mesma altura."
+
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── ORÇAMENTO INTELIGENTE (SUGESTÃO BASEADA EM MÉDIA) ───────
+def sugerir_orcamento(phone_raw, usuario):
+    hoje = agora()
+    mes = hoje.month; ano = hoje.year
+
+    msg = "📊 Sugestão de orçamento\nBaseada nos últimos 6 meses:\n\n"
+    categorias_com_dados = []
+
+    for cat in ['fastfood','restaurante','roupa','supermercado','combustivel','lazer','saude']:
+        totais = []
+        for i in range(1, 7):
+            m = mes - i
+            y = ano
+            while m <= 0: m += 12; y -= 1
+            v = gastos_cat_mes(usuario, cat, m, y)
+            if v > 0: totais.append(v)
+
+        if len(totais) >= 2:
+            media = sum(totais) / len(totais)
+            sugestao = round(media * 0.95 / 5) * 5  # -5% arredondado a 5
+            atual = gastos_cat_mes(usuario, cat, mes, ano)
+            emoji_c = EMOJI_CAT.get(cat, '💳')
+            msg += f"{emoji_c} {cat.capitalize()}\n"
+            msg += f"   Média 6m: {media:.0f}€ → Sugestão: {sugestao:.0f}€\n"
+            if atual > 0:
+                msg += f"   Este mês: {atual:.0f}€\n"
+            categorias_com_dados.append((cat, sugestao))
+
+    if not categorias_com_dados:
+        enviar_mensagem(phone_raw, "Ainda sem dados suficientes (preciso de pelo menos 2 meses) 😊")
+        return
+
+    msg += "\nPara criar meta: 'máximo roupa 175€'"
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── SIMULAR COMPRA MELHORADA (com check de objetivos) ────────
+def simular_compra(phone_raw, usuario, texto):
+    valor = extrair_valor(texto)
+    disp, p = calcular_disponivel(usuario)
+
+    if valor == 0:
+        enviar_mensagem(phone_raw, f"💚 Tens {disp:.0f}€ para gastar este mês."); return
+    if disp <= 0:
+        enviar_mensagem(phone_raw, f"🔴 Orçamento já ultrapassado — não compres agora 😅"); return
+
+    pct = valor / disp * 100
+    depois = disp - valor
+
+    # Verificar impacto nos objetivos
+    objs = db.session.execute(text(
+        "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
+        {'id':usuario.id}).fetchall()
+
+    # Extrair nome do produto
+    stop = {'posso','comprar','isto','compra','vale','consegue','consigo','devo','uma','um','umas','uns','para'}
+    palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
+    produto = ' '.join(palavras[:3]).capitalize() if palavras else f'compra de {valor:.0f}€'
+
+    msg = f"🛍️ {produto} — {valor:.0f}€\n"
+    msg += f"💰 Tens {disp:.0f}€ disponíveis\n\n"
+
+    if pct <= 25:
+        msg += "✅ Compra tranquila — menos de 25% do disponível."
+    elif pct <= 50:
+        msg += f"🟡 Dá, mas pesa. Ficas com {depois:.0f}€."
+    elif pct <= 100:
+        msg += f"🟠 Tecnicamente sim mas ficas com apenas {depois:.0f}€. Precisas mesmo?"
+    else:
+        msg += f"🔴 Não dá — faltam {valor-disp:.0f}€. Deixa para o próximo mês."
+        enviar_mensagem(phone_raw, msg); return
+
+    # Check objetivos
+    if objs and depois >= 0:
+        poupanca_mensal = p.get('poupanca', 0)
+        poupanca_restante = poupanca_mensal - valor
+        if poupanca_restante < 0:
+            obj = objs[0]
+            meses_extra = abs(poupanca_restante) / (obj[1] / 12) if obj[1] > 0 else 0
+            msg += f"\n⚠️ Atenção: pode atrasar o objetivo '{obj[0]}' em ~{meses_extra:.0f} mês(es)."
+        else:
+            msg += f"\n🎯 Os teus objetivos ficam intactos."
+
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── ANIVERSÁRIO AO RECEBER SALÁRIO ──────────────────────────
+def verificar_aniversarios_proximo_mes(phone_raw, usuario, salario):
+    """Chamado quando o salário é registado — verifica aniversários próximos."""
+    hoje = agora().date()
+    em_30_dias = hoje + __import__('datetime').timedelta(days=30)
+    try:
+        rows = db.session.execute(text("""
+            SELECT nome, data_aniv FROM aniversarios
+            WHERE usuario_id=:id
+            AND (
+                (EXTRACT(month FROM data_aniv)=:m1 AND EXTRACT(day FROM data_aniv)>=:d1)
+                OR
+                (EXTRACT(month FROM data_aniv)=:m2 AND EXTRACT(day FROM data_aniv)<=:d2)
+            )
+        """), {
+            'id': usuario.id,
+            'm1': hoje.month, 'd1': hoje.day,
+            'm2': em_30_dias.month, 'd2': em_30_dias.day
+        }).fetchall()
+    except Exception: return
+
+    for nome, data_aniv in rows:
+        try:
+            prox = data_aniv.replace(year=hoje.year)
+            if prox < hoje: prox = prox.replace(year=hoje.year+1)
+            dias = (prox - hoje).days
+            if 0 < dias <= 30:
+                phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+                set_estado(phone, 'aniv_apartar', {'nome': nome, 'dias': dias})
+                enviar_mensagem(phone_raw,
+                    f"🎂 Lembrete: {nome} faz anos daqui a {dias} dias!\n"
+                    f"Queres apartar dinheiro para a prenda? (sim/não)")
+        except Exception: continue
+
+
+# ─── OBJETIVOS CASAL COM CONTRIBUIÇÕES ───────────────────────
+def ver_objetivos_casal(phone_raw, usuario):
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'Tu')
+    par_nome = NOMES_CASAL.get(parceiro_phone, 'Parceiro') if parceiro_phone else 'Parceiro'
+
+    try:
+        objs = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+            "WHERE usuario_id=:id AND descricao LIKE '[casal]%' AND concluido=FALSE"),
+            {'id': usuario.id}).fetchall()
+    except Exception:
+        enviar_mensagem(phone_raw, "Erro 😕"); return
+
+    if not objs:
+        enviar_mensagem(phone_raw,
+            "Sem objetivos de casal ainda.\n\nCria: 'objetivo casal 1500€ para Paris'"); return
+
+    msg = "💑 Objetivos de casal\n\n"
+    for desc, objetivo, meu_atual in objs:
+        nome_obj = desc.replace('[casal] ','')
+        # Buscar contribuição do parceiro
+        par_atual = 0
+        if parceiro:
+            try:
+                r = db.session.execute(text(
+                    "SELECT valor_atual FROM objetivos_poupanca WHERE usuario_id=:uid AND descricao=:d AND concluido=FALSE"),
+                    {'uid': parceiro.id, 'd': desc}).fetchone()
+                if r: par_atual = r[0]
+            except Exception: pass
+
+        total_atual = meu_atual + par_atual
+        pct = round(total_atual / objetivo * 100) if objetivo > 0 else 0
+        barra = '█' * min(int(pct/10),10) + '░' * max(10-int(pct/10),0)
+        falta = objetivo - total_atual
+
+        msg += f"🎯 {nome_obj}\n"
+        msg += f"💰 {meu_nome}: {meu_atual:.0f}€"
+        if parceiro: msg += f"  |  {par_nome}: {par_atual:.0f}€"
+        msg += f"\n📊 Total: {total_atual:.0f}€ de {objetivo:.0f}€\n"
+        msg += f"{barra} {pct}%\n"
+        if falta > 0: msg += f"Faltam {falta:.0f}€\n"
+        else: msg += f"🎉 Objetivo atingido!\n"
+        msg += "\n"
+
+    enviar_mensagem(phone_raw, msg)
+
+
+# ─── COMPRAS RECORRENTES ─────────────────────────────────────
+def processar_recorrentes(phone_raw, usuario, texto):
+    t = texto.lower()
+    mes = agora().month; ano = agora().year
+
+    # Adicionar: "recorrente galp 50€ todo o mês"
+    m_add = re.search(r'(?:recorrente|todo o mes|todos os meses|mensal)\s+([a-zà-ú\s]+?)\s+(\d+(?:[.,]\d+)?)', t)
+    if m_add and any(p in t for p in ['recorrente','todo o mes','todos os meses']):
+        desc = m_add.group(1).strip().capitalize()
+        valor = float(m_add.group(2).replace(',','.'))
+        try:
+            db.session.execute(text(
+                "INSERT INTO recorrentes (usuario_id, descricao, valor) VALUES (:u,:d,:v) ON CONFLICT DO NOTHING"),
+                {'u':usuario.id,'d':desc,'v':valor})
+            db.session.commit()
+            enviar_mensagem(phone_raw, f"🔁 Recorrente adicionado!\n{desc} — {valor:.0f}€/mês\n\nDiz 'recorrentes' para ver todos.")
+        except Exception as e:
+            log.error(f"recorrente add: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Listar
+    try:
+        rows = db.session.execute(text(
+            "SELECT descricao, valor FROM recorrentes WHERE usuario_id=:u ORDER BY valor DESC"),
+            {'u':usuario.id}).fetchall()
+        if not rows:
+            enviar_mensagem(phone_raw, "🔁 Sem recorrentes.\nAdiciona: 'recorrente Galp 50€ todo o mês'")
+            return
+        total = sum(r[1] for r in rows)
+        msg = "🔁 Compras recorrentes\n\n"
+        for desc, val in rows:
+            msg += f"• {desc} — {val:.0f}€\n"
+        msg += f"\n💰 Total: {total:.0f}€/mês"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"recorrentes: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -1103,6 +1369,29 @@ def processar_texto(phone_raw, phone, texto):
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
+        if estado == 'aniv_apartar':
+            nome_aniv = dados_estado.get('nome','')
+            dias_aniv = dados_estado.get('dias', 0)
+            limpar_estado(phone)
+            if any(p in t for p in ['sim','s','yes','claro','quero']):
+                set_estado(phone, 'aniv_apartar_valor', {'nome': nome_aniv})
+                enviar_mensagem(phone_raw, f"💝 Quanto queres apartar para a prenda do(a) {nome_aniv}?")
+            else:
+                enviar_mensagem(phone_raw, f"Ok! Podes sempre apartar depois dizendo 'prenda {nome_aniv} 50€' 💪")
+            return
+        if estado == 'aniv_apartar_valor':
+            nome_aniv = dados_estado.get('nome','')
+            valor_prenda = extrair_valor(texto)
+            limpar_estado(phone)
+            if valor_prenda > 0:
+                try:
+                    db.session.execute(text(
+                        "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u,:d,:v,0)"),
+                        {'u':usuario.id,'d':f'🎁 Prenda {nome_aniv}','v':valor_prenda})
+                    db.session.commit()
+                    enviar_mensagem(phone_raw, f"💝 Apartei {valor_prenda:.0f}€ para a prenda do(a) {nome_aniv}!\nVê em 'objetivos' 🎁")
+                except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+            return
         if estado == 'conjunta_sem_desc':
             valor_c = dados_estado.get('valor', 0)
             limpar_estado(phone)
@@ -1341,6 +1630,19 @@ def processar_texto(phone_raw, phone, texto):
                 mes_n = next((v for k,v in meses_map.items() if k in t), None)
                 enviar_mensagem(phone_raw, picos_resumo_fn(phone, mes=mes_n)); return
         # ──────────────────────────────────────────────────────────────
+        # ── PRENDA para aniversário ──
+        m_prenda = re.search(r'prenda\s+([a-záàâãéêíóôõúç]+)\s+(\d+)', t)
+        if m_prenda:
+            nome_p = m_prenda.group(1).capitalize()
+            valor_p = float(m_prenda.group(2))
+            try:
+                db.session.execute(text(
+                    "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u,:d,:v,0)"),
+                    {'u':usuario.id,'d':f'Prenda {nome_p}','v':valor_p})
+                db.session.commit()
+                enviar_mensagem(phone_raw, f"💝 Apartado {valor_p:.0f}€ para prenda do(a) {nome_p}! 🎁")
+            except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+            return
         # ── ANIVERSÁRIOS ──
         if any(p in t for p in ['aniversario','aniversário','faz anos']) or t.strip() == 'aniversarios':
             processar_aniversario(phone_raw, usuario, texto); return
@@ -1369,6 +1671,18 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['quem criou','quem te fez','quem te criou','criador','quem te programou']):
             enviar_mensagem(phone_raw, "Fui criado pelo tuga27 🚀\nO mesmo genio por tras do Zeflix e agora do teu gestor financeiro 😎"); return
 
+        # ── PREVISÃO / AO RITMO ATUAL ──
+        if any(p in t for p in ['ao ritmo atual','previsao','previsão','como vou acabar','como acabo','quanto vou gastar']):
+            previsao_fim_mes(phone_raw, usuario); return
+        # ── ORÇAMENTO INTELIGENTE ──
+        if any(p in t for p in ['sugerir orcamento','sugere orcamento','orcamento inteligente','media gastos','quanto devia gastar']):
+            sugerir_orcamento(phone_raw, usuario); return
+        # ── OBJETIVOS CASAL ──
+        if any(p in t for p in ['objetivos casal','objetivo casal ver','metas casal']):
+            ver_objetivos_casal(phone_raw, usuario); return
+        # ── RECORRENTES ──
+        if any(p in t for p in ['recorrente','recorrentes','compras mensais']):
+            processar_recorrentes(phone_raw, usuario, texto); return
         # ── COMO ESTOU? (dashboard natural) ──
         if any(p in t for p in ['como estou','como e que estou','situacao atual','dashboard','overview','resumo geral','visao geral']):
             como_estou(phone_raw, usuario); return
@@ -1708,6 +2022,7 @@ def processar_receita(phone_raw, usuario, texto):
     db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
     db.session.commit()
     enviar_plano_salario(phone_raw, usuario, valor)
+    verificar_aniversarios_proximo_mes(phone_raw, usuario, valor)
 
 def enviar_plano_salario(phone_raw, usuario, salario):
     modo = get_modo(usuario.id)
@@ -2246,19 +2561,7 @@ def processar_despesa_futura(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, f"📅 Anotado! {desc}: {valor:.0f}€ {when}\nVai aparecer nos fixos do mes 👍\n\nPara cancelar: 'afinal nao tenho {desc.lower()}'")
 
 # ─── SIMULAR COMPRA ──────────────────────────────────────────
-def simular_compra(phone_raw, usuario, texto):
-    valor = extrair_valor(texto)
-    disp, _ = calcular_disponivel(usuario)
-    if valor == 0:
-        enviar_mensagem(phone_raw, f"💚 Tens {disp:.2f}€ para gastar este mes."); return
-    if disp <= 0:
-        enviar_mensagem(phone_raw, f"🔴 Nem penses! Ja nao tens orcamento 😅"); return
-    pct = valor/disp*100
-    if pct <= 30:    resp = f"✅ Vai nessa! {valor:.0f}€ e so {pct:.0f}% do disponivel. Ficas com {disp-valor:.0f}€ 🛍️"
-    elif pct <= 60:  resp = f"🟡 Da, mas pesa. Ficas com {disp-valor:.0f}€. Precisas mesmo?"
-    elif pct <= 100: resp = f"🟠 Tecnicamente sim mas ficas quase a zero ({disp-valor:.0f}€)."
-    else:            resp = f"🔴 Nao da. Faltam {valor-disp:.0f}€. Deixa p/ o mes que vem 😬"
-    enviar_mensagem(phone_raw, resp)
+
 
 # ─── RESUMO POR PESSOA ───────────────────────────────────────
 def resumo_por_pessoa(phone_raw, usuario, texto):
