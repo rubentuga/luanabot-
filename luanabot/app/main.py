@@ -1970,6 +1970,27 @@ def processar_despesa(phone_raw, usuario, texto):
 
         # Notifica o parceiro
         meu_nome = NOMES_CASAL.get(usuario.phone, 'O parceiro')
+        # Round up → coisasnossas
+        import math
+        arredondado = math.ceil(valor)
+        diferenca = round(arredondado - valor, 2)
+        if diferenca > 0:
+            try:
+                r_obj = db.session.execute(text(
+                    "SELECT id, valor_atual FROM objetivos_poupanca WHERE usuario_id=:u AND LOWER(descricao)='coisasnossas' AND concluido=FALSE"
+                ), {'u': usuario.id}).fetchone()
+                if r_obj:
+                    db.session.execute(text(
+                        "UPDATE objetivos_poupanca SET valor_atual=valor_atual+:d WHERE id=:id"
+                    ), {'d': diferenca, 'id': r_obj[0]})
+                else:
+                    db.session.execute(text(
+                        "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u, 'coisasnossas', 9999, :d)"
+                    ), {'u': usuario.id, 'd': diferenca})
+                db.session.commit()
+                msg += f"\n🪙 +{diferenca:.2f}€ → coisasnossas"
+            except Exception as e:
+                log.error(f"roundup: {e}"); db.session.rollback()
         notif_msg = (f"💑 *{meu_nome}* gastou {valor:.2f}€ na conjunta\n"
                      f"📍 {nome_loja}\n"
                      f"💚 Resta: {max(resta_conj,0):.2f}€ de {total_dep:.0f}€")
