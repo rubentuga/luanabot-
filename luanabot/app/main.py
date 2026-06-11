@@ -339,7 +339,9 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50), data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, km_percorridos FLOAT, valor FLOAT, litros FLOAT, custo_por_km FLOAT, consumo_l100 FLOAT)",
         "CREATE TABLE IF NOT EXISTS dividas_pessoais (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, credor VARCHAR(100), saldo FLOAT DEFAULT 0, parcela_mensal FLOAT DEFAULT 0, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, credor))",
+        "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, valor FLOAT, litros FLOAT, km_ganhos FLOAT, custo_por_km FLOAT)",
         "CREATE TABLE IF NOT EXISTS recorrentes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, descricao VARCHAR(200), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, descricao))",
         "CREATE TABLE IF NOT EXISTS assinaturas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, nome VARCHAR(100), valor FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS metas_categoria (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, categoria VARCHAR(50), limite FLOAT, mes INTEGER, ano INTEGER, UNIQUE(usuario_id, categoria, mes, ano))",
@@ -625,6 +627,151 @@ def webhook():
     except Exception as e:
         log.error(f'Webhook: {e}', exc_info=True)
     return jsonify({'status':'ok'})
+
+
+
+@app.route('/api/relatorio', methods=['GET'])
+def api_relatorio():
+    """Gera relatorio mensal em PDF simples (HTML)."""
+    token = request.args.get('token','')
+    phone = request.args.get('phone','')
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+    mes_p = request.args.get('mes')
+    ano_p = request.args.get('ano')
+    hoje = agora()
+    mes = int(mes_p) if mes_p else hoje.month
+    ano = int(ano_p) if ano_p else hoje.year
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error':'not found'}), 404
+        nomes_mes = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
+                     'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+        # Dados do mês
+        gastos = db.session.execute(text(
+            "SELECT categoria, SUM(valor) as total FROM despesas "
+            "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y "
+            "AND descricao NOT LIKE '[conjunta]%%' "
+            "GROUP BY categoria ORDER BY total DESC"),
+            {'u':usuario.id,'m':mes,'y':ano}).fetchall()
+        total_gastos = sum(r[1] for r in gastos)
+        receitas = db.session.execute(text(
+            "SELECT SUM(valor) FROM receitas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+            {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
+        EMOJI_CAT_R = {'fastfood':'🍔','restaurante':'🍽️','roupa':'👗','supermercado':'🛒',
+            'combustivel':'⛽','saude':'💊','lazer':'🎭','outros':'💳','carro':'🚗',
+            'tecnologia':'📱','subscricoes':'📺','pessoal':'💅','casa':'🏠','viagem':'✈️'}
+        cats_html = ''.join([
+            f'<tr><td>{EMOJI_CAT_R.get(r[0],"💳")} {r[0].capitalize()}</td>'
+            f'<td style="text-align:right">{r[1]:.2f}€</td>'
+            f'<td style="text-align:right;color:#999">{round(r[1]/total_gastos*100) if total_gastos else 0}%</td></tr>'
+            for r in gastos
+        ])
+        html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+        <title>Relatório {nomes_mes[mes-1]} {ano}</title>
+        <style>body{{font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#222;padding:20px}}
+        h1{{color:#5a8ff0;font-size:22px}}h2{{font-size:15px;color:#666;font-weight:normal;margin-bottom:24px}}
+        .kpi{{display:flex;gap:16px;margin:20px 0}}.kpi-box{{flex:1;background:#f5f7ff;border-radius:8px;padding:14px;text-align:center}}
+        .kpi-label{{font-size:11px;color:#888;text-transform:uppercase}}.kpi-val{{font-size:20px;font-weight:700;color:#5a8ff0}}
+        table{{width:100%;border-collapse:collapse;margin:16px 0}}td{{padding:8px 6px;border-bottom:1px solid #eee}}
+        .footer{{color:#aaa;font-size:11px;margin-top:32px;text-align:center}}</style></head>
+        <body><h1>Relatório Financeiro</h1><h2>{nomes_mes[mes-1]} {ano} · {usuario.nome or phone}</h2>
+        <div class="kpi">
+          <div class="kpi-box"><div class="kpi-label">Receita</div><div class="kpi-val">{receitas:.0f}€</div></div>
+          <div class="kpi-box"><div class="kpi-label">Gastos</div><div class="kpi-val" style="color:#f05a5a">{total_gastos:.2f}€</div></div>
+          <div class="kpi-box"><div class="kpi-label">Saldo</div><div class="kpi-val" style="color:{'#22d37a' if receitas-total_gastos>=0 else '#f05a5a'}">{receitas-total_gastos:.0f}€</div></div>
+        </div>
+        <table><tr><th style="text-align:left">Categoria</th><th style="text-align:right">Total</th><th style="text-align:right">%</th></tr>
+        {cats_html}</table>
+        <div class="footer">Zé das Finanças · {hoje.strftime('%d/%m/%Y')}</div>
+        </body></html>"""
+        return html, 200, {'Content-Type':'text/html; charset=utf-8'}
+    except Exception as e:
+        log.error(f"api_relatorio: {e}")
+        return jsonify({'error':str(e)}), 500
+
+@app.route('/api/gasto', methods=['POST'])
+def api_gasto():
+    """Endpoint para iOS Shortcut / Apple Pay."""
+    data = request.get_json(silent=True) or {}
+    token = data.get('token') or request.headers.get('X-Token','')
+    phone = data.get('phone','')
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+    valor = float(data.get('valor', 0))
+    descricao = data.get('descricao', 'Apple Pay')
+    if valor <= 0:
+        return jsonify({'error':'valor invalido'}), 400
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error':'utilizador nao encontrado'}), 404
+        cat, emoji, nome_loja = categorizar(descricao)
+        despesa = Despesa(
+            usuario_id=usuario.id, valor=valor, categoria=cat,
+            descricao=f'[ApplePay] {nome_loja}',
+            data=agora().replace(tzinfo=None)
+        )
+        db.session.add(despesa); db.session.commit()
+        disp, _ = calcular_disponivel(usuario)
+        return jsonify({
+            'status': 'ok',
+            'gasto': valor,
+            'categoria': cat,
+            'disponivel': round(disp, 2),
+            'mensagem': f'{emoji} {nome_loja} {valor:.2f}€ registado'
+        })
+    except Exception as e:
+        log.error(f"api_gasto: {e}"); db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/picos', methods=['GET'])
+def api_picos():
+    """API para horas extras do utilizador."""
+    token = request.args.get('token') or request.headers.get('X-Token','')
+    phone = request.args.get('phone','')
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+    mes_param = request.args.get('mes')
+    ano_param = request.args.get('ano')
+    import calendar
+    hoje = agora()
+    mes = int(mes_param) if mes_param else hoje.month
+    ano = int(ano_param) if ano_param else hoje.year
+    _, ultimo_dia = calendar.monthrange(ano, mes)
+    try:
+        rows = db.session.execute(text("""
+            SELECT data, entrada, saida, horas_trabalhadas, horas_extra, dia_folga
+            FROM picos
+            WHERE user_phone=:p AND data>=:ini AND data<=:fim
+            ORDER BY data ASC
+        """), {'p': phone, 'ini': f"{ano}-{mes:02d}-01", 'fim': f"{ano}-{mes:02d}-{ultimo_dia:02d}"}).fetchall()
+        dias = []
+        total_extra = 0
+        for r in rows:
+            dias.append({
+                'data': r[0].strftime('%d/%m'),
+                'entrada': r[1].strftime('%H:%M') if r[1] else None,
+                'saida': r[2].strftime('%H:%M') if r[2] else None,
+                'horas': round(float(r[3] or 0), 2),
+                'extra': round(float(r[4] or 0), 2),
+                'folga': bool(r[5])
+            })
+            total_extra += float(r[4] or 0)
+        return jsonify({
+            'mes': mes, 'ano': ano,
+            'dias': dias,
+            'total_extra': round(total_extra, 2),
+            'dias_com_extra': len([d for d in dias if d['extra'] > 0])
+        })
+    except Exception as e:
+        log.error(f"api_picos: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health():
@@ -1469,6 +1616,261 @@ def enviar_plano_contas(phone_raw, usuario):
     )
     enviar_mensagem(phone_raw, msg)
 
+
+def enviar_onde_vai_dinheiro(phone_raw, usuario):
+    """Mostra como distribuir o salario este mes."""
+    p = calcular_plano(usuario.salario_liquido or 0, phone=usuario.phone, usuario_id=usuario.id)
+    salario = usuario.salario_liquido or 0
+    fixos = p.get('total_fixos', 0)
+    gastar = p.get('gastar', 0)
+    poupanca = p.get('poupanca', 0)
+    subsidio = p.get('subsidio', False)
+    META_FUNDO = 2500
+    try:
+        saldo_reserva = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            Despesa.descricao.like('[reserva]%')).scalar() or 0
+    except Exception:
+        saldo_reserva = 0
+    fundo_completo = saldo_reserva >= META_FUNDO
+    pct_fundo = round(saldo_reserva / META_FUNDO * 100) if not fundo_completo else 100
+
+    msg = f"\U0001f4b6 Distribuicao de {salario:.0f}\u20ac\n\n"
+    if subsidio:
+        msg += "\U0001f389 Subsidio incluido!\n\n"
+    msg += f"\U0001f4cd BPI (fica aqui)\n"
+    msg += f"   Fixos: {fixos:.0f}\u20ac\n"
+    msg += f"   Buffer: 200\u20ac\n\n"
+    msg += f"\U0001f491 Revolut\n"
+    msg += f"   Variavel: {gastar:.0f}\u20ac\n"
+    msg += f"   Conjunta: 50\u20ac\n\n"
+    if not fundo_completo:
+        pb = round(poupanca * 0.7)
+        pt = round(poupanca * 0.3)
+        msg += f"\U0001f6e1 Bankinter (70%) — Fundo emergencia ({pct_fundo}% de {META_FUNDO:.0f}\u20ac)\n"
+        msg += f"   {pb:.0f}\u20ac\n\n"
+        msg += f"\U0001f4b0 Trade Republic (30%)\n"
+        msg += f"   Cash: {pt:.0f}\u20ac\n"
+    else:
+        msg += f"\U0001f6e1 Bankinter — Fundo completo \u2705\n\n"
+        pc = round(poupanca * 0.5)
+        pe = round(poupanca * 0.5)
+        msg += f"\U0001f4b0 Trade Republic\n"
+        msg += f"   Cash (2%): {pc:.0f}\u20ac\n"
+        msg += f"   ETF MSCI World: {pe:.0f}\u20ac\n"
+    msg += f"\n\U0001f4ca Total: {salario:.0f}\u20ac"
+    enviar_mensagem(phone_raw, msg)
+
+
+def processar_abastecimento(phone_raw, usuario, texto):
+    """Regista abastecimento de gasolina com tracking de km."""
+    t = texto.lower()
+
+    # Ver histórico: "gasolina", "abastecimentos", "consumo"
+    if any(p in t for p in ['historico gasolina','historico abastecimento','ver abastecimentos','consumo carro']):
+        try:
+            rows = db.session.execute(text(
+                "SELECT data, km_antes, km_depois, valor, km_ganhos, custo_por_km "
+                "FROM abastecimentos WHERE usuario_id=:u ORDER BY data DESC LIMIT 6"),
+                {'u': usuario.id}).fetchall()
+            if not rows:
+                enviar_mensagem(phone_raw, "⛽ Ainda sem abastecimentos registados.\nDiz: tinha 50km meti 25€ agora tenho 450km")
+                return
+            msg = "⛽ Últimos abastecimentos\n\n"
+            for r in rows:
+                data_fmt = r[0].strftime('%d/%m')
+                msg += f"📅 {data_fmt} — {r[3]:.0f}€"
+                if r[4]: msg += f" | {r[4]:.0f}km"
+                if r[5]: msg += f" | {r[5]:.3f}€/km"
+                msg += "\n"
+            # Médias
+            media_rows = db.session.execute(text(
+                "SELECT AVG(valor), AVG(km_ganhos), AVG(custo_por_km) "
+                "FROM abastecimentos WHERE usuario_id=:u AND km_ganhos IS NOT NULL"),
+                {'u': usuario.id}).fetchone()
+            if media_rows and media_rows[0]:
+                msg += f"\n📊 Médias:\n"
+                msg += f"   Custo: {media_rows[0]:.0f}€/abastecimento\n"
+                if media_rows[1]: msg += f"   Autonomia: {media_rows[1]:.0f}km\n"
+                if media_rows[2]: msg += f"   Eficiência: {media_rows[2]:.3f}€/km\n"
+            enviar_mensagem(phone_raw, msg)
+        except Exception as e:
+            log.error(f"historico abastecimento: {e}")
+            enviar_mensagem(phone_raw, "Erro 😕")
+        return
+
+    # Registar: "tinha Xkm meti Z€ agora tenho Ykm"
+    import re as re2
+    km_antes = None; km_depois = None; valor = None; litros = None
+
+    m_antes = re2.search(r'tinha\s+(\d+(?:[.,]\d+)?)\s*km', t)
+    m_depois = re2.search(r'(?:agora(?:\s+tenho)?|tenho agora)\s+(\d+(?:[.,]\d+)?)\s*km', t)
+    m_valor = re2.search(r'(\d+(?:[.,]\d+)?)\s*(?:€|euros?|euro)', t)
+    m_litros = re2.search(r'(\d+(?:[.,]\d+)?)\s*(?:l|litros?)', t)
+
+    if m_antes: km_antes = float(m_antes.group(1).replace(',','.'))
+    if m_depois: km_depois = float(m_depois.group(1).replace(',','.'))
+    if m_valor: valor = float(m_valor.group(1).replace(',','.'))
+    if m_litros: litros = float(m_litros.group(1).replace(',','.'))
+
+    if valor is None:
+        enviar_mensagem(phone_raw,
+            "⛽ Para registar abastecimento diz:\n"
+            "tinha 50km meti 25€ agora tenho 450km\n\n"
+            "Para ver histórico: historico gasolina")
+        return
+
+    km_ganhos = None; custo_por_km = None
+    if km_antes is not None and km_depois is not None and km_depois > km_antes:
+        km_ganhos = km_depois - km_antes
+        custo_por_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else None
+
+    try:
+        db.session.execute(text(
+            "INSERT INTO abastecimentos (usuario_id, data, km_antes, km_depois, valor, litros, km_ganhos, custo_por_km) "
+            "VALUES (:u, :d, :ka, :kd, :v, :l, :kg, :cpk)"),
+            {'u': usuario.id, 'd': agora().replace(tzinfo=None),
+             'ka': km_antes, 'kd': km_depois, 'v': valor,
+             'l': litros, 'kg': km_ganhos, 'cpk': custo_por_km})
+        # Também regista como despesa
+        despesa = Despesa(usuario_id=usuario.id, valor=valor, categoria='combustivel',
+            descricao='Gasolina', data=agora().replace(tzinfo=None))
+        db.session.add(despesa)
+        db.session.commit()
+
+        msg = f"⛽ Abastecimento registado!\n"
+        msg += f"💰 {valor:.0f}€"
+        if litros: msg += f" | {litros:.1f}L"
+        if km_ganhos:
+            msg += f"\n🛣️ +{km_ganhos:.0f}km de autonomia"
+        if custo_por_km:
+            msg += f"\n📊 {custo_por_km:.3f}€/km"
+            # Comparar com carro do utilizador
+            consumo = usuario.carro_consumo_l100 or 7.5
+            msg += f"\n🚗 {usuario.carro_nome or 'Carro'}: ~{consumo}L/100km"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"abastecimento: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro 😕")
+
+
+def registar_abastecimento(phone_raw, usuario, texto):
+    """Regista abastecimento com autonomia antes/depois e valor."""
+    t = texto.lower()
+    nums = re.findall(r'\d+(?:[.,]\d+)?', t)
+    floats = [float(n.replace(',','.')) for n in nums]
+
+    if len(floats) < 3:
+        enviar_mensagem(phone_raw,
+            "⛽ Não percebi. Tenta assim:\n"
+            "*tinha 80km meti 20€ fiquei com 200km*")
+        return
+
+    # Identificar valor (€) vs autonomia (km)
+    # Valor é tipicamente <= 100€, autonomia >= 30km
+    # Ordem natural: autonomia_antes, valor, autonomia_depois
+    # Ou detetar por contexto (meti/gastei antes do número = valor)
+    m_antes = re.search(r'tinha\s+(\d+)', t)
+    m_valor = re.search(r'(?:meti|gastei|paguei|custou)\s+(\d+(?:[.,]\d+)?)', t)
+    m_depois = re.search(r'(?:fiquei|tenho|ficou|agora)\s+(?:com\s+)?(\d+)', t)
+
+    if m_antes and m_valor and m_depois:
+        km_antes = float(m_antes.group(1))
+        valor = float(m_valor.group(1).replace(',','.'))
+        km_depois = float(m_depois.group(1))
+    elif len(floats) >= 3:
+        # Fallback: 3 números — menor do meio é o valor
+        floats_sorted_idx = sorted(range(len(floats[:3])), key=lambda i: floats[i])
+        valor = floats[floats_sorted_idx[0]]  # menor = euros
+        km_candidates = [f for i,f in enumerate(floats[:3]) if i != floats_sorted_idx[0]]
+        km_antes = min(km_candidates)
+        km_depois = max(km_candidates)
+    else:
+        enviar_mensagem(phone_raw,
+            "⛽ Não percebi. Tenta:\n*tinha 80km meti 20€ fiquei com 200km*")
+        return
+
+    km_ganhos = km_depois - km_antes  # km de autonomia ganhos com o abastecimento
+    consumo = usuario.carro_consumo_l100 or 7.5
+    litros_estimados = round(km_ganhos * consumo / 100, 2) if km_ganhos > 0 else 0
+    custo_litro = round(valor / litros_estimados, 3) if litros_estimados > 0 else 0
+    custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
+
+    try:
+        db.session.execute(text(
+            "INSERT INTO abastecimentos (user_phone, data, km_antes, km_depois, km_percorridos, "
+            "valor, litros, custo_por_km, consumo_l100) VALUES (:p,:d,:a,:b,:c,:v,:l,:cpk,:cons)"),
+            {'p': usuario.phone, 'd': agora().replace(tzinfo=None),
+             'a': km_antes, 'b': km_depois, 'c': km_perc,
+             'v': valor, 'l': litros_estimados, 'cpk': custo_km, 'cons': consumo})
+
+        # Registar como gasto de combustível
+        despesa = Despesa(usuario_id=usuario.id, valor=valor, categoria='combustivel',
+            descricao=f'Gasolina {km_perc:.0f}km', data=agora().replace(tzinfo=None))
+        db.session.add(despesa)
+        db.session.commit()
+
+        # Histórico último mês
+        um_mes = agora().replace(tzinfo=None) - __import__('datetime').timedelta(days=30)
+        hist = db.session.execute(text(
+            "SELECT SUM(km_percorridos), SUM(valor), COUNT(*) FROM abastecimentos "
+            "WHERE user_phone=:p AND data>=:d"),
+            {'p': usuario.phone, 'd': um_mes}).fetchone()
+
+        msg = f"⛽ Abastecimento registado!\n\n"
+        msg += f"📉 Antes: {km_antes:.0f}km autonomia\n"
+        msg += f"📈 Depois: {km_depois:.0f}km autonomia\n"
+        msg += f"💰 {valor:.0f}€"
+        if litros_estimados > 0:
+            msg += f" (~{litros_estimados:.1f}L · {custo_litro:.2f}€/L)"
+        msg += f"\n"
+        if hist and hist[0]:
+            msg += f"\n📅 Últimos 30 dias:\n"
+            msg += f"   {hist[0]:.0f}km | {hist[1]:.0f}€ | {hist[2]} abastecimentos"
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"abastecimento: {e}")
+        enviar_mensagem(phone_raw, "Erro ao registar 😕"); return
+
+    enviar_mensagem(phone_raw, msg)
+
+
+def ver_historico_combustivel(phone_raw, usuario):
+    """Mostra histórico de abastecimentos."""
+    try:
+        rows = db.session.execute(text(
+            "SELECT data, km_antes, km_depois, km_percorridos, valor, custo_por_km "
+            "FROM abastecimentos WHERE user_phone=:p "
+            "ORDER BY data DESC LIMIT 5"),
+            {'p': usuario.phone}).fetchall()
+
+        if not rows:
+            enviar_mensagem(phone_raw,
+                "⛽ Sem abastecimentos registados.\n\nRegista assim:\n"
+                "*tinha 52340 tenho 52640 meti 20€*")
+            return
+
+        # Stats gerais
+        stats = db.session.execute(text(
+            "SELECT SUM(km_percorridos), SUM(valor), AVG(custo_por_km), COUNT(*) "
+            "FROM abastecimentos WHERE user_phone=:p"),
+            {'p': usuario.phone}).fetchone()
+
+        msg = "⛽ Histórico combustível\n\n"
+        if stats[0]:
+            msg += f"📊 Total: {stats[0]:.0f}km | {stats[1]:.0f}€\n"
+            msg += f"💰 Média: {stats[2]*100:.1f}€/100km\n\n"
+
+        msg += "Últimos abastecimentos:\n"
+        for r in rows:
+            data_fmt = r[0].strftime('%d/%m') if r[0] else '—'
+            msg += f"• {data_fmt}: {r[3]:.0f}km | {r[4]:.0f}€\n"
+
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"historico combustivel: {e}")
+        enviar_mensagem(phone_raw, "Erro 😕")
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -1892,6 +2294,8 @@ def processar_texto(phone_raw, phone, texto):
             enviar_resumo(phone_raw, usuario); return
 
         # ── PLANO ──
+        if any(p in t for p in ['onde vai o dinheiro','distribuir','como distribuir','onde meto','onde coloco','onde ponho','dividir salario']):
+            enviar_onde_vai_dinheiro(phone_raw, usuario); return
         if any(p in t for p in ['plano contas','plano de contas','onde poupar','contas bancarias','minhas contas']):
             enviar_plano_contas(phone_raw, usuario); return
         if any(p in t for p in ['plano','transferencia','transferência','distribuicao','ver plano']):
