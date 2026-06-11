@@ -2622,7 +2622,18 @@ def enviar_plano_salario(phone_raw, usuario, salario):
 
     msg  = f"💰 Boa, recebeste {salario:.2f}€! {m['emoji']}\n\n📋 Plano:\n"
     msg += f"🏠 Fixos: {p['total_fixos']:.0f}€\n"
-    msg += f"   🚗{p['carro']:.0f} | 💼{p['ordem']:.0f} | 💅{p['unhas']:.0f} | 💑{p['conjunta']:.0f} | ⛽{p['combustivel']:.0f}"
+    # Mostrar fixos dinamicamente consoante o utilizador
+    fixos_display = []
+    if p.get('mae'):        fixos_display.append(f"👩 {p['mae']:.0f}")
+    if p.get('carro'):      fixos_display.append(f"🚗 {p['carro']:.0f}")
+    if p.get('credito1'):   fixos_display.append(f"💳 {p['credito1']:.0f}")
+    if p.get('credito2'):   fixos_display.append(f"💳 {p['credito2']:.0f}")
+    if p.get('ordem'):      fixos_display.append(f"💼 {p['ordem']:.0f}")
+    if p.get('unhas'):      fixos_display.append(f"💅 {p['unhas']:.0f}")
+    if p.get('conjunta'):   fixos_display.append(f"💑 {p['conjunta']:.0f}")
+    if p.get('combustivel'):fixos_display.append(f"⛽ {p['combustivel']:.0f}")
+    if p.get('divida_luana'):fixos_display.append(f"💸 {p['divida_luana']:.0f}")
+    msg += "   " + " | ".join(fixos_display)
     if total_fut > 0:
         msg += f"\n   📅 Despesas mes: {total_fut:.0f}€"
         for d in futuras: msg += f"\n     {d.descricao}: {d.valor_reserva_mensal:.0f}€"
