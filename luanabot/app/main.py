@@ -634,6 +634,80 @@ def webhook():
 
 
 
+
+@app.route('/api/webhook/recibo', methods=['POST'])
+def webhook_recibo():
+    """Chamado pelo Google Apps Script quando chega recibo de vencimento."""
+    data = request.get_json(silent=True) or {}
+
+    # Aceita chamadas sem token (do Google Apps Script legado) ou com token
+    token = data.get('token','')
+    phone = data.get('phone', PHONE_RUBEN)
+    if token:
+        expected = (phone[:8] + 'zef') if phone else ''
+        if token != expected:
+            return jsonify({'error':'unauthorized'}), 401
+
+    salario = float(data.get('salario', 0))
+    mensagem_gs = data.get('mensagem','')  # mensagem já formatada pelo Apps Script
+    mes = data.get('mes','')
+
+    # Dados de horas extras do Apps Script
+    horas_50  = float(data.get('horas_50', 0))
+    valor_50  = float(data.get('valor_50', 0))
+    horas_75  = float(data.get('horas_75', 0))
+    valor_75  = float(data.get('valor_75', 0))
+    horas_dom = float(data.get('horas_domingos', 0))
+    valor_dom = float(data.get('valor_domingos', 0))
+    horas_fer = float(data.get('horas_feriados', 0))
+    valor_fer = float(data.get('valor_feriados', 0))
+    total_h   = float(data.get('total_horas', 0))
+    total_v   = float(data.get('valor_total_horas', 0))
+
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error':'user not found'}), 404
+
+        phone_raw = phone + '@c.us'
+
+        if salario <= 0:
+            enviar_mensagem(phone_raw,
+                "📄 Chegou um recibo mas não consegui ler o valor.\n"
+                "Envia-me o PDF no WhatsApp 📎")
+            return jsonify({'status':'ok'})
+
+        # Montar mensagem rica
+        msg = f"📄 Chegou o teu recibo!\n\n"
+        msg += f"💰 Líquido: *{salario:.2f}€*"
+        if mes:
+            msg += f" — {mes}"
+        msg += "\n"
+
+        if total_h > 0:
+            msg += f"\n⏱️ Horas extra: {total_h:.1f}h → {total_v:.2f}€\n"
+            if horas_75 > 0:  msg += f"   • {horas_75:.1f}h a 75% → {valor_75:.2f}€\n"
+            if horas_50 > 0:  msg += f"   • {horas_50:.1f}h a 50% → {valor_50:.2f}€\n"
+            if horas_fer > 0: msg += f"   • {horas_fer:.1f}h feriados → {valor_fer:.2f}€\n"
+            if horas_dom > 0: msg += f"   • {horas_dom:.1f}h domingos → {valor_dom:.2f}€\n"
+
+        msg += f"\n📅 O dinheiro entra amanhã ou depois 😊"
+
+        enviar_mensagem(phone_raw, msg)
+
+        # Guardar o salário no perfil para o plano
+        if not usuario.salario_liquido or abs(usuario.salario_liquido - salario) > 50:
+            usuario.salario_liquido = salario
+            db.session.commit()
+            log.info(f"Salário atualizado para {phone}: {salario}€")
+
+        log.info(f"Recibo processado para {phone}: {salario}€, extras: {total_h}h")
+        return jsonify({'status':'ok','salario':salario,'mensagem_enviada':True})
+
+    except Exception as e:
+        log.error(f"webhook_recibo: {e}")
+        return jsonify({'error':str(e)}), 500
+
 @app.route('/api/relatorio', methods=['GET'])
 def api_relatorio():
     """Gera relatorio mensal em PDF simples (HTML)."""
