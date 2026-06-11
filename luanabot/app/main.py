@@ -469,17 +469,21 @@ def get_fixos_usuario(phone, mes, usuario_id=None):
         }
         # Dívida à Luana — usa saldo real da BD se disponível
         if usuario_id:
-            saldo, parcela = get_saldo_divida(usuario_id, 'luana')
-            if saldo <= 0:
-                # Inicializar com 1720€ se ainda não existe na BD
-                r = db.session.execute(text(
-                    "SELECT COUNT(*) FROM dividas_pessoais WHERE usuario_id=:u AND LOWER(credor)='luana'"),
-                    {'u': usuario_id}).scalar()
-                if r == 0:
-                    set_saldo_divida(usuario_id, 'luana', 1720, 500)
-                    saldo, parcela = 1720.0, 500.0
-            if saldo > 0:
-                fixos['divida_luana'] = min(parcela, saldo)
+            try:
+                saldo, parcela = get_saldo_divida(usuario_id, 'luana')
+                if saldo <= 0:
+                    r = db.session.execute(text(
+                        "SELECT COUNT(*) FROM dividas_pessoais WHERE usuario_id=:u AND LOWER(credor)='luana'"),
+                        {'u': usuario_id}).scalar()
+                    if r == 0:
+                        set_saldo_divida(usuario_id, 'luana', 1720, 500)
+                        saldo, parcela = 1720.0, 500.0
+                if saldo > 0:
+                    fixos['divida_luana'] = min(parcela, saldo)
+            except Exception as e:
+                log.error(f"get_fixos divida: {e}")
+                db.session.rollback()
+                fixos['divida_luana'] = 500  # fallback
         return fixos
     else:  # Luana (default)
         return {
@@ -2435,6 +2439,10 @@ def processar_texto(phone_raw, phone, texto):
             enviar_mensagem(phone_raw, random.choice(resps)); return
 
         # ── GASTO (texto/sem keyword) ──
+        # ── ABASTECIMENTO COM KM (antes do eh_gasto) ────────────────
+        if re.search(r'\b(tinha|estava)\b', t) and any(p in t for p in ['meti','gastei','paguei']) and re.search(r'\d+\s*km', t):
+            registar_abastecimento(phone_raw, usuario, texto); return
+        # ─────────────────────────────────────────────────────────────
         if tem_numero(texto) and eh_gasto(texto):
             valor_check = extrair_valor(texto)
             # Gasto grande
