@@ -669,7 +669,7 @@ def webhook_recibo():
         if not usuario:
             return jsonify({'error':'user not found'}), 404
 
-        phone_raw = phone + '@c.us'
+        phone_raw = phone + '@lid'
 
         if salario <= 0:
             enviar_mensagem(phone_raw,
