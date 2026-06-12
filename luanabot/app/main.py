@@ -339,6 +339,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
+        "CREATE TABLE IF NOT EXISTS salarios_pendentes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT, data_pagamento DATE, processado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50), data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, km_percorridos FLOAT, valor FLOAT, litros FLOAT, custo_por_km FLOAT, consumo_l100 FLOAT)",
         "CREATE TABLE IF NOT EXISTS dividas_pessoais (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, credor VARCHAR(100), saldo FLOAT DEFAULT 0, parcela_mensal FLOAT DEFAULT 0, criado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, credor))",
         "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, valor FLOAT, litros FLOAT, km_ganhos FLOAT, custo_por_km FLOAT)",
@@ -716,7 +717,10 @@ def webhook_recibo():
             if horas_fer > 0: msg += f"   • {horas_fer:.1f}h feriados → {valor_fer:.2f}€\n"
             if horas_dom > 0: msg += f"   • {horas_dom:.1f}h domingos → {valor_dom:.2f}€\n"
 
-        msg += f"\n📅 O dinheiro entra amanhã ou depois 😊"
+        # Pagamento = próximo dia útil após o recibo
+        dp = proximo_dia_util(agora().date())
+        guardar_salario_pendente(usuario.id, salario, dp)
+        msg += f"\n📅 O dinheiro entra dia {dp.strftime('%d/%m')} — eu aviso e mando o plano! 😊"
 
         enviar_mensagem(phone_raw, msg)
 
@@ -1045,7 +1049,7 @@ def ler_pdf_salario(url):
 
 # ─── PICOS / HORAS EXTRAS ────────────────────────────────────
 def _parse_hora_pico(texto):
-    m = re.search(r"(\d{1,2})(?:[h:](\d{0,2}))?", texto.strip().lower())
+    m = re.search(r"(\d{1,2})(?:[h:,\.](\d{1,2}))?", texto.strip().lower())
     if not m: return None
     hora = int(m.group(1)); minuto = int(m.group(2)) if m.group(2) else 0
     return (hora, minuto) if 0 <= hora <= 23 and 0 <= minuto <= 59 else None
@@ -1974,6 +1978,268 @@ def ver_historico_combustivel(phone_raw, usuario):
         log.error(f"historico combustivel: {e}")
         enviar_mensagem(phone_raw, "Erro 😕")
 
+
+def processar_sms_banco(phone_raw, usuario, texto):
+    """Deteta SMS/notificação de banco encaminhada e regista o gasto."""
+    t = texto.lower()
+    # Padrões comuns PT: BPI, CGD, Santander, ActivoBank, Revolut, Millennium
+    # "Compra ... 24,50 EUR ... CONTINENTE" / "compra com cartao no valor de X em Y"
+    m_valor = re.search(r'(\d+[.,]\d{2})\s*(?:eur|€|euros)?', t)
+    if not m_valor:
+        return False
+    valor = float(m_valor.group(1).replace(',', '.'))
+
+    # Extrair comerciante: depois de "em", "no", "loja", ou ÚLTIMA palavra maiúscula longa
+    comerciante = None
+    m_com = re.search(r'(?:\bem\b|\bno\b|\bna\b)\s+([A-ZÀ-Ú][A-ZÀ-Ú0-9\s&\.\*]{2,30})', texto)
+    if m_com:
+        comerciante = m_com.group(1).strip()
+    else:
+        # palavras todas maiúsculas no texto original (formato típico de SMS)
+        caps = re.findall(r'\b[A-ZÀ-Ú][A-ZÀ-Ú0-9&\*\.]{3,}\b', texto)
+        caps = [c for c in caps if c not in ['EUR','EUROS','IBAN','SMS','MB','MBWAY','CARTAO','CARTÃO','COMPRA','VALOR','DEBITO','DÉBITO','CONTA','SALDO']]
+        if caps:
+            comerciante = caps[-1]
+
+    if not comerciante:
+        comerciante = 'Compra cartão'
+
+    cat, emoji, _ = categorizar(comerciante.lower())
+    try:
+        despesa = Despesa(usuario_id=usuario.id, valor=valor, categoria=cat,
+            descricao=f'[SMS] {comerciante.title()[:50]}', data=agora().replace(tzinfo=None))
+        db.session.add(despesa); db.session.commit()
+        disp, _ = calcular_disponivel(usuario)
+        enviar_mensagem(phone_raw,
+            f"🏦 SMS do banco detetado!\n\n"
+            f"{emoji} {comerciante.title()[:40]} — {valor:.2f}€\n"
+            f"📁 Categoria: {cat}\n"
+            f"💚 Disponível: {disp:.2f}€")
+        return True
+    except Exception as e:
+        log.error(f"sms_banco: {e}"); db.session.rollback()
+        return False
+
+
+def eh_sms_banco(texto):
+    """Verifica se o texto parece SMS/notificação de banco."""
+    t = texto.lower()
+    indicadores = ['compra com cartao','compra com cartão','compra no valor','debito de','débito de',
+                   'cartao final','cartão final','movimento a debito','movimento a débito',
+                   'pagamento efetuado','compra efetuada','autorizada a compra','transacao aprovada',
+                   'transação aprovada','cartao terminado','disponivel apos','disponível após']
+    return any(i in t for i in indicadores)
+
+
+def extrair_data_relativa(texto):
+    """Deteta referências temporais e devolve a data correta (ou None = hoje)."""
+    t = texto.lower()
+    hoje = agora().date()
+    if 'anteontem' in t:
+        return hoje - timedelta(days=2)
+    if 'ontem' in t:
+        return hoje - timedelta(days=1)
+    dias_semana = {'segunda':0,'terca':1,'terça':1,'quarta':2,'quinta':3,'sexta':4,'sabado':5,'sábado':5,'domingo':6}
+    for nome, wd in dias_semana.items():
+        if nome in t:
+            delta = (hoje.weekday() - wd) % 7
+            if delta == 0: delta = 7  # "sábado" hoje sendo sábado = sábado passado
+            return hoje - timedelta(days=delta)
+    m = re.search(r'dia\s+(\d{1,2})\b', t)
+    if m:
+        d = int(m.group(1))
+        if 1 <= d <= 31 and d <= hoje.day:
+            try: return hoje.replace(day=d)
+            except ValueError: pass
+    return None
+
+
+def apagar_ultimo_gasto(phone_raw, usuario):
+    """Apaga o último gasto registado."""
+    try:
+        r = db.session.execute(text(
+            "DELETE FROM despesas WHERE id=(SELECT id FROM despesas WHERE usuario_id=:u ORDER BY id DESC LIMIT 1) "
+            "RETURNING descricao, valor"), {'u': usuario.id}).fetchone()
+        db.session.commit()
+        if r:
+            enviar_mensagem(phone_raw, f"🗑️ Apagado: {r[0]} — {r[1]:.2f}€\nComo se nunca tivesse acontecido 😉")
+        else:
+            enviar_mensagem(phone_raw, "Não há gastos para apagar 🤷")
+    except Exception as e:
+        log.error(f"apagar_ultimo: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao apagar 😕")
+
+
+def corrigir_ultimo_gasto(phone_raw, usuario, texto):
+    """Corrige o valor do último gasto: 'corrige para 25' / 'altera o último para 25€'."""
+    valor = extrair_valor(texto)
+    if valor <= 0:
+        enviar_mensagem(phone_raw, "Qual é o valor correto? Ex: 'corrige para 25€'"); return
+    try:
+        r = db.session.execute(text(
+            "UPDATE despesas SET valor=:v WHERE id=(SELECT id FROM despesas WHERE usuario_id=:u ORDER BY id DESC LIMIT 1) "
+            "RETURNING descricao"), {'v': valor, 'u': usuario.id}).fetchone()
+        db.session.commit()
+        if r:
+            enviar_mensagem(phone_raw, f"✏️ Corrigido! {r[0]} agora é {valor:.2f}€")
+        else:
+            enviar_mensagem(phone_raw, "Não há gastos para corrigir 🤷")
+    except Exception as e:
+        log.error(f"corrigir_ultimo: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro 😕")
+
+
+def processar_fatura_referencia(phone_raw, usuario, texto):
+    """Deteta entidade/referência MB numa fatura colada e formata para pagamento."""
+    # Entidade: 5 dígitos | Referência: 9 dígitos (formato XXX XXX XXX comum)
+    m_ent = re.search(r'entidade[:\s]*(\d{5})', texto, re.IGNORECASE)
+    m_ref = re.search(r'refer[êe]ncia[:\s]*([\d\s]{9,15})', texto, re.IGNORECASE)
+    m_val = re.search(r'(?:valor|montante|total|importância)[:\s]*(\d+[.,]\d{2})', texto, re.IGNORECASE)
+
+    if not (m_ent and m_ref):
+        return False
+
+    entidade = m_ent.group(1)
+    referencia = re.sub(r'\s', '', m_ref.group(1))[:9]
+    valor = float(m_val.group(1).replace(',', '.')) if m_val else 0
+
+    msg = "🧾 Fatura detetada! Dados para pagamento:\n\n"
+    msg += f"🏛️ Entidade: *{entidade}*\n"
+    msg += f"🔢 Referência: *{referencia[:3]} {referencia[3:6]} {referencia[6:9]}*\n"
+    if valor > 0:
+        msg += f"💰 Valor: *{valor:.2f}€*\n"
+    msg += "\nCopia e cola no homebanking 📲"
+    if valor > 0:
+        msg += "\n\nQuando pagares diz 'paguei a fatura' que eu registo o gasto 😉"
+        phone = usuario.phone
+        set_estado(phone, 'fatura_pendente', {'valor': valor, 'entidade': entidade})
+    enviar_mensagem(phone_raw, msg)
+    return True
+
+
+def processar_ja_paguei(phone_raw, usuario, texto):
+    """'Já paguei ao Ruben' — marca dívidas ao parceiro como pagas e notifica-o."""
+    t = texto.lower()
+    m = re.search(r'paguei\s+(?:ao|à|a)\s+([a-záàâãéêíóôõúç]+)', t)
+    if not m:
+        return False
+    credor = m.group(1).capitalize()
+    meu_nome = NOMES_CASAL.get(usuario.phone, 'Alguém')
+
+    # O credor registou que EU lhe devo → procurar na conta DELE splits com o MEU nome
+    parceiro_phone = get_parceiro_phone(usuario.phone)
+    if not parceiro_phone or NOMES_CASAL.get(parceiro_phone,'').lower() != credor.lower():
+        return False
+    parceiro = Usuario.query.filter_by(phone=parceiro_phone).first()
+    if not parceiro:
+        return False
+    try:
+        rows = db.session.execute(text(
+            "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE "
+            "RETURNING descricao, valor_cada"),
+            {'u': parceiro.id, 'p': meu_nome}).fetchall()
+        db.session.commit()
+        if rows:
+            total = sum(r[1] for r in rows)
+            enviar_mensagem(phone_raw,
+                f"✅ Boa! Marquei como pago: {total:.2f}€ ao(à) {credor} 💪")
+            notificar_parceiro(usuario.phone,
+                f"💰 {meu_nome} pagou-te {total:.2f}€!\n"
+                f"📝 {', '.join(r[0] for r in rows[:3])}\n"
+                f"Estão quites 🤝")
+            return True
+        else:
+            enviar_mensagem(phone_raw, f"Não encontrei dívidas tuas ao(à) {credor} 🤔")
+            return True
+    except Exception as e:
+        log.error(f"ja_paguei: {e}"); db.session.rollback()
+        return False
+
+
+DISTANCIAS_MOITA = {
+    'algarve': 240, 'faro': 250, 'albufeira': 230, 'portimao': 260, 'lagos': 280,
+    'porto': 320, 'braga': 370, 'guimaraes': 360, 'aveiro': 250, 'coimbra': 180,
+    'lisboa': 30, 'sintra': 55, 'cascais': 55, 'setubal': 25, 'evora': 100,
+    'fatima': 140, 'nazare': 150, 'obidos': 110, 'peniche': 120, 'ericeira': 75,
+    'sesimbra': 30, 'troia': 40, 'comporta': 60, 'badajoz': 180, 'sevilha': 300,
+    'madrid': 630, 'salamanca': 450, 'viana': 400, 'guarda': 290, 'viseu': 250,
+}
+PORTAGENS_POR_KM = 0.095  # média A2/A1
+
+def calcular_viagem(phone_raw, usuario, texto):
+    """'vamos ao algarve' → custo estimado: combustível + portagens."""
+    t = texto.lower()
+    destino = None
+    km = None
+    for cidade, dist in DISTANCIAS_MOITA.items():
+        if cidade in t.replace('ã','a').replace('é','e').replace('í','i').replace('ó','o'):
+            destino = cidade.capitalize(); km = dist; break
+    # km manual: "viagem de 300km"
+    if not km:
+        m = re.search(r'(\d{2,4})\s*km', t)
+        if m:
+            km = int(m.group(1)); destino = f"{km}km"
+    if not km:
+        enviar_mensagem(phone_raw,
+            "🗺️ Para onde vais? Conheço: Algarve, Porto, Coimbra, Évora...\n"
+            "Ou diz os km: 'viagem de 300km'")
+        return
+
+    consumo = usuario.carro_consumo_l100 or 7.5
+    ida_volta = km * 2
+    litros = ida_volta * consumo / 100
+    preco_litro = 1.75  # estimativa gasolina 95
+    custo_comb = litros * preco_litro
+    custo_portagens = ida_volta * PORTAGENS_POR_KM * 0.7  # nem todo o percurso é portagem
+    total = custo_comb + custo_portagens
+
+    disp, _ = calcular_disponivel(usuario)
+
+    msg = f"🗺️ Viagem a {destino} (ida e volta)\n\n"
+    msg += f"🛣️ {ida_volta}km\n"
+    msg += f"⛽ Combustível: ~{custo_comb:.0f}€ ({litros:.0f}L)\n"
+    msg += f"🛂 Portagens: ~{custo_portagens:.0f}€\n"
+    msg += f"💰 Total: *~{total:.0f}€*\n\n"
+    if usuario.phone in [PHONE_RUBEN, PHONE_LUANA]:
+        msg += f"💑 Se dividirem: {total/2:.0f}€ cada\n"
+    if disp > 0:
+        pct = total / disp * 100
+        msg += f"💳 É {pct:.0f}% do teu disponível ({disp:.0f}€)"
+        if pct > 50:
+            msg += " — pesa, planeia bem 😅"
+    enviar_mensagem(phone_raw, msg)
+
+
+def detetar_multi_gastos(texto):
+    """Deteta se a mensagem tem múltiplos gastos e divide via Groq. Devolve lista ou None."""
+    t = texto.lower()
+    # Heurística: 2+ valores E conectores de divisão
+    valores = re.findall(r'\d+(?:[.,]\d{1,2})?\s*(?:€|euros?)', t)
+    conectores = ['mas ','sendo ',' foram ',' foi para',' e o resto',' resto ',' dos quais']
+    if len(valores) < 2 or not any(c in t for c in conectores):
+        return None
+    try:
+        from groq import Groq
+        resp = Groq(api_key=GROQ_API_KEY).chat.completions.create(
+            model='llama-3.1-8b-instant', max_tokens=200, temperature=0,
+            messages=[
+                {'role':'system','content':
+                 'Divide a mensagem em gastos individuais. Responde APENAS JSON array: '
+                 '[{"valor": 4.0, "descricao": "café"}, {"valor": 30.0, "descricao": "compras continente"}]. '
+                 'Se "o resto" for mencionado, calcula a diferença. Sem texto extra.'},
+                {'role':'user','content': texto}
+            ])
+        import json as _json
+        txt = resp.choices[0].message.content.strip()
+        txt = re.sub(r'^```(?:json)?|```$', '', txt, flags=re.MULTILINE).strip()
+        gastos = _json.loads(txt)
+        if isinstance(gastos, list) and 2 <= len(gastos) <= 5:
+            validos = [g for g in gastos if isinstance(g.get('valor'), (int,float)) and g['valor'] > 0]
+            return validos if len(validos) >= 2 else None
+    except Exception as e:
+        log.error(f"multi_gastos: {e}")
+    return None
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -1991,16 +2257,23 @@ def processar_texto(phone_raw, phone, texto):
             nome_aniv = dados_estado.get('nome','')
             dias_aniv = dados_estado.get('dias', 0)
             limpar_estado(phone)
-            if any(p in t for p in ['sim','s','yes','claro','quero']):
+            palavras = t.strip().split()
+            if t.strip() in ['sim','s','yes','claro','quero','sim quero'] or (palavras and palavras[0] in ['sim','yes','claro','quero']):
                 set_estado(phone, 'aniv_apartar_valor', {'nome': nome_aniv})
                 enviar_mensagem(phone_raw, f"💝 Quanto queres apartar para a prenda do(a) {nome_aniv}?")
-            else:
+            elif t.strip() in ['nao','não','n','no','agora nao','agora não']:
                 enviar_mensagem(phone_raw, f"Ok! Podes sempre apartar depois dizendo 'prenda {nome_aniv} 50€' 💪")
+            else:
+                # Mensagem não relacionada — sai do estado e processa normalmente
+                processar_texto(phone_raw, phone, texto)
             return
         if estado == 'aniv_apartar_valor':
             nome_aniv = dados_estado.get('nome','')
             valor_prenda = extrair_valor(texto)
             limpar_estado(phone)
+            # Se a mensagem parece outro comando (entrei, sai, gastei...) sai do fluxo
+            if any(w in t for w in ['entrei','sai','saí','gastei','quanto','picos']):
+                processar_texto(phone_raw, phone, texto); return
             if valor_prenda > 0:
                 try:
                     db.session.execute(text(
@@ -2174,7 +2447,15 @@ def processar_texto(phone_raw, phone, texto):
         if estado == 'confirmar_salario':
             if any(p in t for p in ['sim','yes','correto','certo','exato','e isso','é isso']):
                 valor = dados_estado.get('valor', 0); limpar_estado(phone)
-                processar_receita(phone_raw, usuario, f"recebi {valor}")
+                # Se o pagamento é amanhã/futuro → guardar pendente
+                pag = dia_pagamento_usuario(usuario, agora().year, agora().month)
+                if pag.date() > agora().date():
+                    guardar_salario_pendente(usuario.id, valor, pag.date())
+                    enviar_mensagem(phone_raw,
+                        f"Boa! 💰 {valor:.2f}€ anotado!\n"
+                        f"No dia {pag.strftime('%d/%m')} confirmo a entrada e mando o plano 😉")
+                else:
+                    processar_receita(phone_raw, usuario, f"recebi {valor}")
             elif tem_numero(texto):
                 limpar_estado(phone); processar_receita(phone_raw, usuario, texto)
             else:
@@ -2188,14 +2469,28 @@ def processar_texto(phone_raw, phone, texto):
             return
 
         if estado == 'aguardar_recibo':
+            data_pag_str = dados_estado.get('data_pagamento','')
             if any(p in t for p in ['sim','yes','quero','manda','envia']):
-                limpar_estado(phone); enviar_mensagem(phone_raw, "Manda o PDF ou foto do recibo 📄")
-            elif any(p in t for p in ['nao','não','valor','digo']) or tem_numero(texto):
+                # mantém estado para apanhar o PDF/valor a seguir
+                enviar_mensagem(phone_raw, "Manda o PDF ou foto do recibo 📄")
+            elif tem_numero(texto):
                 limpar_estado(phone)
-                if tem_numero(texto): processar_receita(phone_raw, usuario, texto)
-                else: enviar_mensagem(phone_raw, "Ok, diz: recebi X euros 💰")
+                valor_rec = extrair_valor(texto)
+                if valor_rec > 0 and data_pag_str:
+                    from datetime import date as _date
+                    dp = datetime.strptime(data_pag_str, '%Y-%m-%d').date()
+                    if dp > agora().date():
+                        guardar_salario_pendente(usuario.id, valor_rec, dp)
+                        enviar_mensagem(phone_raw,
+                            f"Boa! 💰 {valor_rec:.2f}€ anotado!\n"
+                            f"Amanhã quando o dinheiro cair eu confirmo e mando o plano todo 😉")
+                        return
+                # data já passou ou sem data → processa já
+                processar_receita(phone_raw, usuario, texto)
+            elif any(p in t for p in ['nao','não','ainda nao','ainda não']):
+                limpar_estado(phone)
+                enviar_mensagem(phone_raw, "Ok! Quando chegar manda-me 📄")
             else:
-                # nao reconheceu — limpa estado e processa normalmente
                 limpar_estado(phone)
                 processar_texto(phone_raw, phone, texto)
             return
@@ -2239,11 +2534,19 @@ def processar_texto(phone_raw, phone, texto):
 
         # ── PICOS / HORAS EXTRAS (so Ruben) ──────────────────────────
         if phone == PHONE_RUBEN:
-            if re.match(r'^entr(ei|e|a)', t):
-                enviar_mensagem(phone_raw, pico_entrada(phone, t)); return
-            if re.match(r'^sa[ii]', t) or t.strip() in ['sai','saiu']:
-                enviar_mensagem(phone_raw, pico_saida(phone, t)); return
-            if t.strip() == 'picos hoje':
+            t_norm = t.replace('í','i').replace('á','a').replace('à','a')
+            # Entrada E saída na mesma mensagem: "entrei às 9 e saí às 23h30"
+            if re.search(r'\bentr(ei|e)\b', t_norm) and re.search(r'\bsai\b', t_norm):
+                m_ent = re.search(r'entr(?:ei|e)\s*(?:as|às)?\s*([\d:h,\.]+)', t_norm)
+                m_sai = re.search(r'sai\s*(?:as|às)?\s*([\d:h,\.]+)', t_norm)
+                r1 = pico_entrada(phone, f"entrei {m_ent.group(1) if m_ent else ''}")
+                r2 = pico_saida(phone, f"sai {m_sai.group(1) if m_sai else ''}")
+                enviar_mensagem(phone_raw, r2); return
+            if re.match(r'^entr(ei|e|a)', t_norm):
+                enviar_mensagem(phone_raw, pico_entrada(phone, t_norm)); return
+            if re.match(r'^sai', t_norm) or t_norm.strip() in ['sai','saiu']:
+                enviar_mensagem(phone_raw, pico_saida(phone, t_norm)); return
+            if any(p in t_norm for p in ['quantas horas','horas fiz','horas hoje','horas trabalhei']) or t_norm.strip() == 'picos hoje':
                 enviar_mensagem(phone_raw, picos_hoje_fn(phone)); return
             if re.match(r'^picos', t):
                 meses_map = {
@@ -2544,6 +2847,50 @@ def processar_texto(phone_raw, phone, texto):
             enviar_mensagem(phone_raw, random.choice(resps)); return
 
         # ── GASTO (texto/sem keyword) ──
+        # ── MULTI-GASTOS NUMA MENSAGEM ───────────────────────────────
+        if eh_gasto(texto):
+            multi = detetar_multi_gastos(texto)
+            if multi:
+                msg_multi = f"🧾 Detetei {len(multi)} gastos:\n\n"
+                for g in multi:
+                    cat_m, emoji_m, _ = categorizar(g.get('descricao',''))
+                    d = Despesa(usuario_id=usuario.id, valor=float(g['valor']), categoria=cat_m,
+                        descricao=g.get('descricao','Gasto')[:50].capitalize(),
+                        data=agora().replace(tzinfo=None))
+                    db.session.add(d)
+                    msg_multi += f"{emoji_m} {g.get('descricao','Gasto').capitalize()} — {float(g['valor']):.2f}€\n"
+                db.session.commit()
+                disp_m, _ = calcular_disponivel(usuario)
+                msg_multi += f"\n💚 Disponível: {disp_m:.2f}€"
+                enviar_mensagem(phone_raw, msg_multi); return
+        # ── CALCULADORA DE VIAGENS ───────────────────────────────────
+        if any(p in t for p in ['vamos a','vamos ao','viagem a','viagem ao','viagem para','quanto custa ir','custo da viagem','ir ate','ir até']):
+            calcular_viagem(phone_raw, usuario, texto); return
+        # ── JÁ PAGUEI AO PARCEIRO (sem valor = splits) ───────────────
+        if re.search(r'\bj[áa] paguei\b', t) and not tem_numero(texto):
+            if processar_ja_paguei(phone_raw, usuario, texto): return
+        # ── FATURA COM ENTIDADE/REFERÊNCIA ───────────────────────────
+        if 'entidade' in t and 'refer' in t:
+            if processar_fatura_referencia(phone_raw, usuario, texto): return
+        if any(p in t for p in ['paguei a fatura','fatura paga','ja paguei a fatura']):
+            est_f, dados_f = get_estado(phone)
+            if est_f == 'fatura_pendente':
+                limpar_estado(phone)
+                v_f = dados_f.get('valor', 0)
+                if v_f > 0:
+                    d = Despesa(usuario_id=usuario.id, valor=v_f, categoria='casa',
+                        descricao=f"Fatura ent.{dados_f.get('entidade','')}", data=agora().replace(tzinfo=None))
+                    db.session.add(d); db.session.commit()
+                    enviar_mensagem(phone_raw, f"✅ Fatura de {v_f:.2f}€ registada em Casa 🏠"); return
+            enviar_mensagem(phone_raw, "Não tenho nenhuma fatura pendente. Cola o texto da fatura primeiro 🧾"); return
+        # ── APAGAR / CORRIGIR ÚLTIMO GASTO ───────────────────────────
+        if any(p in t for p in ['apaga o ultimo','apaga ultimo','apagar ultimo','remove o ultimo','apaga o último','apagar último','enganei-me apaga','apaga isso']):
+            apagar_ultimo_gasto(phone_raw, usuario); return
+        if any(p in t for p in ['corrige para','altera para','corrige o ultimo','altera o ultimo','muda para','afinal foi','afinal era','afinal foram']) and tem_numero(texto):
+            corrigir_ultimo_gasto(phone_raw, usuario, texto); return
+        # ── SMS/NOTIFICAÇÃO DO BANCO ─────────────────────────────────
+        if eh_sms_banco(texto):
+            if processar_sms_banco(phone_raw, usuario, texto): return
         # ── ABASTECIMENTO COM KM (antes do eh_gasto) ────────────────
         if re.search(r'\b(tinha|estava)\b', t) and any(p in t for p in ['meti','gastei','paguei']) and re.search(r'\d+\s*km', t):
             registar_abastecimento(phone_raw, usuario, texto); return
@@ -2580,6 +2927,10 @@ def processar_texto(phone_raw, phone, texto):
 
 # ─── PROCESSAR DESPESA ───────────────────────────────────────
 def processar_despesa(phone_raw, usuario, texto):
+    # Data relativa: "ontem gastei...", "sábado atestei..."
+    _d_rel = extrair_data_relativa(texto)
+    _data_gasto = (datetime.combine(_d_rel, datetime.min.time().replace(hour=12)) if _d_rel
+                   else agora().replace(tzinfo=None))
     valor = extrair_valor(texto)
     if valor == 0:
         enviar_mensagem(phone_raw, "Nao percebi o valor 🤔 Ex: 25 conti"); return
@@ -2594,7 +2945,7 @@ def processar_despesa(phone_raw, usuario, texto):
 
     descricao = ('[conjunta] ' if na_conjunta else '') + texto[:90]
     despesa = Despesa(usuario_id=usuario.id, valor=valor, categoria=categoria,
-                      descricao=descricao, data=agora().replace(tzinfo=None))
+                      descricao=descricao, data=_data_gasto)
     db.session.add(despesa); db.session.commit()
 
     if pessoa:
@@ -2676,6 +3027,9 @@ def processar_despesa(phone_raw, usuario, texto):
     # Linha principal
     pessoa_txt = f" (com {pessoa})" if pessoa else ""
     msg = f"{emoji} {nome_loja} — {valor:.2f}€{pessoa_txt}\n"
+    if _d_rel:
+        _dias_n = ['Seg','Ter','Qua','Qui','Sex','Sáb','Dom']
+        msg += f"📅 {_dias_n[_d_rel.weekday()]} {_d_rel.strftime('%d/%m')}\n"
     msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.2f}€"
 
     # Comentário de padrão
@@ -2709,6 +3063,7 @@ def processar_despesa(phone_raw, usuario, texto):
 # ─── RECEITA / PLANO ─────────────────────────────────────────
 def processar_receita(phone_raw, usuario, texto):
     valor = extrair_valor(texto)
+    limpar_salarios_pendentes(usuario.id)  # evita duplo registo pelo job das 9h
     if valor == 0:
         enviar_mensagem(phone_raw, "Quanto recebeste? 💰"); return
     usuario.salario_liquido = valor
@@ -4052,6 +4407,15 @@ def processar_dividas(phone_raw, usuario, texto):
                 {'u':usuario.id,'d':desc,'vt':valor,'vc':valor,'p':pessoa})
             db.session.commit()
             enviar_mensagem(phone_raw, f"📝 Anotado! {pessoa} deve-te {valor:.2f}€\n😏 Vamos ver quando aparece com o dinheiro...")
+            # Se a pessoa é o parceiro → notificar diretamente
+            meu_nome_d = NOMES_CASAL.get(usuario.phone, 'Alguém')
+            parceiro_phone_d = get_parceiro_phone(usuario.phone)
+            nome_parceiro_d = NOMES_CASAL.get(parceiro_phone_d, '').lower() if parceiro_phone_d else ''
+            if parceiro_phone_d and pessoa.lower() == nome_parceiro_d:
+                notificar_parceiro(usuario.phone,
+                    f"💸 Deves {valor:.2f}€ ao(à) {meu_nome_d}!\n"
+                    f"📝 Motivo: {desc}\n\n"
+                    f"Quando pagares diz 'já paguei ao {meu_nome_d.lower()}' 😉")
     except Exception as e:
         log.error(f"dividas: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
@@ -4354,17 +4718,162 @@ SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sp
         log.error(f'IA: {e}'); return "Não percebi 🤔 Diz 'ajuda'!"
 
 # ─── SCHEDULER ───────────────────────────────────────────────
+
+def proximo_dia_util(d):
+    """Devolve o próximo dia útil a partir de d (exclusive)."""
+    p = d + timedelta(days=1)
+    while p.weekday() >= 5:
+        p += timedelta(days=1)
+    return p
+
+def dia_util_anterior(d):
+    """Devolve o dia útil anterior a d (exclusive)."""
+    p = d - timedelta(days=1)
+    while p.weekday() >= 5:
+        p -= timedelta(days=1)
+    return p
+
+def guardar_salario_pendente(usuario_id, valor, data_pagamento):
+    """Guarda salário para confirmar no dia de pagamento."""
+    try:
+        # Apaga pendentes antigos não processados do mesmo user
+        db.session.execute(text(
+            "DELETE FROM salarios_pendentes WHERE usuario_id=:u AND processado=FALSE"),
+            {'u': usuario_id})
+        db.session.execute(text(
+            "INSERT INTO salarios_pendentes (usuario_id, valor, data_pagamento) VALUES (:u,:v,:d)"),
+            {'u': usuario_id, 'v': valor, 'd': data_pagamento})
+        db.session.commit()
+        return True
+    except Exception as e:
+        log.error(f"guardar_salario_pendente: {e}"); db.session.rollback()
+        return False
+
+def limpar_salarios_pendentes(usuario_id):
+    """Remove pendentes (quando o user regista manualmente)."""
+    try:
+        db.session.execute(text(
+            "UPDATE salarios_pendentes SET processado=TRUE WHERE usuario_id=:u AND processado=FALSE"),
+            {'u': usuario_id})
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def processar_salarios_pendentes():
+    """Às 9h do dia de pagamento, confirma a entrada e manda o plano completo."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 9: return
+        try:
+            rows = db.session.execute(text(
+                "SELECT id, usuario_id, valor FROM salarios_pendentes "
+                "WHERE processado=FALSE AND data_pagamento<=:d"),
+                {'d': hoje.date()}).fetchall()
+        except Exception as e:
+            log.error(f"salarios_pendentes query: {e}"); db.session.rollback(); return
+
+        for row_id, uid, valor in rows:
+            try:
+                u = db.session.get(Usuario, uid)
+                if not u or not u.phone: continue
+                phone_raw = f"{u.phone}@lid"
+                enviar_mensagem(phone_raw,
+                    f"💰 Bom dia! O salário caiu na conta!\n"
+                    f"Recebeste *{valor:.2f}€* 🎉")
+                # Gestão completa (regista receita + plano + verificações)
+                processar_receita(phone_raw, u, f"recebi {valor}")
+                db.session.execute(text(
+                    "UPDATE salarios_pendentes SET processado=TRUE WHERE id=:i"), {'i': row_id})
+                db.session.commit()
+                log.info(f"Salário pendente processado: user {uid} = {valor}€")
+            except Exception as e:
+                log.error(f"processar pendente {row_id}: {e}"); db.session.rollback()
+
+
+def alertas_preditivos():
+    """Avisa quando uma meta de categoria está >80% gasta antes do dia 20."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 19 or hoje.day > 20 or hoje.day < 8: return
+        import calendar as _cal
+        _, ultimo = _cal.monthrange(hoje.year, hoje.month)
+        dias_restantes = ultimo - hoje.day
+        try:
+            metas = db.session.execute(text(
+                "SELECT m.usuario_id, m.categoria, m.limite, u.phone FROM metas_categoria m "
+                "JOIN usuarios u ON u.id=m.usuario_id "
+                "WHERE m.mes=:m AND m.ano=:a"), {'m': hoje.month, 'a': hoje.year}).fetchall()
+        except Exception:
+            db.session.rollback(); return
+
+        for uid, cat, limite, phone in metas:
+            if not phone or not limite: continue
+            try:
+                gasto = db.session.execute(text(
+                    "SELECT COALESCE(SUM(valor),0) FROM despesas WHERE usuario_id=:u AND categoria=:c "
+                    "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:a"),
+                    {'u': uid, 'c': cat, 'm': hoje.month, 'a': hoje.year}).scalar() or 0
+                pct = gasto / limite * 100
+                if 80 <= pct < 100:
+                    # 1 alerta por categoria/mês — usar estado como flag
+                    est, dados = get_estado(phone)
+                    flag_key = f"alerta_{cat}_{hoje.month}"
+                    if dados and dados.get(flag_key): continue
+                    emoji_c = EMOJI_CAT.get(cat, '💳')
+                    enviar_mensagem(f"{phone}@lid",
+                        f"⚠️ Atenção! Já gastaste {pct:.0f}% do orçamento de {emoji_c} {cat} "
+                        f"({gasto:.0f}€ de {limite:.0f}€)\n"
+                        f"📅 Ainda faltam {dias_restantes} dias de mês — vai com calma 😅")
+                    novos_dados = dados or {}
+                    novos_dados[flag_key] = True
+                    set_estado(phone, est or 'alertas', novos_dados)
+            except Exception as e:
+                log.error(f"alerta preditivo {cat}: {e}"); db.session.rollback()
+
+
+def streak_gasto_zero():
+    """Celebra streaks de dias sem gastos supérfluos — só nos marcos (sem spam)."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 21: return
+        SUPERFLUAS = ['fastfood','restaurante','roupa','lazer','tecnologia']
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                # Conta dias consecutivos (até ontem) sem gastos supérfluos
+                streak = 0
+                for i in range(1, 31):
+                    dia = (hoje - timedelta(days=i)).date()
+                    g = db.session.execute(text(
+                        "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u AND DATE(data)=:d AND categoria = ANY(:cats)"),
+                        {'u': u.id, 'd': dia, 'cats': SUPERFLUAS}).scalar() or 0
+                    if g > 0: break
+                    streak += 1
+                if streak in [3, 7, 14, 30]:
+                    medalhas = {3:'🥉', 7:'🥈', 14:'🥇', 30:'🏆'}
+                    enviar_mensagem(f"{u.phone}@lid",
+                        f"{medalhas[streak]} Streak de {streak} dias sem gastos supérfluos!\n"
+                        f"🔥 A carteira agradece — continua assim!")
+            except Exception as e:
+                log.error(f"streak: {e}"); db.session.rollback()
+
 def lembrete_recibo():
     with app.app_context():
         hoje = agora()
-        if hoje.day == dia_recibo_mes(hoje.year, hoje.month).day and hoje.hour == 11:
-            for u in Usuario.query.all():
-                if not u.phone: continue
-                # Ruben recebe automatico via Apps Script — nao precisa lembrete
-                if u.phone == PHONE_RUBEN: continue
-                set_estado(u.phone, 'aguardar_recibo', {})
-                enviar_mensagem(f"{u.phone}@lid", "Olá! 📄 Hoje deve ter chegado o teu recibo!\nQueres mandar o PDF/foto ou preferes dizer o valor?")
-
+        if hoje.hour != 11: return
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            # Ruben recebe recibo automático via Apps Script — não precisa lembrete
+            if u.phone == PHONE_RUBEN: continue
+            # Véspera (dia útil anterior) do pagamento deste utilizador
+            pag = dia_pagamento_usuario(u, hoje.year, hoje.month)
+            vespera = dia_util_anterior(pag)
+            if hoje.date() == vespera.date():
+                set_estado(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')})
+                enviar_mensagem(f"{u.phone}@lid",
+                    f"Olá! 📄 Amanhã deves receber o salário!\n"
+                    f"Já chegou o recibo? Manda o PDF/foto ou diz o valor 😊")
 def lembrete_salario():
     with app.app_context():
         hoje = agora()
@@ -4623,6 +5132,9 @@ if not _sou_o_scheduler:
     pass  # worker secundário — não inicia scheduler
 else:
     scheduler.add_job(lembrete_recibo,            'cron', hour=11, minute=0)
+    scheduler.add_job(processar_salarios_pendentes,'cron', hour=9,  minute=0)
+    scheduler.add_job(alertas_preditivos,         'cron', hour=19, minute=0)
+    scheduler.add_job(streak_gasto_zero,          'cron', hour=21, minute=0)
     scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
     scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
     scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
