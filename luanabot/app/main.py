@@ -815,6 +815,52 @@ def api_debug():
     except Exception as e:
         resultados['id_para_codigo'] = f'ERRO: {e}'
 
+    # Teste 6: enviar_mensagem (wrapper de acentos) — SEM enviar de verdade
+    try:
+        teste_txt = "Situacao teste 100€"
+        for errado, certo in _ACENTOS_FIX.items():
+            if errado in teste_txt:
+                teste_txt = teste_txt.replace(errado, certo)
+        resultados['wrapper_acentos'] = f'OK ({teste_txt})'
+    except Exception as e:
+        resultados['wrapper_acentos'] = f'ERRO: {type(e).__name__}: {str(e)[:100]}'
+
+    # Teste 7: chamar calcular_viagem de verdade (captura o erro real)
+    try:
+        import io, contextlib
+        # Simular sem enviar - chamar a lógica
+        t_v = "vamos ao algarve".lower().replace('ã','a').replace('é','e').replace('í','i').replace('ó','o')
+        km_v = None
+        for cidade, dist in DISTANCIAS_MOITA.items():
+            if cidade in t_v:
+                km_v = dist; break
+        consumo_v = usuario.carro_consumo_l100 or 7.5
+        litros_v = km_v * 2 * consumo_v / 100
+        total_v = litros_v * 1.75 + km_v * 2 * PORTAGENS_POR_KM * 0.7
+        resultados['logica_viagem'] = f'OK (algarve={total_v:.0f}EUR)'
+    except Exception as e:
+        resultados['logica_viagem'] = f'ERRO: {type(e).__name__}: {str(e)[:150]}'
+
+    # Teste 8: Despesa INSERT (o que o abastecimento faz)
+    try:
+        d_teste = Despesa(usuario_id=usuario.id, valor=0.01, categoria='combustivel',
+            descricao='TESTE DEBUG', data=agora().replace(tzinfo=None))
+        db.session.add(d_teste)
+        db.session.commit()
+        # Apagar logo
+        db.session.execute(text("DELETE FROM despesas WHERE descricao='TESTE DEBUG'"))
+        db.session.commit()
+        resultados['inserir_despesa'] = 'OK'
+    except Exception as e:
+        db.session.rollback()
+        resultados['inserir_despesa'] = f'ERRO: {type(e).__name__}: {str(e)[:150]}'
+
+    # Teste 9: carro_consumo_l100 existe?
+    try:
+        resultados['carro_consumo'] = f'OK ({usuario.carro_consumo_l100})'
+    except Exception as e:
+        resultados['carro_consumo'] = f'ERRO: {type(e).__name__}'
+
     return jsonify(resultados)
 
 @app.route('/api/saude', methods=['GET'])
@@ -2113,8 +2159,8 @@ def registar_abastecimento(phone_raw, usuario, texto):
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
         db.session.rollback()
-        log.error(f"abastecimento ERRO: {type(e).__name__}: {e}")
-        enviar_mensagem(phone_raw, "Não consegui registar o abastecimento 😕")
+        log.error(f"abastecimento ERRO: {type(e).__name__}: {e}", exc_info=True)
+        enviar_mensagem(phone_raw, f"🐛 DEBUG abast: {type(e).__name__}: {str(e)[:200]}")
 
 def ver_historico_combustivel(phone_raw, usuario):
     """Mostra histórico de abastecimentos."""
@@ -2388,8 +2434,8 @@ def calcular_viagem(phone_raw, usuario, texto):
                 msg += " — pesa bem 😅"
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
-        log.error(f"calcular_viagem ERRO: {type(e).__name__}: {e}")
-        enviar_mensagem(phone_raw, "Não consegui calcular a viagem 😕 Tenta: *viagem de 300km*")
+        log.error(f"calcular_viagem ERRO: {type(e).__name__}: {e}", exc_info=True)
+        enviar_mensagem(phone_raw, f"🐛 DEBUG viagem: {type(e).__name__}: {str(e)[:200]}")
 
 def detetar_multi_gastos(texto):
     """Deteta se a mensagem tem múltiplos gastos e divide via Groq. Devolve lista ou None."""
