@@ -764,6 +764,59 @@ def webhook_recibo():
         return jsonify({'error':str(e)}), 500
 
 
+
+@app.route('/api/debug', methods=['GET'])
+def api_debug():
+    """Diagnóstico — testa funções problemáticas e mostra erros reais."""
+    token = request.args.get('token','')
+    phone = request.args.get('phone', PHONE_RUBEN)
+    if token != (phone[:8] + 'zef'):
+        return jsonify({'error':'unauthorized'}), 401
+    resultados = {}
+    import traceback
+
+    usuario = Usuario.query.filter_by(phone=phone).first()
+    if not usuario:
+        return jsonify({'error':'user not found'}), 404
+
+    # Teste 1: tabelas existem?
+    for tabela in ['abastecimentos','salarios_pendentes','lembretes','saldos_contas','metas_categoria','dividas_pessoais','picos']:
+        try:
+            n = db.session.execute(text(f"SELECT COUNT(*) FROM {tabela}")).scalar()
+            resultados[f'tabela_{tabela}'] = f'OK ({n} linhas)'
+        except Exception as e:
+            db.session.rollback()
+            resultados[f'tabela_{tabela}'] = f'ERRO: {type(e).__name__}: {str(e)[:100]}'
+
+    # Teste 2: calcular_disponivel
+    try:
+        disp, p = calcular_disponivel(usuario)
+        resultados['calcular_disponivel'] = f'OK (disp={disp:.2f})'
+    except Exception as e:
+        resultados['calcular_disponivel'] = f'ERRO: {type(e).__name__}: {str(e)[:150]}'
+
+    # Teste 3: constantes viagem
+    try:
+        resultados['DISTANCIAS_MOITA'] = f'OK ({len(DISTANCIAS_MOITA)} destinos)'
+        resultados['PORTAGENS_POR_KM'] = f'OK ({PORTAGENS_POR_KM})'
+    except Exception as e:
+        resultados['constantes_viagem'] = f'ERRO: {e}'
+
+    # Teste 4: get_reserva
+    try:
+        r = get_reserva(usuario.id)
+        resultados['get_reserva'] = f'OK ({r:.2f})'
+    except Exception as e:
+        resultados['get_reserva'] = f'ERRO: {type(e).__name__}: {str(e)[:100]}'
+
+    # Teste 5: id_para_codigo
+    try:
+        resultados['id_para_codigo'] = f'OK ({id_para_codigo(127)})'
+    except Exception as e:
+        resultados['id_para_codigo'] = f'ERRO: {e}'
+
+    return jsonify(resultados)
+
 @app.route('/api/saude', methods=['GET'])
 def api_saude():
     """Score de saúde financeira + patrimônio para o dashboard."""
@@ -2667,6 +2720,16 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
             return
 
+        if estado == 'objetivo_nome':
+            valor_obj = dados_estado.get('valor', 0)
+            nome_obj = texto.strip()[:30].capitalize()
+            if len(nome_obj) < 2:
+                enviar_mensagem(phone_raw, "Diz-me um nome para o objetivo 😊"); return
+            set_estado(phone, 'objetivo_data', {'valor': valor_obj, 'desc': nome_obj})
+            enviar_mensagem(phone_raw,
+                f"🎯 *{nome_obj}: {valor_obj:.0f}€*\n\n📅 Até quando queres atingir?\nEx: _dezembro, março, daqui a 3 meses_")
+            return
+
         if estado == 'objetivo_data':
             valor_obj = dados_estado.get('valor', 0)
             desc_obj = dados_estado.get('desc', 'Objetivo')
@@ -2688,20 +2751,47 @@ def processar_texto(phone_raw, phone, texto):
             else:
                 meses_falta = 6
             por_mes = round(valor_obj / meses_falta, 2)
+            nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            mes_txt = nomes_m[mes_alvo-1] if mes_alvo else '?'
+            # Perguntar valor inicial (estilo GranaZen)
+            set_estado(phone, 'objetivo_inicial', {
+                'valor': valor_obj, 'desc': desc_obj, 'mes_txt': mes_txt,
+                'por_mes': por_mes, 'meses': meses_falta})
+            enviar_mensagem(phone_raw,
+                f"🎯 *{desc_obj}: {valor_obj:.0f}€*\n"
+                f"📅 Meta: {mes_txt} ({meses_falta} meses)\n"
+                f"💰 ~{por_mes:.0f}€/mês\n\n"
+                f"Já tens algum valor guardado para começar?\nDiz o valor ou 'não' 😊")
+            return
+
+        if estado == 'objetivo_inicial':
+            d = dados_estado
+            inicial = 0 if any(p in t for p in ['nao','não','zero','nada','n']) else extrair_valor(texto)
+            limpar_estado(phone)
             try:
                 db.session.execute(text(
-                    "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,0)"),
-                    {'u':usuario.id,'d':desc_obj,'v':valor_obj})
+                    "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,:a)"),
+                    {'u':usuario.id,'d':d.get('desc','Objetivo'),'v':d.get('valor',0),'a':inicial})
                 db.session.commit()
-                nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
-                mes_txt = nomes_m[mes_alvo-1] if mes_alvo else '?'
-                enviar_mensagem(phone_raw,
-                    f"🎯 Objetivo criado!\n📌 {desc_obj}: {valor_obj:.0f}€\n"
-                    f"📅 Meta: {mes_txt}\n"
-                    f"💰 Precisas de guardar ~{por_mes:.0f}€/mês durante {meses_falta} meses\n\n"
-                    f"Vou avisar-te quando atingires 25%, 50%, 75% e 100%! 💪")
+                falta = d.get('valor',0) - inicial
+                pct_ini = round(inicial/d.get('valor',1)*100) if d.get('valor',0)>0 else 0
+                barra = '█'*(pct_ini//10) + '░'*(10-pct_ini//10)
+                msg_obj = f"✅ *Objetivo criado!*\n"
+                msg_obj += f"━━━━━━━━━━━━━━\n"
+                msg_obj += f"🎯 {d.get('desc')}\n"
+                msg_obj += f"💰 Meta:  {d.get('valor',0):.0f}€\n"
+                if inicial > 0:
+                    msg_obj += f"💶 Já tens:  {inicial:.0f}€\n"
+                    msg_obj += f"📊 Falta:  {falta:.0f}€\n"
+                    msg_obj += f"{barra} {pct_ini}%\n"
+                msg_obj += f"📅 Meta:  {d.get('mes_txt')} ({d.get('meses')} meses)\n"
+                msg_obj += f"💪 ~{d.get('por_mes',0):.0f}€/mês\n"
+                msg_obj += f"━━━━━━━━━━━━━━\n"
+                msg_obj += f"💡 Diz *guardei 50 para {d.get('desc','').lower()}* para registar"
+                enviar_mensagem(phone_raw, msg_obj)
             except Exception as e:
-                log.error(f"obj data: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+                log.error(f"obj inicial: {e}"); db.session.rollback()
+                enviar_mensagem(phone_raw, "Erro ao criar objetivo 😕")
             return
 
         if estado == 'confirmar_salario':
@@ -4934,9 +5024,15 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
 
     # Pergunta quando quer atingir
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-    set_estado(phone, 'objetivo_data', {'valor': valor, 'desc': desc})
-    enviar_mensagem(phone_raw,
-        f"🎯 Boa! {desc}: {valor:.0f}€\n\n📅 Quando queres atingir este objetivo?\nEx: 'dezembro', 'março', 'daqui a 3 meses'")
+    if desc == 'Objetivo' or len(desc) < 3:
+        # Não percebeu o nome → perguntar
+        set_estado(phone, 'objetivo_nome', {'valor': valor})
+        enviar_mensagem(phone_raw,
+            f"🎯 *Novo objetivo: {valor:.0f}€*\n\nPara que é esta poupança?\nEx: _Viagem, Fundo de emergência, PS5..._")
+    else:
+        set_estado(phone, 'objetivo_data', {'valor': valor, 'desc': desc})
+        enviar_mensagem(phone_raw,
+            f"🎯 *{desc}: {valor:.0f}€*\n\n📅 Até quando queres atingir?\nEx: _dezembro, março, daqui a 3 meses_")
 
 # ─── MODO DISCRETO ───────────────────────────────────────────
 def modo_discreto(phone_raw):
