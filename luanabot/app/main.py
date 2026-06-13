@@ -1990,53 +1990,44 @@ def processar_abastecimento(phone_raw, usuario, texto):
 
 def registar_abastecimento(phone_raw, usuario, texto):
     """Regista abastecimento com autonomia antes/depois e valor."""
-    t = texto.lower()
-    nums = re.findall(r'\d+(?:[.,]\d+)?', t)
-    floats = [float(n.replace(',','.')) for n in nums]
-
-    if len(floats) < 3:
-        enviar_mensagem(phone_raw,
-            "⛽ Não percebi. Tenta assim:\n"
-            "*tinha 80km meti 20€ fiquei com 200km*")
-        return
-
-    # Identificar valor (€) vs autonomia (km)
-    # Valor é tipicamente <= 100€, autonomia >= 30km
-    # Ordem natural: autonomia_antes, valor, autonomia_depois
-    # Ou detetar por contexto (meti/gastei antes do número = valor)
-    m_antes = re.search(r'tinha\s+(\d+)', t)
-    m_valor = re.search(r'(?:meti|gastei|paguei|custou)\s+(\d+(?:[.,]\d+)?)', t)
-    m_depois = re.search(r'(?:fiquei|tenho|ficou|agora)\s+(?:com\s+)?(\d+)', t)
-
-    if m_antes and m_valor and m_depois:
-        km_antes = float(m_antes.group(1))
-        valor = float(m_valor.group(1).replace(',','.'))
-        km_depois = float(m_depois.group(1))
-    elif len(floats) >= 3:
-        # Fallback: 3 números — menor do meio é o valor
-        floats_sorted_idx = sorted(range(len(floats[:3])), key=lambda i: floats[i])
-        valor = floats[floats_sorted_idx[0]]  # menor = euros
-        km_candidates = [f for i,f in enumerate(floats[:3]) if i != floats_sorted_idx[0]]
-        km_antes = min(km_candidates)
-        km_depois = max(km_candidates)
-    else:
-        enviar_mensagem(phone_raw,
-            "⛽ Não percebi. Tenta:\n*tinha 80km meti 20€ fiquei com 200km*")
-        return
-
-    km_ganhos = km_depois - km_antes  # km de autonomia ganhos com o abastecimento
-    consumo = usuario.carro_consumo_l100 or 7.5
-    litros_estimados = round(km_ganhos * consumo / 100, 2) if km_ganhos > 0 else 0
-    custo_litro = round(valor / litros_estimados, 3) if litros_estimados > 0 else 0
-    custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
-
     try:
-        # Garantir que a tabela existe (idempotente)
+        t = texto.lower()
+        nums = re.findall(r'\d+(?:[.,]\d+)?', t)
+        floats = [float(n.replace(',','.')) for n in nums]
+
+        if len(floats) < 3:
+            enviar_mensagem(phone_raw,
+                "⛽ Não percebi. Tenta assim:\n*tinha 80km meti 20€ fiquei com 200km*")
+            return
+
+        m_antes = re.search(r'tinha\s+(\d+)', t)
+        m_valor = re.search(r'(?:meti|gastei|paguei|custou)\s+(\d+(?:[.,]\d+)?)', t)
+        m_depois = re.search(r'(?:fiquei|tenho|ficou|agora)\s+(?:com\s+)?(\d+)', t)
+
+        if m_antes and m_valor and m_depois:
+            km_antes = float(m_antes.group(1))
+            valor = float(m_valor.group(1).replace(',','.'))
+            km_depois = float(m_depois.group(1))
+        else:
+            # Fallback: menor número = valor (€), os outros dois = km
+            ordenados = sorted(floats[:3])
+            valor = ordenados[0]
+            km_antes = ordenados[1]
+            km_depois = ordenados[2]
+
+        km_ganhos = km_depois - km_antes
+        consumo = usuario.carro_consumo_l100 or 7.5
+        litros_estimados = round(km_ganhos * consumo / 100, 2) if km_ganhos > 0 else 0
+        custo_litro = round(valor / litros_estimados, 3) if litros_estimados > 0 else 0
+        custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
+
+        # Garantir tabela
         db.session.execute(text(
             "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50), "
             "data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, km_percorridos FLOAT, "
             "valor FLOAT, litros FLOAT, custo_por_km FLOAT, consumo_l100 FLOAT)"))
         db.session.commit()
+
         db.session.execute(text(
             "INSERT INTO abastecimentos (user_phone, data, km_antes, km_depois, km_percorridos, "
             "valor, litros, custo_por_km, consumo_l100) VALUES (:p,:d,:a,:b,:c,:v,:l,:cpk,:cons)"),
@@ -2044,36 +2035,33 @@ def registar_abastecimento(phone_raw, usuario, texto):
              'a': km_antes, 'b': km_depois, 'c': km_ganhos,
              'v': valor, 'l': litros_estimados, 'cpk': custo_km, 'cons': consumo})
 
-        # Registar como gasto de combustível
         despesa = Despesa(usuario_id=usuario.id, valor=valor, categoria='combustivel',
             descricao=f'Gasolina +{km_ganhos:.0f}km autonomia', data=agora().replace(tzinfo=None))
         db.session.add(despesa)
         db.session.commit()
 
-        # Histórico último mês
         um_mes = agora().replace(tzinfo=None) - __import__('datetime').timedelta(days=30)
         hist = db.session.execute(text(
             "SELECT SUM(km_percorridos), SUM(valor), COUNT(*) FROM abastecimentos "
             "WHERE user_phone=:p AND data>=:d"),
             {'p': usuario.phone, 'd': um_mes}).fetchone()
 
-        msg = f"⛽ Abastecimento registado!\n\n"
-        msg += f"📉 Antes: {km_antes:.0f}km autonomia\n"
-        msg += f"📈 Depois: {km_depois:.0f}km autonomia\n"
-        msg += f"💰 {valor:.0f}€"
+        msg = f"⛽ *Abastecimento registado!*\n"
+        msg += f"━━━━━━━━━━━━━━\n"
+        msg += f"📉 Antes:  {km_antes:.0f}km\n"
+        msg += f"📈 Depois:  {km_depois:.0f}km\n"
+        msg += f"💰 Valor:  {valor:.0f}€"
         if litros_estimados > 0:
-            msg += f" (~{litros_estimados:.1f}L · {custo_litro:.2f}€/L)"
+            msg += f"  (~{litros_estimados:.1f}L · {custo_litro:.2f}€/L)"
         msg += f"\n"
         if hist and hist[0]:
-            msg += f"\n📅 Últimos 30 dias:\n"
-            msg += f"   {hist[0]:.0f}km | {hist[1]:.0f}€ | {hist[2]} abastecimentos"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"📅 Últimos 30 dias: {hist[0]:.0f}km · {hist[1]:.0f}€ · {hist[2]}x"
+        enviar_mensagem(phone_raw, msg)
     except Exception as e:
         db.session.rollback()
-        log.error(f"abastecimento: {e}")
-        enviar_mensagem(phone_raw, "Erro ao registar 😕"); return
-
-    enviar_mensagem(phone_raw, msg)
-
+        log.error(f"abastecimento ERRO: {type(e).__name__}: {e}")
+        enviar_mensagem(phone_raw, "Não consegui registar o abastecimento 😕")
 
 def ver_historico_combustivel(phone_raw, usuario):
     """Mostra histórico de abastecimentos."""
@@ -2300,48 +2288,55 @@ DISTANCIAS_MOITA = {
 PORTAGENS_POR_KM = 0.095  # média A2/A1
 
 def calcular_viagem(phone_raw, usuario, texto):
-    """'vamos ao algarve' → custo estimado: combustível + portagens."""
-    t = texto.lower()
-    destino = None
-    km = None
-    for cidade, dist in DISTANCIAS_MOITA.items():
-        if cidade in t.replace('ã','a').replace('é','e').replace('í','i').replace('ó','o'):
-            destino = cidade.capitalize(); km = dist; break
-    # km manual: "viagem de 300km"
-    if not km:
-        m = re.search(r'(\d{2,4})\s*km', t)
-        if m:
-            km = int(m.group(1)); destino = f"{km}km"
-    if not km:
-        enviar_mensagem(phone_raw,
-            "🗺️ Para onde vais? Conheço: Algarve, Porto, Coimbra, Évora...\n"
-            "Ou diz os km: 'viagem de 300km'")
-        return
+    """'vamos ao algarve' -> custo estimado: combustivel + portagens."""
+    try:
+        t = texto.lower().replace('ã','a').replace('é','e').replace('í','i').replace('ó','o').replace('â','a')
+        destino = None
+        km = None
+        for cidade, dist in DISTANCIAS_MOITA.items():
+            if cidade in t:
+                destino = cidade.capitalize(); km = dist; break
+        if not km:
+            m = re.search(r'(\d{2,4})\s*km', t)
+            if m:
+                km = int(m.group(1)); destino = f"{km}km"
+        if not km:
+            enviar_mensagem(phone_raw,
+                "🗺️ Para onde vais? Conheço: Algarve, Porto, Coimbra, Évora...\n"
+                "Ou diz os km: 'viagem de 300km'")
+            return
 
-    consumo = usuario.carro_consumo_l100 or 7.5
-    ida_volta = km * 2
-    litros = ida_volta * consumo / 100
-    preco_litro = 1.75  # estimativa gasolina 95
-    custo_comb = litros * preco_litro
-    custo_portagens = ida_volta * PORTAGENS_POR_KM * 0.7  # nem todo o percurso é portagem
-    total = custo_comb + custo_portagens
+        consumo = usuario.carro_consumo_l100 or 7.5
+        ida_volta = km * 2
+        litros = ida_volta * consumo / 100
+        preco_litro = 1.75
+        custo_comb = litros * preco_litro
+        custo_portagens = ida_volta * PORTAGENS_POR_KM * 0.7
+        total = custo_comb + custo_portagens
 
-    disp, _ = calcular_disponivel(usuario)
+        try:
+            disp, _ = calcular_disponivel(usuario)
+        except Exception:
+            disp = 0
 
-    msg = f"🗺️ Viagem a {destino} (ida e volta)\n\n"
-    msg += f"🛣️ {ida_volta}km\n"
-    msg += f"⛽ Combustível: ~{custo_comb:.0f}€ ({litros:.0f}L)\n"
-    msg += f"🛂 Portagens: ~{custo_portagens:.0f}€\n"
-    msg += f"💰 Total: *~{total:.0f}€*\n\n"
-    if usuario.phone in [PHONE_RUBEN, PHONE_LUANA]:
-        msg += f"💑 Se dividirem: {total/2:.0f}€ cada\n"
-    if disp > 0:
-        pct = total / disp * 100
-        msg += f"💳 É {pct:.0f}% do teu disponível ({disp:.0f}€)"
-        if pct > 50:
-            msg += " — pesa, planeia bem 😅"
-    enviar_mensagem(phone_raw, msg)
-
+        msg = f"🗺️ *Viagem ao {destino}* (ida e volta)\n"
+        msg += f"━━━━━━━━━━━━━━\n"
+        msg += f"🛣️ Distância:  {ida_volta}km\n"
+        msg += f"⛽ Combustível:  ~{custo_comb:.0f}€ ({litros:.0f}L)\n"
+        msg += f"🛂 Portagens:  ~{custo_portagens:.0f}€\n"
+        msg += f"━━━━━━━━━━━━━━\n"
+        msg += f"💰 *Total: ~{total:.0f}€*\n"
+        if usuario.phone in [PHONE_RUBEN, PHONE_LUANA]:
+            msg += f"💑 A dividir: {total/2:.0f}€ cada\n"
+        if disp > 0:
+            pct = total / disp * 100
+            msg += f"\n💳 É {pct:.0f}% do teu disponível"
+            if pct > 50:
+                msg += " — pesa bem 😅"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"calcular_viagem ERRO: {type(e).__name__}: {e}")
+        enviar_mensagem(phone_raw, "Não consegui calcular a viagem 😕 Tenta: *viagem de 300km*")
 
 def detetar_multi_gastos(texto):
     """Deteta se a mensagem tem múltiplos gastos e divide via Groq. Devolve lista ou None."""
@@ -3127,7 +3122,10 @@ def processar_texto(phone_raw, phone, texto):
             valor_meta = float(m_meta.group(2))
             processar_meta_categoria(phone_raw, usuario, f"limite {cat_meta} {valor_meta}"); return
         # ── CALCULADORA DE VIAGENS ───────────────────────────────────
-        if any(p in t for p in ['vamos a','vamos ao','viagem a','viagem ao','viagem para','quanto custa ir','custo da viagem','ir ate','ir até']):
+        _t_viagem = t.replace('ã','a').replace('é','e').replace('í','i').replace('ó','o')
+        _gatilho_viagem = any(p in _t_viagem for p in ['vamos a','vamos ao','viagem a','viagem ao','viagem para','quanto custa ir','custo da viagem','ir ate','ir a ','fim de semana a','passar a','fui a'])
+        _destino_conhecido = any(c in _t_viagem.split() for c in DISTANCIAS_MOITA.keys())
+        if _gatilho_viagem or (_destino_conhecido and len(t.split()) <= 3 and not eh_gasto(texto)):
             calcular_viagem(phone_raw, usuario, texto); return
         # ── MULTI-GASTOS NUMA MENSAGEM ───────────────────────────────
         if eh_gasto(texto):
