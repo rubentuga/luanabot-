@@ -39,6 +39,8 @@ from pdf_reader import extrair_salario_pdf
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
+DASHBOARD_URL = "https://dinheirinhodoze.netlify.app"
+
 app = Flask(__name__)
 
 @app.after_request
@@ -306,6 +308,22 @@ def normalizar_categoria(cat):
     if cat in CATEGORIAS_VALIDAS: return cat
     return ALIAS_CAT.get(cat, cat)
 
+
+def extrair_nome_gasto(texto):
+    """Extrai um nome limpo do gasto, sem verbos nem números."""
+    t = texto.lower()
+    stop = {'gastei','paguei','comprei','almocei','jantei','custou','lanchei','meti','torrei',
+            'dei','bebi','tomei','fui','no','na','em','de','da','do','num','numa','uns','umas',
+            'uma','um','euros','euro','eur','ontem','hoje','anteontem','€','ao','aos','as','o','a',
+            'comer','beber','foram','para','resto','mas','e','com'}
+    # Remover datas relativas e dias da semana
+    for dia in ['segunda','terca','terça','quarta','quinta','sexta','sabado','sábado','domingo']:
+        t = t.replace(dia, '')
+    tokens = [w for w in re.findall(r"[a-zà-ú]+", t) if w not in stop and len(w) > 2]
+    if tokens:
+        return ' '.join(tokens[:3]).capitalize()
+    return 'Gasto'
+
 def categorizar_ia(texto):
     """Fallback IA para categorias desconhecidas — usa Groq Llama 3 8B."""
     try:
@@ -327,7 +345,7 @@ def categorizar_ia(texto):
             tokens = [w for w in re.findall(r"[a-zà-ú]+", texto.lower()) if len(w)>3 and w not in stop]
             if tokens:
                 guardar_aprendida(tokens[0], cat)
-            return cat, EMOJI_CAT.get(cat,'💳'), texto.split()[0].capitalize()
+            return cat, EMOJI_CAT.get(cat,'💳'), extrair_nome_gasto(texto)
     except Exception as e:
         log.error(f"categorizar_ia: {e}")
     return 'outros', '💳', 'Gasto'
@@ -399,6 +417,7 @@ def criar_tabelas():
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_consumo_l100 FLOAT DEFAULT 6.0",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS pagamento_tipo VARCHAR(20) DEFAULT 'day_before'",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS salario_liquido FLOAT DEFAULT 0",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_salario_mes VARCHAR(7) DEFAULT ''",
     ]
     for sql in colunas_extra:
         try:
@@ -555,7 +574,11 @@ def calcular_disponivel(usuario):
     modo = get_modo(usuario.id)
     futuras = db.session.query(db.func.sum(DespesaFutura.valor_reserva_mensal)).filter(
         DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).scalar() or 0
-    p = calcular_plano(usuario.salario_liquido or 0, modo, futuras, phone=usuario.phone, usuario_id=usuario.id)
+    # Só conta o salário se já foi recebido ESTE mês (senão disponível = 0)
+    mes_atual_str = f"{ano}-{mes:02d}"
+    ja_recebeu = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
+    salario_efetivo = (usuario.salario_liquido or 0) if ja_recebeu else 0
+    p = calcular_plano(salario_efetivo, modo, futuras, phone=usuario.phone, usuario_id=usuario.id)
     gastos = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
@@ -1398,7 +1421,13 @@ def como_estou(phone_raw, usuario):
         {'u': usuario.id}).fetchall()
 
     # Objetivos
-    objs = ObjetivoPoupanca.query.filter_by(usuario_id=usuario.id).all()
+    try:
+        objs_rows = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+            "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 4"),
+            {'u': usuario.id}).fetchall()
+    except Exception:
+        db.session.rollback(); objs_rows = []
 
     # ── SCORE DE SAÚDE FINANCEIRA (0-100) ──
     score = 100
@@ -1476,12 +1505,12 @@ def como_estou(phone_raw, usuario):
         msg += "\n"
 
     # Objetivos com progresso
-    if objs:
+    if objs_rows:
         msg += "🎯 *Objetivos:*\n"
-        for o in objs[:3]:
-            pct_o = min(100, round(o.valor_atual / o.valor_objetivo * 100)) if o.valor_objetivo > 0 else 0
+        for desc_o, val_obj, val_at in objs_rows[:3]:
+            pct_o = min(100, round((val_at or 0) / val_obj * 100)) if val_obj and val_obj > 0 else 0
             barra = '█' * (pct_o // 20) + '░' * (5 - pct_o // 20)
-            msg += f"   {barra} {o.descricao} {pct_o}%\n"
+            msg += f"   {barra} {desc_o} {pct_o}%\n"
         msg += "\n"
 
     # Dívidas a receber
@@ -1491,7 +1520,8 @@ def como_estou(phone_raw, usuario):
             msg += f"   {pessoa} deve-te {val:.0f}€\n"
 
     msg += "\n━━━━━━━━━━━━\n"
-    msg += "💡 *ver transações* · *plano* · *resumo*"
+    msg += "💡 *ver transações* · *resumo*\n"
+    msg += "📊 dinheirinhodoze.netlify.app"
     enviar_mensagem(phone_raw, msg)
 
 def processar_assinaturas(phone_raw, usuario, texto):
@@ -2471,8 +2501,8 @@ def detetar_multi_gastos(texto):
     """Deteta se a mensagem tem múltiplos gastos e divide via Groq. Devolve lista ou None."""
     t = texto.lower()
     # Heurística: 2+ valores E conectores de divisão
-    valores = re.findall(r'\d+(?:[.,]\d{1,2})?\s*(?:€|euros?)', t)
-    conectores = ['mas ','sendo ',' foram ',' foi para',' e o resto',' resto ',' dos quais']
+    valores = re.findall(r'\b\d+(?:[.,]\d{1,2})?\b', t)
+    conectores = ['mas ','sendo ',' foram ',' foi para',' e o resto',' resto ',' dos quais',' sendo ']
     if len(valores) < 2 or not any(c in t for c in conectores):
         return None
     try:
@@ -2531,8 +2561,8 @@ def processar_lembrete(phone_raw, usuario, texto):
         return
 
     # Extrair o texto do lembrete (remover palavras de tempo)
-    texto_limpo = re.sub(r'lembra(?:-me)?\s+(?:de\s+)?', '', t, flags=re.IGNORECASE)
-    texto_limpo = re.sub(r'(?:amanhã|amanha|hoje|segunda|terça|quarta|quinta|sexta|sábado|domingo).*', '', texto_limpo, flags=re.IGNORECASE).strip()
+    texto_limpo = re.sub(r'lembra(?:-me|\s+me)?\s+(?:de\s+|que\s+|para\s+)?', '', t, flags=re.IGNORECASE)
+    texto_limpo = re.sub(r'(?:amanhã|amanha|hoje|segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo|às|as|daqui).*', '', texto_limpo, flags=re.IGNORECASE).strip()
     texto_limpo = texto_limpo.capitalize() or "Lembrete"
 
     try:
@@ -2796,14 +2826,97 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
             return
 
+        if estado == 'objetivo_tudo':
+            d = dados_estado
+            valor_obj = d.get('valor', 0)
+            desc_obj = d.get('desc', '')
+            t_resp = texto.lower()
+
+            # 1. Nome (se ainda não tem) — extrair palavras úteis
+            if not desc_obj:
+                stop_n = {'para','o','a','os','as','em','no','na','ate','até','daqui','meses','mes','mês',
+                          'ja','já','tenho','nao','não','euros','euro','de','do','da','dezembro','janeiro',
+                          'fevereiro','marco','março','abril','maio','junho','julho','agosto','setembro',
+                          'outubro','novembro','um','uns','uma'}
+                palavras_n = [w for w in re.findall(r'[a-zà-ú]+', t_resp) if w not in stop_n and len(w) > 2]
+                desc_obj = ' '.join(palavras_n[:3]).capitalize() if palavras_n else 'Objetivo'
+
+            emoji_o = emoji_objetivo(desc_obj)
+
+            # 2. Data/prazo
+            mes_alvo = None; meses_falta = 6
+            meses_nome = {'janeiro':1,'fevereiro':2,'marco':3,'março':3,'abril':4,'maio':5,'junho':6,
+                          'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12}
+            for nome_m, num_m in meses_nome.items():
+                if nome_m in t_resp:
+                    mes_alvo = num_m; break
+            m_daqui = re.search(r'daqui a (\d+)\s*mes', t_resp)
+            m_meses = re.search(r'(\d+)\s*mes', t_resp)
+            if mes_alvo:
+                hoje_m = agora().month; hoje_a = agora().year
+                meses_falta = (mes_alvo - hoje_m) % 12 or 12
+            elif m_daqui:
+                meses_falta = int(m_daqui.group(1))
+                mes_alvo = ((agora().month - 1 + meses_falta) % 12) + 1
+            elif m_meses:
+                meses_falta = int(m_meses.group(1))
+                mes_alvo = ((agora().month - 1 + meses_falta) % 12) + 1
+
+            # 3. Valor inicial
+            tem_negacao = any(p in t_resp for p in ['nao tenho','não tenho','nada','zero','nao','não'])
+            inicial = 0
+            if not tem_negacao:
+                # Procurar "tenho X" ou "ja tenho X" ou "com X"
+                m_ini = re.search(r'(?:tenho|já tenho|ja tenho|com|guardado)\s+(\d+(?:[.,]\d+)?)', t_resp)
+                if m_ini:
+                    inicial = float(m_ini.group(1).replace(',','.'))
+                else:
+                    # Qualquer número que não seja o valor do objetivo nem meses
+                    nums = [float(n.replace(',','.')) for n in re.findall(r'\d+(?:[.,]\d+)?', t_resp)]
+                    nums = [n for n in nums if n != meses_falta and n != valor_obj and n < valor_obj]
+                    if nums: inicial = nums[0]
+
+            limpar_estado(phone)
+
+            # Criar o objetivo
+            por_mes = round((valor_obj - inicial) / meses_falta, 2) if meses_falta > 0 else valor_obj
+            nomes_m_o = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            mes_txt = nomes_m_o[mes_alvo-1] if mes_alvo else '?'
+            try:
+                db.session.execute(text(
+                    "INSERT INTO objetivos_poupanca (usuario_id,descricao,valor_objetivo,valor_atual) VALUES (:u,:d,:v,:a)"),
+                    {'u':usuario.id,'d':desc_obj,'v':valor_obj,'a':inicial})
+                db.session.commit()
+                falta = valor_obj - inicial
+                pct_ini = round(inicial/valor_obj*100) if valor_obj > 0 else 0
+                barra = '█'*(pct_ini//10) + '░'*(10-pct_ini//10)
+                msg_o = f"✅ *Objetivo criado!* {emoji_o}\n"
+                msg_o += f"━━━━━━━━━━━━━━\n"
+                msg_o += f"{emoji_o} *{desc_obj}*\n"
+                msg_o += f"💰 Meta:  {valor_obj:.0f}€\n"
+                if inicial > 0:
+                    msg_o += f"💶 Já tens:  {inicial:.0f}€\n"
+                    msg_o += f"📊 Falta:  {falta:.0f}€\n"
+                    msg_o += f"{barra} {pct_ini}%\n"
+                msg_o += f"📅 Meta:  {mes_txt} ({meses_falta} {'mês' if meses_falta==1 else 'meses'})\n"
+                msg_o += f"💪 ~{por_mes:.0f}€/mês\n"
+                msg_o += f"━━━━━━━━━━━━━━\n"
+                msg_o += f"💡 Diz *guardei 50 para {desc_obj.lower()}* para ires registando"
+                enviar_mensagem(phone_raw, msg_o)
+            except Exception as e:
+                log.error(f"obj tudo: {e}"); db.session.rollback()
+                enviar_mensagem(phone_raw, "Erro ao criar objetivo 😕")
+            return
+
         if estado == 'objetivo_nome':
             valor_obj = dados_estado.get('valor', 0)
             nome_obj = texto.strip()[:30].capitalize()
             if len(nome_obj) < 2:
                 enviar_mensagem(phone_raw, "Diz-me um nome para o objetivo 😊"); return
-            set_estado(phone, 'objetivo_data', {'valor': valor_obj, 'desc': nome_obj})
+            emoji_obj = emoji_objetivo(nome_obj)
+            set_estado(phone, 'objetivo_data', {'valor': valor_obj, 'desc': nome_obj, 'emoji': emoji_obj})
             enviar_mensagem(phone_raw,
-                f"🎯 *{nome_obj}: {valor_obj:.0f}€*\n\n📅 Até quando queres atingir?\nEx: _dezembro, março, daqui a 3 meses_")
+                f"{emoji_obj} *{nome_obj}: {valor_obj:.0f}€*\n\n📅 Até quando queres atingir?\nEx: _dezembro, março, daqui a 3 meses_")
             return
 
         if estado == 'objetivo_data':
@@ -2830,11 +2943,12 @@ def processar_texto(phone_raw, phone, texto):
             nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
             mes_txt = nomes_m[mes_alvo-1] if mes_alvo else '?'
             # Perguntar valor inicial (estilo GranaZen)
+            emoji_od = dados_estado.get('emoji', emoji_objetivo(desc_obj))
             set_estado(phone, 'objetivo_inicial', {
                 'valor': valor_obj, 'desc': desc_obj, 'mes_txt': mes_txt,
-                'por_mes': por_mes, 'meses': meses_falta})
+                'por_mes': por_mes, 'meses': meses_falta, 'emoji': emoji_od})
             enviar_mensagem(phone_raw,
-                f"🎯 *{desc_obj}: {valor_obj:.0f}€*\n"
+                f"{emoji_od} *{desc_obj}: {valor_obj:.0f}€*\n"
                 f"📅 Meta: {mes_txt} ({meses_falta} meses)\n"
                 f"💰 ~{por_mes:.0f}€/mês\n\n"
                 f"Já tens algum valor guardado para começar?\nDiz o valor ou 'não' 😊")
@@ -2852,9 +2966,10 @@ def processar_texto(phone_raw, phone, texto):
                 falta = d.get('valor',0) - inicial
                 pct_ini = round(inicial/d.get('valor',1)*100) if d.get('valor',0)>0 else 0
                 barra = '█'*(pct_ini//10) + '░'*(10-pct_ini//10)
-                msg_obj = f"✅ *Objetivo criado!*\n"
+                emoji_final = d.get('emoji', '🎯')
+                msg_obj = f"✅ *Objetivo criado!* {emoji_final}\n"
                 msg_obj += f"━━━━━━━━━━━━━━\n"
-                msg_obj += f"🎯 {d.get('desc')}\n"
+                msg_obj += f"{emoji_final} *{d.get('desc')}*\n"
                 msg_obj += f"💰 Meta:  {d.get('valor',0):.0f}€\n"
                 if inicial > 0:
                     msg_obj += f"💶 Já tens:  {inicial:.0f}€\n"
@@ -3122,7 +3237,17 @@ def processar_texto(phone_raw, phone, texto):
             enviar_conjunta(phone_raw, usuario); return
 
         # ── QUANTO TENHO / SALDO ──
-        if any(p in t for p in ['quanto tenho','quanto me resta','quanto sobra','saldo']):
+        # Registar/ver saldo de conta ANTES do quanto tenho
+        if re.search(r'\bsaldo\b', t):
+            if tem_numero(texto):
+                if registar_saldo_conta(phone_raw, usuario, texto): return
+            else:
+                # "saldo bankinter" sem número → ver saldo dessa conta
+                contas_s = ['bpi','cgd','caixa','bankinter','revolut','trade republic','tr','millennium','santander','wise']
+                conta_s = next((c for c in contas_s if c in t), None)
+                if conta_s:
+                    ver_patrimonio(phone_raw, usuario); return
+        if any(p in t for p in ['quanto tenho','quanto me resta','quanto sobra']):
             enviar_quanto_tenho(phone_raw, usuario); return
 
         # ── RESUMO ──
@@ -3287,6 +3412,9 @@ def processar_texto(phone_raw, phone, texto):
             cat_meta = m_meta.group(1).strip()
             valor_meta = float(m_meta.group(2))
             processar_meta_categoria(phone_raw, usuario, f"limite {cat_meta} {valor_meta}"); return
+        # ── HISTÓRICO COMBUSTÍVEL ────────────────────────────────────
+        if any(p in t for p in ['consumo carro','consumo do carro','historico gasolina','histórico gasolina','ver abastecimentos','gastos gasolina','quanto gastei em gasolina']):
+            ver_historico_combustivel(phone_raw, usuario); return
         # ── CALCULADORA DE VIAGENS ───────────────────────────────────
         _t_viagem = t.replace('ã','a').replace('é','e').replace('í','i').replace('ó','o')
         _gatilho_viagem = any(p in _t_viagem for p in ['vamos a','vamos ao','viagem a','viagem ao','viagem para','quanto custa ir','custo da viagem','ir ate','ir a ','fim de semana a','passar a','fui a'])
@@ -3338,7 +3466,7 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['ver transacoes','ver transações','extrato','ultimas transacoes','últimas transações','ver gastos todos','todas as transacoes','todas as transações','historico de gastos','lista de gastos','ver despesas']):
             ver_transacoes(phone_raw, usuario); return
         # ── APAGAR POR CÓDIGO: "apaga G4X" / "excluir G4X" ───────────
-        m_cod = re.search(r'(?:apaga|apagar|elimina|eliminar|exclui|excluir|remove|remover)\s+(?:a\s+|o\s+|transa[çc][ãa]o\s+|gasto\s+)?([0-9a-zA-Z]{2,4})\b', texto)
+        m_cod = re.search(r'(?:apaga|apagar|elimina|eliminar|exclui|excluir|remove|remover)\s+(?:a\s+|o\s+|transa[çc][ãa]o\s+|gasto\s+)?([0-9a-zA-Z]{2,4})\b', texto, re.IGNORECASE)
         if m_cod and not any(p in t for p in ['ultimo','último','isso']):
             cod = m_cod.group(1).upper()
             tx_id = codigo_para_id(cod)
@@ -3598,6 +3726,11 @@ def processar_receita(phone_raw, usuario, texto):
     if valor == 0:
         enviar_mensagem(phone_raw, "Quanto recebeste? 💰"); return
     usuario.salario_liquido = valor
+    # Marcar que recebeu salário ESTE mês (para o disponível contar)
+    try:
+        usuario.ultimo_salario_mes = f"{agora().year}-{agora().month:02d}"
+    except Exception:
+        pass
     db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
     db.session.commit()
     enviar_plano_salario(phone_raw, usuario, valor)
@@ -3658,7 +3791,21 @@ def enviar_plano_salario(phone_raw, usuario, salario):
                     else "\n\nAproveita para comprar umas roupas para ti, tu mereces! 🛍️💕")
     if agora().month == 11 and usuario.phone == PHONE_LUANA:
         msg += "\n\n🎂 Este mês é o teu aniversário!! 100€ só para ti! 🎁"
-    msg += "\n━━━━━━━━━━━━\n💡 *onde vai o dinheiro* para a distribuição"
+    # Lembrete dos objetivos ativos (não te esqueças de poupar para X)
+    try:
+        objs_ativos = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+            "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 3"),
+            {'u': usuario.id}).fetchall()
+        if objs_ativos:
+            msg += "\n\n🎯 *Não te esqueças dos objetivos:*\n"
+            for desc_o, val_o, at_o in objs_ativos:
+                emoji_o = emoji_objetivo(desc_o)
+                falta_o = (val_o or 0) - (at_o or 0)
+                msg += f"{emoji_o} {desc_o} — falta {falta_o:.0f}€\n"
+    except Exception as e:
+        log.error(f"lembrete objetivos: {e}")
+    msg += "\n━━━━━━━━━━━━\n💡 *onde vai o dinheiro* · 📊 dinheirinhodoze.netlify.app"
     enviar_mensagem(phone_raw, msg)
 
     reserva_atual = get_reserva(usuario.id)
@@ -3901,28 +4048,34 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     disp = p['gastar'] - gp
     nomes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
 
-    msg = f"📊 {nomes[mes-1]}\n\n"
-    msg += f"💰 Receita: {receita:.0f}€\n"
-    msg += f"🛒 Gastos: {gp:.2f}€\n"
-    if gc > 0: msg += f"💑 Conjunta: {gc:.2f}€\n"
-    msg += f"💚 Disponível: {disp:.2f}€\n"
-    msg += f"💎 Poupança: {p['poupanca']:.0f}€\n"
+    saldo_mes = receita - gp
+    msg = f"📊 *{nomes[mes-1]} {ano}*\n"
+    msg += f"━━━━━━━━━━━━━━\n"
+    msg += f"💰 Receita:  {receita:.0f}€\n"
+    msg += f"🛒 Gastos:  {gp:.0f}€\n"
+    if gc > 0:
+        msg += f"💑 Conjunta:  {gc:.0f}€\n"
+    sinal = "🟢" if saldo_mes >= 0 else "🔴"
+    msg += f"{sinal} Saldo:  {saldo_mes:+.0f}€\n"
+    msg += f"━━━━━━━━━━━━━━\n"
 
     if por_cat_sorted:
-        msg += "\n📈 Categorias:\n"
-        for i, (cat, total) in enumerate(por_cat_sorted, 1):
+        msg += f"*Para onde foi o dinheiro:*\n"
+        for cat, total in por_cat_sorted[:6]:
             pct = round(total/gp*100) if gp > 0 else 0
-            msg += f"{i}. {EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}: {total:.2f}€ ({pct}%)\n"
+            barra = '▓' * (pct // 10) + '░' * (10 - pct // 10)
+            msg += f"{EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}\n"
+            msg += f"   {barra} {total:.0f}€ · {pct}%\n"
 
     if not mes_override and agora().day > 3 and gp > 0:
         ritmo = gp/agora().day*30
-        msg += f"\n🔮 Ao ritmo atual: ~{ritmo:.0f}€ no fim do mês"
+        msg += f"\n🔮 Ao ritmo atual: ~{ritmo:.0f}€ até fim do mês"
         if por_cat_sorted:
             top_cat, top_val = por_cat_sorted[0]
             if top_val > 50:
-                msg += f"\n💡 Reduz {top_cat} 30% → poupa ~{top_val*0.3*12:.0f}€/ano"
+                msg += f"\n💡 Cortar 30% em {top_cat} = +{top_val*0.3*12:.0f}€/ano"
 
-    msg += "\n\nResponde com o número para ver os detalhes de cada categoria"
+    msg += "\n\n💡 Diz o *número* da categoria para detalhes\n📊 dinheirinhodoze.netlify.app"
 
     # Guarda as categorias no estado para o utilizador poder selecionar
     cats_estado = {str(i+1): cat for i, (cat, _) in enumerate(por_cat_sorted)}
@@ -5072,6 +5225,39 @@ def processar_objetivo_casal(phone_raw, usuario, texto):
         notificar_parceiro(usuario.phone, f"💑 {meu_nome} criou um objetivo conjunto!\n🎯 {desc.capitalize()}: {valor:.0f}€\nVamos a isso! 💪")
 
 # ─── OBJETIVO POUPANÇA ───────────────────────────────────────
+
+def emoji_objetivo(nome):
+    """Escolhe emoji(s) temático(s) para o nome do objetivo (estilo GranaZen)."""
+    n = nome.lower()
+    mapa = {
+        ('paris','franca','frança'): '✈️🇫🇷',
+        ('londres','inglaterra','reino unido'): '✈️🇬🇧',
+        ('lisboa','porto','portugal'): '✈️🇵🇹',
+        ('espanha','madrid','barcelona'): '✈️🇪🇸',
+        ('italia','itália','roma','milao'): '✈️🇮🇹',
+        ('viagem','viajar','ferias','férias','voo'): '✈️',
+        ('praia','mar','verao','verão'): '🏖️',
+        ('ps5','playstation','xbox','consola','jogos','jogo'): '🎮',
+        ('pc','computador','portatil','portátil','laptop'): '💻',
+        ('telemovel','telemóvel','iphone','android','samsung'): '📱',
+        ('carro','automovel','automóvel','mota'): '🚗',
+        ('casa','apartamento','renda','imovel','imóvel'): '🏠',
+        ('movel','móvel','mobilia','mobília','sofa','sofá'): '🛋️',
+        ('emergencia','emergência','fundo','seguranca','segurança'): '🛡️',
+        ('casamento','anel','noivado'): '💍',
+        ('bebe','bebé','filho','filha'): '👶',
+        ('curso','formacao','formação','escola','estudo'): '📚',
+        ('ginasio','ginásio','gym','fitness'): '💪',
+        ('relogio','relógio','watch'): '⌚',
+        ('camara','câmara','fotografia','foto'): '📷',
+        ('bicicleta','bike','trotinete'): '🚲',
+        ('natal','presente','prenda'): '🎁',
+    }
+    for chaves, emoji in mapa.items():
+        if any(c in n for c in chaves):
+            return emoji
+    return '🎯'
+
 def processar_objetivo_poupanca(phone_raw, usuario, texto):
     t = texto.lower()
     if any(p in t for p in ['ver','lista','objetivos','metas','mostrar']):
@@ -5098,17 +5284,20 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
     palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
     desc = ' '.join(palavras[:3]).capitalize() if palavras else 'Objetivo'
 
-    # Pergunta quando quer atingir
+    # Perguntar TUDO de uma vez (estilo GranaZen) — depois parseia a resposta completa
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-    if desc == 'Objetivo' or len(desc) < 3:
-        # Não percebeu o nome → perguntar
-        set_estado(phone, 'objetivo_nome', {'valor': valor})
-        enviar_mensagem(phone_raw,
-            f"🎯 *Novo objetivo: {valor:.0f}€*\n\nPara que é esta poupança?\nEx: _Viagem, Fundo de emergência, PS5..._")
-    else:
-        set_estado(phone, 'objetivo_data', {'valor': valor, 'desc': desc})
-        enviar_mensagem(phone_raw,
-            f"🎯 *{desc}: {valor:.0f}€*\n\n📅 Até quando queres atingir?\nEx: _dezembro, março, daqui a 3 meses_")
+    emoji_d = emoji_objetivo(desc) if desc != 'Objetivo' else '🎯'
+    set_estado(phone, 'objetivo_tudo', {'valor': valor, 'desc': desc if desc != 'Objetivo' else '', 'emoji': emoji_d})
+
+    desc_txt = f" para *{desc}*" if desc != 'Objetivo' else ""
+    msg = f"{emoji_d} *Novo objetivo: {valor:.0f}€*{desc_txt}\n\n"
+    msg += f"Conta-me numa mensagem:\n"
+    if desc == 'Objetivo':
+        msg += f"📝 *Para quê* (ex: Viagem, PS5)\n"
+    msg += f"📅 *Até quando* (ex: dezembro, daqui a 6 meses)\n"
+    msg += f"💰 *Quanto já tens* (ou diz que não tens)\n\n"
+    msg += f"_Ex: \"para o Algarve em dezembro, já tenho 200\"_"
+    enviar_mensagem(phone_raw, msg)
 
 # ─── MODO DISCRETO ───────────────────────────────────────────
 def modo_discreto(phone_raw):
@@ -5332,6 +5521,10 @@ def processar_salarios_pendentes():
                     f"Recebeste *{valor:.2f}€* 🎉")
                 # Gestão completa (regista receita + plano + verificações)
                 processar_receita(phone_raw, u, f"recebi {valor}")
+                try:
+                    u.ultimo_salario_mes = f"{hoje.year}-{hoje.month:02d}"
+                    db.session.commit()
+                except Exception: pass
                 db.session.execute(text(
                     "UPDATE salarios_pendentes SET processado=TRUE WHERE id=:i"), {'i': row_id})
                 db.session.commit()
@@ -5476,9 +5669,36 @@ def relatorio_mensal_automatico():
                              'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
                 enviar_mensagem(f"{u.phone}@lid",
                     f"📊 *Relatório de {nomes_m_r[hoje.month-1]}*\n\n"
-                    f"O mês acabou! Aqui está o teu resumo:\n{url}")
+                    f"O mês acabou! Vê o resumo completo:\n📊 dinheirinhodoze.netlify.app\n\n"
+                    f"Ou o relatório detalhado:\n{url}")
             except Exception as e:
                 log.error(f"relatorio_mensal: {e}")
+
+
+def lembrete_poupanca_mensal():
+    """Início do mês: lembra de poupar para os objetivos ativos."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.day != 2 or hoje.hour != 10: return  # dia 2 às 10h
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                objs = db.session.execute(text(
+                    "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+                    "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 3"),
+                    {'u': u.id}).fetchall()
+                if not objs: continue
+                msg = "🎯 *Novo mês, novos objetivos!*\n\n"
+                msg += "Não te esqueças de poupar para:\n"
+                for desc_o, val_o, at_o in objs:
+                    emoji_o = emoji_objetivo(desc_o)
+                    falta_o = (val_o or 0) - (at_o or 0)
+                    pct_o = round((at_o or 0)/val_o*100) if val_o else 0
+                    msg += f"{emoji_o} {desc_o} — {pct_o}% (falta {falta_o:.0f}€)\n"
+                msg += "\n💡 Diz *guardei X para [objetivo]* quando puseres dinheiro de lado 💪"
+                enviar_mensagem(f"{u.phone}@lid", msg)
+            except Exception as e:
+                log.error(f"lembrete_poupanca: {e}"); db.session.rollback()
 
 def repergunta_recibo():
     """Às 15h30, repergunta a quem disse 'não' de manhã."""
@@ -5774,6 +5994,7 @@ else:
     scheduler.add_job(enviar_lembretes_gerais,    'cron', minute='*/5')
     scheduler.add_job(lembrete_contas_receber,    'cron', hour=12, minute=0, day_of_week='mon')
     scheduler.add_job(relatorio_mensal_automatico,'cron', hour=10, minute=30)
+    scheduler.add_job(lembrete_poupanca_mensal,   'cron', hour=10, minute=0)
     scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
     scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
     scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
