@@ -2031,6 +2031,12 @@ def registar_abastecimento(phone_raw, usuario, texto):
     custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
 
     try:
+        # Garantir que a tabela existe (idempotente)
+        db.session.execute(text(
+            "CREATE TABLE IF NOT EXISTS abastecimentos (id SERIAL PRIMARY KEY, user_phone VARCHAR(50), "
+            "data TIMESTAMP DEFAULT NOW(), km_antes FLOAT, km_depois FLOAT, km_percorridos FLOAT, "
+            "valor FLOAT, litros FLOAT, custo_por_km FLOAT, consumo_l100 FLOAT)"))
+        db.session.commit()
         db.session.execute(text(
             "INSERT INTO abastecimentos (user_phone, data, km_antes, km_depois, km_percorridos, "
             "valor, litros, custo_por_km, consumo_l100) VALUES (:p,:d,:a,:b,:c,:v,:l,:cpk,:cons)"),
@@ -3224,7 +3230,7 @@ def processar_texto(phone_raw, phone, texto):
     except Exception as e:
         try: db.session.rollback()
         except Exception: pass
-        log.error(f'processar_texto: {e}', exc_info=True)
+        log.error(f'processar_texto ERRO: {type(e).__name__}: {e} | texto="{texto[:50]}"', exc_info=True)
         enviar_mensagem(phone_raw, "Ocorreu um erro 😕 Tenta de novo!")
 
 # ─── PROCESSAR DESPESA ───────────────────────────────────────
