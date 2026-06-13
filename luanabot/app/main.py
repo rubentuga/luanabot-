@@ -392,6 +392,20 @@ def criar_tabelas():
             db.session.execute(text(sql)); db.session.commit()
         except Exception as e:
             log.warning(f"tabela: {e}"); db.session.rollback()
+    # Garantir colunas críticas na tabela usuarios (re-tentar individualmente)
+    colunas_extra = [
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dia_pagamento INTEGER DEFAULT 21",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_nome VARCHAR(100) DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carro_consumo_l100 FLOAT DEFAULT 6.0",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS pagamento_tipo VARCHAR(20) DEFAULT 'day_before'",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS salario_liquido FLOAT DEFAULT 0",
+    ]
+    for sql in colunas_extra:
+        try:
+            db.session.execute(text(sql)); db.session.commit()
+            log.info(f"Coluna OK: {sql[:55]}")
+        except Exception as e:
+            log.warning(f"coluna: {e}"); db.session.rollback()
 
 def carregar_aprendidas():
     try:
@@ -834,7 +848,7 @@ def api_debug():
         for cidade, dist in DISTANCIAS_MOITA.items():
             if cidade in t_v:
                 km_v = dist; break
-        consumo_v = usuario.carro_consumo_l100 or 7.5
+        consumo_v = get_consumo_carro(usuario)
         litros_v = km_v * 2 * consumo_v / 100
         total_v = litros_v * 1.75 + km_v * 2 * PORTAGENS_POR_KM * 0.7
         resultados['logica_viagem'] = f'OK (algarve={total_v:.0f}EUR)'
@@ -857,7 +871,7 @@ def api_debug():
 
     # Teste 9: carro_consumo_l100 existe?
     try:
-        resultados['carro_consumo'] = f'OK ({usuario.carro_consumo_l100})'
+        resultados['carro_consumo'] = f'OK ({get_consumo_carro(usuario)})'
     except Exception as e:
         resultados['carro_consumo'] = f'ERRO: {type(e).__name__}'
 
@@ -2079,8 +2093,8 @@ def processar_abastecimento(phone_raw, usuario, texto):
         if custo_por_km:
             msg += f"\n📊 {custo_por_km:.3f}€/km"
             # Comparar com carro do utilizador
-            consumo = usuario.carro_consumo_l100 or 7.5
-            msg += f"\n🚗 {usuario.carro_nome or 'Carro'}: ~{consumo}L/100km"
+            consumo = get_consumo_carro(usuario)
+            msg += f"\n🚗 {getattr(usuario, 'carro_nome', None) or 'Carro'}: ~{consumo}L/100km"
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
         log.error(f"abastecimento: {e}"); db.session.rollback()
@@ -2115,7 +2129,7 @@ def registar_abastecimento(phone_raw, usuario, texto):
             km_depois = ordenados[2]
 
         km_ganhos = km_depois - km_antes
-        consumo = usuario.carro_consumo_l100 or 7.5
+        consumo = get_consumo_carro(usuario)
         litros_estimados = round(km_ganhos * consumo / 100, 2) if km_ganhos > 0 else 0
         custo_litro = round(valor / litros_estimados, 3) if litros_estimados > 0 else 0
         custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
@@ -2160,7 +2174,7 @@ def registar_abastecimento(phone_raw, usuario, texto):
     except Exception as e:
         db.session.rollback()
         log.error(f"abastecimento ERRO: {type(e).__name__}: {e}", exc_info=True)
-        enviar_mensagem(phone_raw, f"🐛 DEBUG abast: {type(e).__name__}: {str(e)[:200]}")
+        enviar_mensagem(phone_raw, "Não consegui registar o abastecimento 😕")
 
 def ver_historico_combustivel(phone_raw, usuario):
     """Mostra histórico de abastecimentos."""
@@ -2386,6 +2400,22 @@ DISTANCIAS_MOITA = {
 }
 PORTAGENS_POR_KM = 0.095  # média A2/A1
 
+
+def get_consumo_carro(usuario):
+    """Busca consumo do carro de forma segura (coluna pode não existir no modelo)."""
+    try:
+        return getattr(usuario, 'carro_consumo_l100', None) or _consumo_por_phone(usuario.phone)
+    except Exception:
+        return _consumo_por_phone(usuario.phone)
+
+def _consumo_por_phone(phone):
+    """Consumo fixo por utilizador (fallback)."""
+    if phone == PHONE_RUBEN:
+        return 7.5  # Ibiza 6J 1.2
+    elif phone == PHONE_LUANA:
+        return 5.5  # Taigo
+    return 6.5
+
 def calcular_viagem(phone_raw, usuario, texto):
     """'vamos ao algarve' -> custo estimado: combustivel + portagens."""
     try:
@@ -2405,7 +2435,7 @@ def calcular_viagem(phone_raw, usuario, texto):
                 "Ou diz os km: 'viagem de 300km'")
             return
 
-        consumo = usuario.carro_consumo_l100 or 7.5
+        consumo = get_consumo_carro(usuario)
         ida_volta = km * 2
         litros = ida_volta * consumo / 100
         preco_litro = 1.75
@@ -2435,7 +2465,7 @@ def calcular_viagem(phone_raw, usuario, texto):
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
         log.error(f"calcular_viagem ERRO: {type(e).__name__}: {e}", exc_info=True)
-        enviar_mensagem(phone_raw, f"🐛 DEBUG viagem: {type(e).__name__}: {str(e)[:200]}")
+        enviar_mensagem(phone_raw, "Não consegui calcular a viagem 😕 Tenta: *viagem de 300km*")
 
 def detetar_multi_gastos(texto):
     """Deteta se a mensagem tem múltiplos gastos e divide via Groq. Devolve lista ou None."""
