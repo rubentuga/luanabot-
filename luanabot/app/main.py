@@ -1,3 +1,4 @@
+
 import os, json, logging, re, base64, tempfile
 from datetime import datetime, timedelta
 try:
@@ -1137,8 +1138,126 @@ def api_saude():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/relatorio', methods=['GET'])
+
+def gerar_pdf_relatorio(usuario, mes, ano):
+    """Gera um PDF do relatório mensal. Devolve os bytes do PDF."""
+    from fpdf import FPDF
+    nomes_mes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho',
+                 'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+    nome = NOMES_CASAL.get(usuario.phone, 'Utilizador')
+    mes_nome = nomes_mes[mes-1]
+
+    # Dados
+    gastos = db.session.execute(text(
+        "SELECT categoria, SUM(valor) as total FROM despesas "
+        "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y "
+        "AND descricao NOT LIKE '[conjunta]%%' GROUP BY categoria ORDER BY total DESC"),
+        {'u':usuario.id,'m':mes,'y':ano}).fetchall()
+    total_gastos = sum(r[1] for r in gastos) or 0
+    receita = db.session.execute(text(
+        "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
+        "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+        {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
+    try:
+        reserva = get_reserva(usuario.id)
+    except Exception:
+        reserva = 0
+    _, p = calcular_disponivel(usuario)
+    poupanca = p.get('poupanca', 0)
+
+    NOME_CAT = {'fastfood':'Fast Food','restaurante':'Restaurante','cafe':'Cafe','roupa':'Roupa',
+        'tecnologia':'Tecnologia','supermercado':'Supermercado','combustivel':'Combustivel',
+        'saude':'Saude','pessoal':'Pessoal','carro':'Carro','lazer':'Lazer','casa':'Casa',
+        'subscricoes':'Subscricoes','animais':'Animais','presentes':'Presentes','viagem':'Viagem',
+        'educacao':'Educacao','desporto':'Desporto','gota':'Bebidas','outros':'Outros'}
+    CORES = {'roupa':(75,159,255),'fastfood':(255,122,69),'combustivel':(255,184,77),
+        'supermercado':(61,220,132),'cafe':(184,124,255),'restaurante':(255,94,94),
+        'tecnologia':(75,159,255),'carro':(120,144,170),'casa':(61,220,132),'outros':(140,150,160)}
+
+    class PDF(FPDF):
+        def header(self):
+            self.set_fill_color(20, 25, 35)
+            self.rect(0, 0, 210, 45, 'F')
+            self.set_y(12)
+            self.set_font("Helvetica", 'B', 22)
+            self.set_text_color(255, 255, 255)
+            self.cell(0, 10, "Ze das Financas", align='C')
+            self.ln(9)
+            self.set_font("Helvetica", '', 13)
+            self.set_text_color(180, 190, 200)
+            self.cell(0, 8, f"Relatorio de {mes_nome} {ano} - {nome}", align='C')
+            self.ln(20)
+        def footer(self):
+            self.set_y(-15)
+            self.set_font("Helvetica", '', 8)
+            self.set_text_color(150, 150, 150)
+            self.cell(0, 10, "dinheirinhodoze.netlify.app", align='C')
+
+    pdf = PDF()
+    pdf.add_page()
+
+    def kpi_box(x, label, valor, cor):
+        pdf.set_fill_color(*cor)
+        pdf.set_draw_color(230, 230, 230)
+        pdf.rect(x, 55, 42, 28, 'DF')
+        pdf.set_xy(x, 60)
+        pdf.set_font("Helvetica", '', 9)
+        pdf.set_text_color(90, 90, 90)
+        pdf.cell(42, 5, label, align='C')
+        pdf.set_xy(x, 68)
+        pdf.set_font("Helvetica", 'B', 14)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(42, 8, valor, align='C')
+
+    kpi_box(15, "Receita", f"{receita:.0f}EUR", (235, 245, 255))
+    kpi_box(60, "Gastos", f"{total_gastos:.0f}EUR", (255, 240, 235))
+    kpi_box(105, "Poupanca", f"{poupanca:.0f}EUR", (235, 255, 242))
+    kpi_box(150, "Reserva", f"{reserva:.0f}EUR", (255, 250, 235))
+
+    pdf.set_y(92)
+    saldo = receita - total_gastos
+    pdf.set_font("Helvetica", 'B', 13)
+    if saldo >= 0: pdf.set_text_color(61, 180, 110)
+    else: pdf.set_text_color(220, 60, 60)
+    pdf.cell(0, 10, f"Saldo do mes: {'+' if saldo>=0 else ''}{saldo:.0f}EUR", align='C')
+
+    pdf.set_y(110)
+    pdf.set_font("Helvetica", 'B', 14)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 10, "Para onde foi o dinheiro")
+    pdf.ln(13)
+
+    for cat, valor in gastos[:10]:
+        pct = round(valor/total_gastos*100) if total_gastos > 0 else 0
+        nome_cat = NOME_CAT.get(cat, cat.capitalize())
+        cor = CORES.get(cat, (150,150,150))
+        y = pdf.get_y()
+        pdf.set_font("Helvetica", '', 11)
+        pdf.set_text_color(50, 50, 50)
+        pdf.cell(55, 8, nome_cat)
+        pdf.set_font("Helvetica", 'B', 11)
+        pdf.cell(28, 8, f"{valor:.0f}EUR")
+        bar_x = 100; bar_w = 75
+        pdf.set_fill_color(235, 235, 235)
+        pdf.rect(bar_x, y+1, bar_w, 6, 'F')
+        pdf.set_fill_color(*cor)
+        pdf.rect(bar_x, y+1, bar_w * pct/100, 6, 'F')
+        pdf.set_xy(bar_x + bar_w + 2, y)
+        pdf.set_font("Helvetica", '', 9)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(15, 8, f"{pct}%")
+        pdf.ln(11)
+
+    if not gastos:
+        pdf.set_font("Helvetica", '', 11)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 10, "Sem gastos registados este mes.")
+
+    return bytes(pdf.output())
+
+
 def api_relatorio():
-    """Gera relatorio mensal em PDF simples (HTML)."""
+    """Gera relatorio mensal em HTML ou PDF (formato=pdf)."""
     token = request.args.get('token','')
     phone = request.args.get('phone','')
     expected = (phone[:8] + 'zef') if phone else ''
@@ -1146,9 +1265,25 @@ def api_relatorio():
         return jsonify({'error':'unauthorized'}), 401
     mes_p = request.args.get('mes')
     ano_p = request.args.get('ano')
+    formato = request.args.get('formato', 'html')
     hoje = agora()
     mes = int(mes_p) if mes_p else hoje.month
     ano = int(ano_p) if ano_p else hoje.year
+    # PDF?
+    if formato == 'pdf':
+        try:
+            usuario = Usuario.query.filter_by(phone=phone).first()
+            if not usuario:
+                return jsonify({'error':'not found'}), 404
+            pdf_bytes = gerar_pdf_relatorio(usuario, mes, ano)
+            nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            fname = f"relatorio_{nomes_m[mes-1]}_{ano}.pdf"
+            return pdf_bytes, 200, {
+                'Content-Type': 'application/pdf',
+                'Content-Disposition': f'inline; filename="{fname}"'}
+        except Exception as e:
+            log.error(f"api_relatorio pdf: {e}")
+            return jsonify({'error': str(e)}), 500
     try:
         usuario = Usuario.query.filter_by(phone=phone).first()
         if not usuario:
@@ -2947,6 +3082,35 @@ def processar_aporte(phone_raw, usuario, texto):
         log.error(f"aporte: {e}"); db.session.rollback()
         enviar_mensagem(phone_raw, "Erro ao guardar 😕")
 
+
+def enviar_pdf_whatsapp(phone, usuario, mes, ano):
+    """Envia o PDF do relatório direto no WhatsApp via WAHA sendFile."""
+    import requests as _req
+    try:
+        WAHA = os.environ.get('WAHA_URL', 'https://evolution-api-production-634b.up.railway.app')
+        KEY = os.environ.get('WAHA_API_KEY', 'waha123')
+        SESSION = os.environ.get('WAHA_SESSION', 'default')
+        chat_id = phone if '@' in phone else f"{phone}@c.us"
+        # URL pública do PDF (o WAHA descarrega e envia)
+        url_pdf = (f"https://luanabot-production.up.railway.app/api/relatorio"
+                   f"?phone={usuario.phone}&token={usuario.phone[:8]}zef&formato=pdf")
+        nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+        fname = f"Relatorio_{nomes_m[mes-1]}_{ano}.pdf"
+        r = _req.post(
+            f'{WAHA}/api/sendFile',
+            headers={'X-Api-Key': KEY, 'Content-Type': 'application/json'},
+            json={'session': SESSION, 'chatId': chat_id,
+                  'file': {'url': url_pdf, 'filename': fname, 'mimetype': 'application/pdf'},
+                  'caption': f'📄 Aqui está o teu relatório de {nomes_m[mes-1]}! 📊'},
+            timeout=30)
+        if r.status_code in [200, 201]:
+            return True
+        log.error(f"sendFile falhou: {r.status_code} {r.text[:200]}")
+        return False
+    except Exception as e:
+        log.error(f"enviar_pdf_whatsapp: {e}")
+        return False
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -3439,15 +3603,44 @@ def processar_texto(phone_raw, phone, texto):
             processar_aniversario(phone_raw, usuario, texto); return
 
         # ── APRENDER ──
+        # Formato 1: "aprende que X é Y"
         m = re.search(r'aprende que (.+?) (?:é|e|sao|são) (?:da categoria |categoria )?(\w[\w\s]*)', t)
-        if m:
-            chave = m.group(1).strip().strip('"\'')
-            cat = normalizar_categoria(m.group(2).strip())
-            if cat in CATEGORIAS_VALIDAS:
-                enviar_mensagem(phone_raw, f"🧠 Aprendido! '{chave}' = {cat.capitalize()} p/ sempre 😎") if guardar_aprendida(chave, cat) else enviar_mensagem(phone_raw, "Ops 😕")
-            else:
-                enviar_mensagem(phone_raw, f"Nao conheço '{m.group(2)}' 🤔\nCategorias: {', '.join(CATEGORIAS_VALIDAS)}")
-            return
+        # Formato 2 natural: "X é loja de roupa" / "X é uma loja de Y" / "X é supermercado"
+        if not m:
+            m = re.search(r'^(.+?)\s+(?:é|eh|e)\s+(?:uma?\s+)?(?:loja\s+de\s+|categoria\s+(?:de\s+)?)?([a-zà-ú]+)\s*$', t)
+        if m and any(w in t for w in ['é ','eh ','loja','categoria','aprende','ensina']):
+            chave = m.group(1).strip().strip('"\'').replace('gastei ','').replace('paguei ','')
+            chave = re.sub(r'^(?:o |a |os |as )', '', chave)
+            chave = re.sub(r'^\d+\s*(?:euros?|€)?\s*(?:na |no |em )?', '', chave).strip()
+            cat_raw = m.group(2).strip()
+            # Mapear palavras comuns para categorias
+            mapa_cat = {'roupa':'roupa','comida':'supermercado','supermercado':'supermercado',
+                'restaurante':'restaurante','cafe':'cafe','café':'cafe','tecnologia':'tecnologia',
+                'gasolina':'combustivel','combustivel':'combustivel','saude':'saude','saúde':'saude',
+                'casa':'casa','carro':'carro','lazer':'lazer','desporto':'desporto','viagem':'viagem',
+                'perfume':'pessoal','perfumes':'pessoal','beleza':'pessoal','sapatilhas':'roupa',
+                'calçado':'roupa','calcado':'roupa','fastfood':'fastfood'}
+            cat = mapa_cat.get(cat_raw) or normalizar_categoria(cat_raw)
+            if cat in CATEGORIAS_VALIDAS and len(chave) > 1:
+                if guardar_aprendida(chave, cat):
+                    msg_apr = f"🧠 Aprendido! *{chave.capitalize()}* = {cat.capitalize()} para sempre 😎"
+                    # Corrigir o último gasto se for dessa loja
+                    try:
+                        ult = db.session.execute(text(
+                            "SELECT id, categoria FROM despesas WHERE usuario_id=:u "
+                            "AND LOWER(descricao) LIKE :c ORDER BY id DESC LIMIT 1"),
+                            {'u': usuario.id, 'c': f'%{chave[:12]}%'}).fetchone()
+                        if ult and ult[1] != cat:
+                            db.session.execute(text("UPDATE despesas SET categoria=:c WHERE id=:i"),
+                                {'c': cat, 'i': ult[0]})
+                            db.session.commit()
+                            msg_apr += f"\n✏️ Corrigi também o último gasto para {cat.capitalize()}"
+                    except Exception:
+                        db.session.rollback()
+                    enviar_mensagem(phone_raw, msg_apr)
+                else:
+                    enviar_mensagem(phone_raw, "Ops 😕")
+                return
 
         # ── CORRIGIR ──
         if re.search(r'(?:corrige|corrigir|muda|mudar|afinal|isso é|isso e)\s+(?:para\s+)?(\w+)', t) and \
@@ -3520,6 +3713,17 @@ def processar_texto(phone_raw, phone, texto):
                 notificar_parceiro(usuario.phone, msg_parceiro)
                 return
         # ──────────────────────────────────────────────────────────────
+        # ── RELATÓRIO PDF ────────────────────────────────────────────
+        if any(p in t for p in ['relatorio pdf','relatório pdf','pdf do mes','pdf do mês','manda o pdf','relatorio em pdf','quero o pdf','exporta pdf','relatorio','relatório']):
+            mes_r = agora().month; ano_r = agora().year
+            enviar_mensagem(phone_raw, "📄 A preparar o teu relatório... 1 segundo!")
+            if enviar_pdf_whatsapp(phone_raw, usuario, mes_r, ano_r):
+                pass  # PDF enviado com sucesso
+            else:
+                url_pdf = (f"https://luanabot-production.up.railway.app/api/relatorio"
+                           f"?phone={usuario.phone}&token={usuario.phone[:8]}zef&formato=pdf")
+                enviar_mensagem(phone_raw, f"📄 Descarrega aqui:\n{url_pdf}")
+            return
         if (t.strip() in ['gastos','gastos?','resumo','resumo?','meus gastos','os meus gastos','quanto gastei','onde gastei','onde gastei dinheiro','onde foi o dinheiro','no que gastei','em que gastei','quanto gastei este mes','quanto gastei este mês','ver gastos','os gastos']
                 or any(p in t for p in ['resumo do mes','resumo do mês','resumo mensal','onde foi o meu dinheiro','no que gastei'])):
             enviar_resumo(phone_raw, usuario); return
@@ -6117,9 +6321,8 @@ def relatorio_mensal_automatico():
                 nomes_m_r = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
                              'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
                 enviar_mensagem(f"{u.phone}@lid",
-                    f"📊 *Relatório de {nomes_m_r[hoje.month-1]}*\n\n"
-                    f"O mês acabou! Vê o resumo completo:\n📊 dinheirinhodoze.netlify.app\n\n"
-                    f"Ou o relatório detalhado:\n{url}")
+                    f"📊 *Relatório de {nomes_m_r[hoje.month-1]}*\n\nO mês acabou! Aqui está o teu resumo 👇")
+                enviar_pdf_whatsapp(f"{u.phone}@lid", u, hoje.month, hoje.year)
             except Exception as e:
                 log.error(f"relatorio_mensal: {e}")
 
