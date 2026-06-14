@@ -265,6 +265,183 @@ LOJAS = {
     # Lazer
     'cinema':'lazer','concerto':'lazer','bowling':'lazer','netflix':'subscricoes',
     'spotify':'subscricoes','disney':'subscricoes',
+    # ─── Lojas expandidas (lista completa) ───
+    'pizza hut':'fastfood',
+    "domino's":'fastfood',
+    'taco bell':'fastfood',
+    'five guys':'fastfood',
+    'pans':'fastfood',
+    'pans & company':'fastfood',
+    'burger ranch':'fastfood',
+    'maccas':'fastfood',
+    'kentucky':'fastfood',
+    'glovo':'fastfood',
+    'uber eats':'fastfood',
+    'ubereats':'fastfood',
+    'bolt food':'fastfood',
+    'takeaway':'fastfood',
+    'just eat':'fastfood',
+    'h3':'restaurante',
+    'honorato':'restaurante',
+    'portugualia':'restaurante',
+    'portuguália':'restaurante',
+    'ramiro':'restaurante',
+    'solar dos presuntos':'restaurante',
+    'hard rock':'restaurante',
+    'italian republic':'restaurante',
+    'capricciosa':'restaurante',
+    'sabor a lenha':'restaurante',
+    'auchan':'supermercado',
+    'intermarché':'supermercado',
+    'minipreço':'supermercado',
+    'froiz':'supermercado',
+    'el corte':'supermercado',
+    'pull&bear':'roupa',
+    'pull bear':'roupa',
+    'pb':'roupa',
+    'strad':'roupa',
+    'massimo':'roupa',
+    'massimo dutti':'roupa',
+    'c&a':'roupa',
+    'kiabi':'roupa',
+    'salsa':'roupa',
+    'levis':'roupa',
+    "levi's":'roupa',
+    'tommy':'roupa',
+    'tommy hilfiger':'roupa',
+    'ralph lauren':'roupa',
+    'lacoste':'roupa',
+    'zh':'roupa',
+    'tshirt':'roupa',
+    't-shirt':'roupa',
+    'camisa':'roupa',
+    'polo':'roupa',
+    'hoodie':'roupa',
+    'sweat':'roupa',
+    'crewneck':'roupa',
+    'casaco':'roupa',
+    'blusao':'roupa',
+    'blusão':'roupa',
+    'jeans':'roupa',
+    'ganga':'roupa',
+    'calcas':'roupa',
+    'calças':'roupa',
+    'calcoes':'roupa',
+    'calções':'roupa',
+    'sport zone':'roupa',
+    'courir':'roupa',
+    'nike store':'roupa',
+    'adidas store':'roupa',
+    'new balance':'roupa',
+    'asics':'roupa',
+    'sketchers':'roupa',
+    'tenis':'roupa',
+    'ténis':'roupa',
+    'sneakers':'roupa',
+    'sapatilhas':'roupa',
+    'sapatos':'roupa',
+    'primor':'pessoal',
+    'notino':'pessoal',
+    'douglas':'pessoal',
+    'perfumes & companhia':'pessoal',
+    'sephora':'pessoal',
+    'wells beauty':'pessoal',
+    'equivalenza':'pessoal',
+    'druni':'pessoal',
+    'perfume':'pessoal',
+    'jysk':'casa',
+    'homa':'casa',
+    'hôma':'casa',
+    'conforama':'casa',
+    'maxmat':'casa',
+    'bricomarche':'casa',
+    'bricomarché':'casa',
+    'casa shop':'casa',
+    'sofa':'casa',
+    'sofá':'casa',
+    'cama':'casa',
+    'colchao':'casa',
+    'colchão':'casa',
+    'comoda':'casa',
+    'cómoda':'casa',
+    'secretaria':'casa',
+    'secretária':'casa',
+    'candeeiro':'casa',
+    'espelho':'casa',
+    'tapete':'casa',
+    'moldura':'casa',
+    'pcdiga':'tecnologia',
+    'switch technology':'tecnologia',
+    'globaldata':'tecnologia',
+    'chip7':'tecnologia',
+    'mediamarkt':'tecnologia',
+    'media markt':'tecnologia',
+    'amazon':'tecnologia',
+    'monitor':'tecnologia',
+    'teclado':'tecnologia',
+    'rato':'tecnologia',
+    'gpu':'tecnologia',
+    'grafica':'tecnologia',
+    'gráfica':'tecnologia',
+    'processador':'tecnologia',
+    'ram':'tecnologia',
+    'ssd':'tecnologia',
+    'iphone':'tecnologia',
+    'ipad':'tecnologia',
+    'macbook':'tecnologia',
+    'airpods':'tecnologia',
+    'apple watch':'tecnologia',
+    'playstation store':'tecnologia',
+    'ps store':'tecnologia',
+    'steam':'tecnologia',
+    'epic games':'tecnologia',
+    'nintendo':'tecnologia',
+    'xbox store':'tecnologia',
+    'instant gaming':'tecnologia',
+    'cdkeys':'tecnologia',
+    'ps5':'tecnologia',
+    'ps5 pro':'tecnologia',
+    'switch':'tecnologia',
+    'alves bandeira':'combustivel',
+    'norauto':'carro',
+    'midas':'carro',
+    'feu vert':'carro',
+    'roady':'carro',
+    'glassdrive':'carro',
+    'carglass':'carro',
+    'estacionamento':'carro',
+    'parque':'carro',
+    'pneus':'carro',
+    'revisao':'carro',
+    'revisão':'carro',
+    'inspecao':'carro',
+    'inspeção':'carro',
+    'farmacia portuguesa':'saude',
+    'cuf':'saude',
+    'lusiadas':'saude',
+    'lusíadas':'saude',
+    'trofa':'saude',
+    'hospital da luz':'saude',
+    'medicapilar':'saude',
+    'tiendanimal':'animais',
+    'kiwoko':'animais',
+    'pet outlet':'animais',
+    'pet city':'animais',
+    'mr wonderful':'presentes',
+    'odisseias':'presentes',
+    'smartbox':'presentes',
+    'uber':'carro',
+    'bolt':'carro',
+    'freenow':'carro',
+    'cp':'viagem',
+    'fertagus':'viagem',
+    'carris':'viagem',
+    'metro':'viagem',
+    'easyjet':'viagem',
+    'edreams':'viagem',
+    'skyscanner':'viagem',
+    'hotels.com':'viagem',
+    'a1':'casa',
 }
 LOJAS_NOME = {
     'bk':'Burger King','mac':"McDonald's",'mc':"McDonald's",'mcd':"McDonald's",
@@ -641,7 +818,10 @@ def categorizar_sem_ia(texto):
 
 def eh_gasto(texto):
     t = texto.lower()
-    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','abasteci','lanchei','fui ao','fui à','deixei','torrei','dei','fui no','fui na','comi no','comi na','bebi','tomei']
+    verbos = ['gastei','paguei','comprei','almocei','jantei','custou','abasteci','lanchei','fui ao','fui à',
+              'deixei','torrei','dei','fui no','fui na','comi no','comi na','bebi','tomei','larguei','arrotei',
+              'voaram','sairam','saíram','desapareceram','estourei','rebentei','queimei','derreti','mandei',
+              'foi-se','custou-me','ficou-me','atestei']
     # "meti" só é gasto se não for na conta
     if 'meti' in t and not any(p in t for p in ['na conta','no banco','no bpi','no revolut','na minha']):
         verbos.append('meti')
@@ -2164,9 +2344,14 @@ def registar_abastecimento(phone_raw, usuario, texto):
 
         km_ganhos = km_depois - km_antes
         consumo = get_consumo_carro(usuario)
-        litros_estimados = round(km_ganhos * consumo / 100, 2) if km_ganhos > 0 else 0
-        custo_litro = round(valor / litros_estimados, 3) if litros_estimados > 0 else 0
-        custo_km = round(valor / km_ganhos, 4) if km_ganhos > 0 else 0
+        # Litros estimados a partir do PREÇO (mais fiável que dos km)
+        PRECO_LITRO_MEDIO = 1.85
+        litros_estimados = round(valor / PRECO_LITRO_MEDIO, 1)
+        custo_litro = PRECO_LITRO_MEDIO
+        # Custo por km percorrido (real, com base na autonomia ganha)
+        custo_km = round(valor / km_ganhos, 3) if km_ganhos > 0 else 0
+        # Autonomia teórica desses litros
+        km_teoricos = round(litros_estimados / consumo * 100) if consumo > 0 else 0
 
         # Garantir tabela
         db.session.execute(text(
@@ -2195,15 +2380,13 @@ def registar_abastecimento(phone_raw, usuario, texto):
 
         msg = f"⛽ *Abastecimento registado!*\n"
         msg += f"━━━━━━━━━━━━━━\n"
-        msg += f"📉 Antes:  {km_antes:.0f}km\n"
-        msg += f"📈 Depois:  {km_depois:.0f}km\n"
-        msg += f"💰 Valor:  {valor:.0f}€"
-        if litros_estimados > 0:
-            msg += f"  (~{litros_estimados:.1f}L · {custo_litro:.2f}€/L)"
-        msg += f"\n"
+        msg += f"💰 Meteste:  {valor:.0f}€  (~{litros_estimados:.1f}L)\n"
+        msg += f"🛣️ Autonomia:  {km_antes:.0f} → {km_depois:.0f}km  (+{km_ganhos:.0f}km)\n"
+        if custo_km > 0:
+            msg += f"📊 Custo:  {custo_km:.2f}€/km\n"
         if hist and hist[0]:
             msg += f"━━━━━━━━━━━━━━\n"
-            msg += f"📅 Últimos 30 dias: {hist[0]:.0f}km · {hist[1]:.0f}€ · {hist[2]}x"
+            msg += f"📅 30 dias: {hist[1]:.0f}€ em gasolina · {hist[2]}x"
         enviar_mensagem(phone_raw, msg)
     except Exception as e:
         db.session.rollback()
@@ -3337,7 +3520,8 @@ def processar_texto(phone_raw, phone, texto):
                 notificar_parceiro(usuario.phone, msg_parceiro)
                 return
         # ──────────────────────────────────────────────────────────────
-        if t.strip() in ['gastos','gastos?']:
+        if (t.strip() in ['gastos','gastos?','resumo','resumo?','meus gastos','os meus gastos','quanto gastei','onde gastei','onde gastei dinheiro','onde foi o dinheiro','no que gastei','em que gastei','quanto gastei este mes','quanto gastei este mês','ver gastos','os gastos']
+                or any(p in t for p in ['resumo do mes','resumo do mês','resumo mensal','onde foi o meu dinheiro','no que gastei'])):
             enviar_resumo(phone_raw, usuario); return
         if any(p in t for p in ['ajuda','help','/start','comandos']):
             enviar_ajuda(phone_raw); return
@@ -3346,9 +3530,39 @@ def processar_texto(phone_raw, phone, texto):
             enviar_boas_vindas(phone_raw, usuario, phone); return
 
         # ── MODO TESO ──
-        if any(p in t for p in ['estou teso','tou teso','sem dinheiro','estou liso']):
+        if any(p in t for p in ['estou teso','tou teso','sem dinheiro','estou liso','estou falido','sem um tostao','sem um tostão','à rasca','a rasca','estou apertado','estou sem dinheiro','sem guita','liso']):
             modo_teso(phone_raw, usuario); return
 
+        # ── PERGUNTA SOBRE LIMITE/CATEGORIA ──────────────────────────
+        if any(p in t for p in ['passei o limite','passei o orcamento','passei o orçamento','já passei','ja passei','estou dentro do orcamento','quanto gastei em','gastei muito em']):
+            # Detetar categoria mencionada
+            cat_q = None
+            for c in CATEGORIAS_VALIDAS:
+                if c in t: cat_q = c; break
+            for alias, c in ALIAS_CAT.items():
+                if alias in t: cat_q = c; break
+            if 'gasolina' in t or 'combustivel' in t or 'combustível' in t: cat_q = 'combustivel'
+            if cat_q:
+                mes_q=agora().month; ano_q=agora().year
+                gasto_q = db.session.execute(text(
+                    "SELECT COALESCE(SUM(valor),0) FROM despesas WHERE usuario_id=:u AND categoria=:c "
+                    "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+                    {'u':usuario.id,'c':cat_q,'m':mes_q,'y':ano_q}).scalar() or 0
+                # Limite: meta definida ou BASE_COMBUSTIVEL para gasolina
+                limite_q = None
+                if cat_q == 'combustivel': limite_q = BASE_COMBUSTIVEL
+                meta_q = db.session.execute(text(
+                    "SELECT limite FROM metas_categoria WHERE usuario_id=:u AND categoria=:c AND mes=:m AND ano=:y"),
+                    {'u':usuario.id,'c':cat_q,'m':mes_q,'y':ano_q}).scalar()
+                if meta_q: limite_q = meta_q
+                emoji_q = EMOJI_CAT.get(cat_q,'💳')
+                msg_q = f"{emoji_q} *{cat_q.capitalize()}* este mês: {gasto_q:.0f}€"
+                if limite_q:
+                    if gasto_q > limite_q:
+                        msg_q += f"\n🚨 Orçamento: {limite_q:.0f}€ — *passaste {gasto_q-limite_q:.0f}€!*"
+                    else:
+                        msg_q += f"\n✅ Orçamento: {limite_q:.0f}€ — ainda tens {limite_q-gasto_q:.0f}€"
+                enviar_mensagem(phone_raw, msg_q); return
         # ── GASOLINA ──
         gasolina_keywords = ['gasolina mais barata','posto mais barato','gasolina barata',
                              'valor gasolina','preco gasolina','preço gasolina','onde e a gasolina',
@@ -3401,7 +3615,7 @@ def processar_texto(phone_raw, phone, texto):
             enviar_resumo(phone_raw, usuario); return
 
         # ── PLANO ──
-        if any(p in t for p in ['onde vai o dinheiro','distribuir','como distribuir','onde meto','onde coloco','onde ponho','dividir salario']):
+        if any(p in t for p in ['onde vai o dinheiro','onde vai o meu dinheiro','distribuir','como distribuir','onde meto','onde coloco','onde ponho','dividir salario','distribuicao','distribuição']):
             enviar_onde_vai_dinheiro(phone_raw, usuario); return
         if any(p in t for p in ['plano contas','plano de contas','onde poupar','contas bancarias','minhas contas']):
             enviar_plano_contas(phone_raw, usuario); return
@@ -3453,7 +3667,12 @@ def processar_texto(phone_raw, phone, texto):
                 db.session.commit()
                 enviar_mensagem(phone_raw, f"💰 +{valor_extra:.0f}€ registado na tua conta!\nSe quiseres atualizar o disponível diz 'quanto tenho' 😊")
                 return
-        if any(p in t for p in ['recebi','ganhei','ordenado','salario','salário','vencimento']) and tem_numero(texto):
+        verbos_receita = ['recebi','ganhei','ordenado','salario','salário','vencimento','caiu o','entrou o',
+                          'entrou a','pagaram','mandaram-me','transferiram','devolveram','reembolso',
+                          'caiu a guita','entrou a massa','entrou dinheiro','recebi os','recebi das',
+                          'recebi o','prémio','premio','comissao','comissão','duodecimo','duodécimo',
+                          'subsidio','subsídio','caiu na conta','ja caiu','já caiu','ja entrou','já entrou']
+        if any(p in t for p in verbos_receita) and tem_numero(texto):
             processar_receita(phone_raw, usuario, texto); return
 
         # ── RESUMO POR PESSOA ──
@@ -3468,7 +3687,12 @@ def processar_texto(phone_raw, phone, texto):
             processar_wishlist(phone_raw, usuario, texto); return
 
         # "quero X" só vai para wishlist se nao for gasto
-        if t.startswith('quero ') and not any(p in t for p in ['poupar','gastar']):
+        # Wishlist: "quero X", "curtia X", "ando a ver X", "gostava de X"
+        gatilho_wish = (t.startswith('quero ') or t.startswith('curtia ') or t.startswith('gostava ')
+                        or 'ando a ver' in t or 'estou a pensar comprar' in t or 'preciso de' in t
+                        or 'ando de olho' in t or 'está-me a chamar' in t or 'um dia compro' in t
+                        or 'tenho de comprar' in t or 'gostava de ter' in t or 'estou tentado' in t)
+        if gatilho_wish and not any(p in t for p in ['poupar','gastar',' ver ','saber','juntar','guardar',' que ','os meus','o meu','consultar','mostrar','quanto']):
             # Mesmo com valor vai para wishlist — pergunta se é wishlist ou gasto
             valor_q = extrair_valor(texto)
             stop_q = {'quero','uma','um','umas','uns'}
@@ -3834,7 +4058,7 @@ def processar_despesa(phone_raw, usuario, texto):
     msg += f"📅 Data:  {data_txt}\n"
     msg += f"🆔 Código:  `{codigo_tx}`\n"
     msg += f"━━━━━━━━━━━━━━\n"
-    msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.0f}€ ({pct_cat}%)"
+    msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.0f}€ ({pct_cat}% dos gastos)"
     # Aviso se passou a meta definida para esta categoria
     try:
         meta_cat = db.session.execute(text(
@@ -3935,7 +4159,13 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     msg += f"💳 Para gastar: {p['gastar']:.0f}€\n"
     msg += f"💎 Poupanca: {p['poupanca']:.0f}€"
     if p['subsidio']:
-        msg += "\n\n🌴 Mes de subsidio! 😉"
+        mes_sub = agora().month
+        if mes_sub == 6:
+            msg += "\n\n🌴 *Subsídio de férias!* 😎\n💡 Aproveita para reservar uns 100€ para roupa de verão ou uma escapadinha"
+        elif mes_sub in [11, 12]:
+            msg += "\n\n🎄 *Subsídio de Natal!* 🎁\n💡 Guarda algo para as prendas e a ceia"
+        else:
+            msg += "\n\n🌴 *Mês de subsídio!* 😉"
         # Verifica se tem wishlist
         try:
             rows = db.session.execute(text(
@@ -5422,8 +5652,9 @@ def interpretar_objetivo_ia(texto):
                  f'"mes_alvo": número 1-12 ou null, '
                  f'"valor_inicial": número ou 0, '
                  f'"conjunto": true se mencionar a Luana/casal/juntos/nós/conjunto, senão false}}. '
-                 f'O nome deve ser natural e específico, não genérico. '
-                 f'Se disser "pc novo" o nome é "PC novo". Se "ir a roma" é "Viagem a Roma".'},
+                 f'O nome deve ser natural e específico, não genérico. IGNORA perguntas retóricas como "sabes o que quero?". '
+                 f'Extrai SÓ o objeto da poupança. Se disser "pc novo" o nome é "PC novo". Se "ir a roma" é "Viagem a Roma". '
+                 f'Se NÃO houver objeto claro, usa "Poupança". Nunca uses frases ou perguntas como nome.'},
                 {'role':'user','content': texto}
             ])
         txt = resp.choices[0].message.content.strip()
@@ -5493,9 +5724,13 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
     valor = extrair_valor(texto)
     if valor == 0:
         enviar_mensagem(phone_raw, "Quanto queres poupar? Ex: 'quero poupar 500€ para ferias'"); return
-    stop = {'quero','poupar','para','objetivo','meta','de','poupanca','poupança','euros','euro'}
-    palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
-    desc = ' '.join(palavras[:3]).capitalize() if palavras else 'Objetivo'
+    desc = 'Objetivo'
+    m_para = re.search(r'para\s+(?:um |uma |o |a |uns |umas )?([a-zà-ú][a-zà-úA-ZÀ-Ú\s]{2,30})', texto, re.IGNORECASE)
+    if m_para and '?' not in texto:
+        candidato = m_para.group(1).strip()
+        stop_frase = ['sabes','quero','que ','isso','aquilo','isto','ver eles','poupar']
+        if not any(s in candidato.lower() for s in stop_frase):
+            desc = candidato[:30].capitalize()
 
     # Perguntar TUDO de uma vez (estilo GranaZen) — depois parseia a resposta completa
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
