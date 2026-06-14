@@ -562,6 +562,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
         "CREATE TABLE IF NOT EXISTS lembretes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, texto VARCHAR(300), quando TIMESTAMP, enviado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS saldos_contas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, conta VARCHAR(50), valor FLOAT, atualizado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, conta))",
+        "CREATE TABLE IF NOT EXISTS viagens (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), ativa BOOLEAN DEFAULT TRUE, inicio TIMESTAMP DEFAULT NOW(), fim TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS objetivos_casal (id SERIAL PRIMARY KEY, descricao VARCHAR(100), valor_objetivo FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS aportes_casal (id SERIAL PRIMARY KEY, objetivo_id INTEGER NOT NULL, usuario_id INTEGER NOT NULL, valor FLOAT, data TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS salarios_pendentes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, valor FLOAT, data_pagamento DATE, processado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT NOW())",
@@ -3124,6 +3125,66 @@ def enviar_pdf_whatsapp(phone, usuario, mes, ano):
         log.error(f"enviar_pdf_whatsapp: {e}")
         return False
 
+
+def iniciar_viagem(phone_raw, usuario, texto):
+    """Inicia o modo viagem — agrupa gastos até terminar."""
+    nome = re.sub(r'(?:iniciar?|come[çc]ar?|nova|modo)\s+viagem\s*(?:a|para|ao|em|à)?\s*', '', texto.lower()).strip()
+    nome = nome.capitalize()[:50] or "Viagem"
+    try:
+        # Fechar viagens anteriores ativas
+        db.session.execute(text("UPDATE viagens SET ativa=FALSE WHERE usuario_id=:u AND ativa=TRUE"), {'u': usuario.id})
+        db.session.execute(text("INSERT INTO viagens (usuario_id, nome) VALUES (:u, :n)"), {'u': usuario.id, 'n': nome})
+        db.session.commit()
+        enviar_mensagem(phone_raw,
+            f"✈️ *Modo viagem ativado: {nome}!*\n\n"
+            f"A partir de agora agrupo todos os teus gastos.\n"
+            f"Regista normalmente (ex: _35 no jantar_).\n\n"
+            f"Quando voltares, diz *terminar viagem* para o total 🧳")
+    except Exception as e:
+        log.error(f"iniciar_viagem: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao iniciar viagem 😕")
+
+def viagem_ativa(usuario_id):
+    """Devolve (id, nome, inicio) da viagem ativa ou None."""
+    try:
+        return db.session.execute(text(
+            "SELECT id, nome, inicio FROM viagens WHERE usuario_id=:u AND ativa=TRUE ORDER BY id DESC LIMIT 1"),
+            {'u': usuario_id}).fetchone()
+    except Exception:
+        return None
+
+def terminar_viagem(phone_raw, usuario):
+    """Termina a viagem e dá o resumo total."""
+    v = viagem_ativa(usuario.id)
+    if not v:
+        enviar_mensagem(phone_raw, "Não tens nenhuma viagem ativa 🤔\nInicia com *viagem Algarve*"); return
+    try:
+        vid, vnome, vinicio = v
+        # Gastos desde o início da viagem
+        gastos = db.session.execute(text(
+            "SELECT categoria, SUM(valor) as t, COUNT(*) FROM despesas "
+            "WHERE usuario_id=:u AND data >= :inicio GROUP BY categoria ORDER BY t DESC"),
+            {'u': usuario.id, 'inicio': vinicio}).fetchall()
+        total = sum(r[1] for r in gastos)
+        ndias = max(1, (agora().replace(tzinfo=None) - vinicio).days + 1) if vinicio else 1
+        db.session.execute(text("UPDATE viagens SET ativa=FALSE, fim=NOW() WHERE id=:i"), {'i': vid})
+        db.session.commit()
+        msg = f"🧳 *Viagem terminada: {vnome}!*\n"
+        msg += f"━━━━━━━━━━━━━━\n"
+        msg += f"💰 Total gasto:  *{total:.0f}€*\n"
+        msg += f"📅 Duração:  {ndias} dia{'s' if ndias>1 else ''}\n"
+        msg += f"📊 Média:  {total/ndias:.0f}€/dia\n"
+        if gastos:
+            msg += f"━━━━━━━━━━━━━━\n"
+            for cat, t, n in gastos[:6]:
+                em = EMOJI_CAT.get(cat, '💳')
+                msg += f"{em} {cat.capitalize()}: {t:.0f}€\n"
+        msg += f"\n✨ Espero que tenhas aproveitado!"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"terminar_viagem: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao terminar viagem 😕")
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -3566,6 +3627,24 @@ def processar_texto(phone_raw, phone, texto):
 
         # ── RESERVA ──
         # Deteta "gastei/usei/tirei X da reserva" com número no meio
+        # Depositar na reserva: "reserva 50", "mete 50 na reserva", "guarda 50 na reserva"
+        m_dep_res = re.search(r'(?:reserva|reforça reserva|reforçar reserva|guarda(?:r)?|mete(?:r)?|p[õo]e)\s+(\d+(?:[.,]\d+)?)\s*(?:€|euros?)?\s*(?:na |para a |[àa] )?(?:reserva|fundo|emergencia|emergência)', t)
+        if not m_dep_res:
+            m_dep_res = re.search(r'reserva\s+(\d+(?:[.,]\d+)?)', t)
+        if m_dep_res and 'gastei' not in t and 'tirei' not in t and 'usei' not in t:
+            val_res = float(m_dep_res.group(1).replace(',','.'))
+            try:
+                atual_res = get_reserva(usuario.id)
+                set_reserva(usuario.id, atual_res + val_res)
+                novo_res = atual_res + val_res
+                msg_res = f"🛡️ +{val_res:.0f}€ na reserva de emergência!\n💰 Total: *{novo_res:.0f}€*"
+                if novo_res >= 2500:
+                    msg_res += f"\n\n🎉 Já tens uma reserva sólida! Bom trabalho 💪"
+                enviar_mensagem(phone_raw, msg_res)
+            except Exception as e:
+                log.error(f"deposito reserva: {e}")
+                enviar_mensagem(phone_raw, "Erro ao guardar na reserva 😕")
+            return
         if re.search(r'(?:gastei|usei|tirei|meti|fui|busquei).{0,20}reserva', t) or \
            re.search(r'reserva.{0,20}(?:gastei|usei|tirei)', t):
             processar_gasto_reserva(phone_raw, usuario, texto); return
@@ -4005,6 +4084,19 @@ def processar_texto(phone_raw, phone, texto):
             cat_meta = m_meta.group(1).strip()
             valor_meta = float(m_meta.group(2))
             processar_meta_categoria(phone_raw, usuario, f"limite {cat_meta} {valor_meta}"); return
+        # ── MODO VIAGEM (agrupar gastos) ─────────────────────────────
+        if re.search(r'(?:iniciar|começar|come[çc]ar|nova|ativar|modo)\s+viagem', t) or t.strip() in ['viagem nova','nova viagem']:
+            iniciar_viagem(phone_raw, usuario, texto); return
+        if any(p in t for p in ['terminar viagem','acabar viagem','fim da viagem','terminei a viagem','voltei da viagem','fechar viagem']):
+            terminar_viagem(phone_raw, usuario); return
+        if t.strip() in ['viagem atual','resumo viagem','como vai a viagem']:
+            v_at = viagem_ativa(usuario.id)
+            if v_at:
+                g_at = db.session.execute(text("SELECT COALESCE(SUM(valor),0) FROM despesas WHERE usuario_id=:u AND data >= :i"), {'u':usuario.id,'i':v_at[2]}).scalar() or 0
+                enviar_mensagem(phone_raw, f"✈️ *{v_at[1]}* em curso\n💰 Já gastaste {g_at:.0f}€\n\n_Diz_ *terminar viagem* _para o total_")
+            else:
+                enviar_mensagem(phone_raw, "Não tens viagem ativa 🤔")
+            return
         # ── HISTÓRICO COMBUSTÍVEL ────────────────────────────────────
         if any(p in t for p in ['consumo carro','consumo do carro','historico gasolina','histórico gasolina','ver abastecimentos','gastos gasolina','quanto gastei em gasolina']):
             ver_historico_combustivel(phone_raw, usuario); return
@@ -4346,12 +4438,72 @@ def processar_receita(phone_raw, usuario, texto):
     except Exception as e:
         log.error(f"aniv_proximo: {e}")
 
+
+def sugerir_meta_inteligente(usuario):
+    """Analisa gastos e sugere uma meta de categoria se gastar muito numa."""
+    try:
+        hoje = agora()
+        mes_ant = hoje.month - 1 if hoje.month > 1 else 12
+        ano_ant = hoje.year if hoje.month > 1 else hoje.year - 1
+        # Categoria onde gastou mais (excluindo essenciais)
+        rows = db.session.execute(text(
+            "SELECT categoria, SUM(valor) as t FROM despesas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y "
+            "AND categoria IN ('fastfood','restaurante','cafe','roupa','lazer','gota') "
+            "GROUP BY categoria ORDER BY t DESC LIMIT 1"),
+            {'u':usuario.id,'m':mes_ant,'y':ano_ant}).fetchone()
+        if not rows or rows[1] < 60:
+            return None  # só sugere se gastou 60€+ numa categoria supérflua
+        cat, total = rows[0], rows[1]
+        # Já tem meta nesta categoria?
+        ja_tem = db.session.execute(text(
+            "SELECT 1 FROM metas_categoria WHERE usuario_id=:u AND categoria=:c AND mes=:m AND ano=:y"),
+            {'u':usuario.id,'c':cat,'m':hoje.month,'y':hoje.year}).fetchone()
+        if ja_tem:
+            return None
+        meta_sug = round(total * 0.7 / 5) * 5  # 30% menos, arredondado a 5
+        nomes_cat = {'fastfood':'fast food','restaurante':'restaurantes','cafe':'cafés',
+                     'roupa':'roupa','lazer':'lazer','gota':'bebidas'}
+        nome_c = nomes_cat.get(cat, cat)
+        emoji_c = EMOJI_CAT.get(cat, '💳')
+        poupado_ano = round((total - meta_sug) * 12)
+        return (f"💡 *Sugestão do Zé*\n"
+                f"Gastaste {total:.0f}€ em {emoji_c} {nome_c} no mês passado.\n"
+                f"Que tal uma meta de *{meta_sug:.0f}€* este mês?\n"
+                f"Poupavas ~{poupado_ano}€/ano! 📈\n\n"
+                f"_Diz_ *meta {cat} {meta_sug:.0f}* _para ativar_")
+    except Exception as e:
+        log.error(f"sugerir_meta: {e}")
+        return None
+
 def enviar_plano_salario(phone_raw, usuario, salario):
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
     p = calcular_plano(salario, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
     m = MODOS_POUPANCA[modo]
+
+    # ── Quanto sobrou do orçamento do mês ANTERIOR ──
+    sobra_anterior = 0
+    try:
+        hoje_s = agora()
+        mes_ant_s = hoje_s.month - 1 if hoje_s.month > 1 else 12
+        ano_ant_s = hoje_s.year if hoje_s.month > 1 else hoje_s.year - 1
+        rec_ant = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+            {'u':usuario.id,'m':mes_ant_s,'y':ano_ant_s}).scalar() or 0
+        gas_ant = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM despesas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y "
+            "AND descricao NOT LIKE '[conjunta]%%'"),
+            {'u':usuario.id,'m':mes_ant_s,'y':ano_ant_s}).scalar() or 0
+        if rec_ant > 0:
+            p_ant = calcular_plano(rec_ant, modo, 0, phone=usuario.phone, usuario_id=usuario.id)
+            # O que estava destinado a gastar menos o que gastou
+            sobra_anterior = round(p_ant.get('gastar', 0) - gas_ant, 0)
+    except Exception as e:
+        log.error(f"sobra anterior: {e}")
 
     msg  = f"💰 *Recebeste {salario:.2f}€!* {m['emoji']}\n\n"
     msg += f"━━━━━━━━━━━━\n"
@@ -4418,8 +4570,30 @@ def enviar_plano_salario(phone_raw, usuario, salario):
                 msg += f"{emoji_o} {desc_o} — falta {falta_o:.0f}€\n"
     except Exception as e:
         log.error(f"lembrete objetivos: {e}")
+    # ── Mostrar sobra do mês anterior + sugestão ──
+    if sobra_anterior >= 10:
+        msg += f"\n\n💰 *Sobraram {sobra_anterior:.0f}€ do mês passado!*\n"
+        try:
+            objs_s = db.session.execute(text(
+                "SELECT descricao FROM objetivos_poupanca WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 1"),
+                {'u': usuario.id}).fetchone()
+            if objs_s:
+                em_s = emoji_objetivo(objs_s[0])
+                msg += f"Mete na reserva 🛡️ ou no {em_s} {objs_s[0]}:\n"
+                msg += f"_Diz_ *reserva {sobra_anterior:.0f}* _ou_ *guardei {sobra_anterior:.0f} para {objs_s[0].lower()}*"
+            else:
+                msg += f"Aproveita para reforçar a reserva: _diz_ *reserva {sobra_anterior:.0f}* 🛡️"
+        except Exception:
+            msg += f"Aproveita para reforçar a reserva: _diz_ *reserva {sobra_anterior:.0f}* 🛡️"
     msg += "\n━━━━━━━━━━━━\n💡 *onde vai o dinheiro* · 📊 dinheirinhodoze.netlify.app"
     enviar_mensagem(phone_raw, msg)
+    # Sugestão de meta inteligente (mensagem separada, só às vezes)
+    try:
+        sugestao = sugerir_meta_inteligente(usuario)
+        if sugestao:
+            enviar_mensagem(phone_raw, sugestao)
+    except Exception:
+        pass
 
     reserva_atual = get_reserva(usuario.id)
     if reserva_atual > 0:
@@ -6079,7 +6253,30 @@ def enviar_ajuda(phone_raw):
 💡 Sugestões? Manda! 🚀""")
 
 def filtrar_resposta(txt, phone=None):
-    """Filtra respostas da IA conforme o perfil do utilizador."""
+    """Filtra respostas da IA: remove zuca (PT-BR) e ajusta ao perfil."""
+    # ── Limpar brasileirismos (zuca) → PT-PT ──
+    zuca_subs = [
+        (r'\bvocê\b','tu'),(r'\bvc\b','tu'),(r'\bvocês\b','vocês'),
+        (r'\bgrana\b','dinheiro'),(r'\bmassa\b','dinheiro'),
+        (r'\blegal\b','fixe'),(r'\bshow\b','top'),(r'\bmaneiro\b','fixe'),
+        (r'\bbacana\b','fixe'),(r'\bda hora\b','fixe'),
+        (r'\bpra\b','para'),(r'\bpro\b','para o'),
+        (r'\ba gente\b','nós'),(r'\bgalera\b','pessoal'),
+        (r'\bcafezinho\b','café'),(r'\bdinheirinho\b','dinheiro'),
+        (r'\bgraninha\b','dinheiro'),(r'\bnenê\b','bebé'),
+        (r'\bbabaca\b','parvo'),(r'\bvaleu\b','obrigado'),
+        (r'\bfalou\b','combinado'),(r'\bbeleza\b','tudo bem'),
+        (r'\btá\b','está'),(r'\btô\b','estou'),(r'\btá bom\b','está bem'),
+        (r'\bcomprinhas\b','compras'),(r'\bbar(?:a|à)to\b','barato'),
+        (r'\bcelular\b','telemóvel'),(r'\bgeladeira\b','frigorífico'),
+        (r'\bônibus\b','autocarro'),(r'\btrem\b','comboio'),
+        (r'\bcafé da manhã\b','pequeno-almoço'),(r'\bsorvete\b','gelado'),
+        (r'\bbanana\b,','calma,'),(r'\bcurtir\b','aproveitar'),
+        (r'\bnossa\b!','fogo!'),(r'\baí ó\b','olha'),
+    ]
+    for p, s in zuca_subs:
+        txt = re.sub(p, s, txt, flags=re.IGNORECASE)
+    # ── Ajuste de género (perfil feminino) ──
     perfil = get_perfil(phone or '')
     if perfil['genero'] == 'F':
         subs = [
@@ -6108,7 +6305,9 @@ SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sp
         else:
             sys = f"""És o Zé das Finanças, assistente financeiro criado pelo tuga27 para a {perfil['nome']}.
 REGRAS: fala SEMPRE no feminino. PROIBIDO: {perfil['proibido']}.
-Usa: {perfil['expressoes']}. Português europeu informal e fofo. Max 2 linhas + 1 emoji.
+Usa: {perfil['expressoes']}. PORTUGUÊS DE PORTUGAL (PT-PT) obrigatório, NUNCA brasileiro.
+PROIBIDO escrever: você, vc, grana, legal, massa (=dinheiro), pra, bacana, show, a gente, tá, tô, celular, ônibus, curtir, nossa!, bora demais.
+USA: tu, fixe, dinheiro, para, está, telemóvel, giro, porreiro. Max 2 linhas + 1 emoji.
 NUNCA inventes preços de gasolina.
 CONTEXTO: Modo {m['nome']} | {disp:.0f}€ disponível | Salário: {usuario.salario_liquido or 'não registado'}€
 SABER: BK=Burger King, Mac=McDonald's, conti=Continente, PD=Pingo Doce, JD=JD Sports"""
@@ -6420,6 +6619,57 @@ def lembrete_recibo():
                 enviar_mensagem(f"{u.phone}@lid",
                     f"Olá! 📄 Amanhã deves receber o salário!\n"
                     f"Já chegou o recibo? Manda o PDF/foto ou diz o valor 😊")
+
+def balanco_pre_salario():
+    """No dia antes de receber, faz o balanço do que sobrou e sugere onde meter."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 19: return  # uma vez por dia, à noite
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                dias = dias_para_salario(u)
+                if dias != 1:  # só no dia ANTES do salário
+                    continue
+                disp, p = calcular_disponivel(u)
+                if disp <= 5:  # não vale a pena se sobrou pouco
+                    if disp >= 0:
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"🌙 *Amanhã é dia de salário!*\n\n"
+                            f"Este mês gastaste tudo o que tinhas para gastar — sem sobras.\n"
+                            f"Amanhã recomeças com o orçamento novo 💪")
+                    continue
+                # Sobrou dinheiro — sugerir onde meter
+                emoji_o = "💰"
+                msg = f"🌙 *Amanhã é dia de salário!*\n"
+                msg += f"━━━━━━━━━━━━━━\n"
+                msg += f"Sobraram-te *{disp:.0f}€* do orçamento deste mês! 🎉\n\n"
+                msg += f"Não deixes esse dinheiro parado — sugestões:\n"
+                # Reserva
+                try:
+                    reserva = get_reserva(u.id)
+                    if reserva < 2500:
+                        msg += f"🛡️ Reforçar a *reserva* (tens {reserva:.0f}€)\n"
+                except Exception:
+                    pass
+                # Objetivos ativos
+                try:
+                    objs = db.session.execute(text(
+                        "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+                        "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 2"),
+                        {'u': u.id}).fetchall()
+                    for desc_o, val_o, at_o in objs:
+                        falta_o = (val_o or 0) - (at_o or 0)
+                        em_o = emoji_objetivo(desc_o)
+                        msg += f"{em_o} Meter no objetivo *{desc_o}* (falta {falta_o:.0f}€)\n"
+                except Exception:
+                    pass
+                msg += f"\n💡 Diz *guardei {disp:.0f} para [objetivo]* ou *reserva {disp:.0f}*"
+                enviar_mensagem(f"{u.phone}@lid", msg)
+            except Exception as e:
+                log.error(f"balanco_pre_salario {u.phone}: {e}")
+                db.session.rollback()
+
 def lembrete_salario():
     with app.app_context():
         hoje = agora()
