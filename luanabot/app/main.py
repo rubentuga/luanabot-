@@ -1,4 +1,3 @@
-
 import os, json, logging, re, base64, tempfile
 from datetime import datetime, timedelta
 try:
@@ -1140,121 +1139,135 @@ def api_saude():
 @app.route('/api/relatorio', methods=['GET'])
 
 def gerar_pdf_relatorio(usuario, mes, ano):
-    """Gera um PDF do relatório mensal. Devolve os bytes do PDF."""
-    from fpdf import FPDF
+    """Gera PDF do relatório mensal com reportlab (já instalado via pdfplumber)."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.lib import colors
+        import io
+    except ImportError:
+        try:
+            from fpdf import FPDF
+            return _gerar_pdf_fpdf(usuario, mes, ano)
+        except ImportError:
+            raise Exception("Nem reportlab nem fpdf2 disponíveis")
+
     nomes_mes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho',
                  'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
     nome = NOMES_CASAL.get(usuario.phone, 'Utilizador')
     mes_nome = nomes_mes[mes-1]
 
-    # Dados
     gastos = db.session.execute(text(
-        "SELECT categoria, SUM(valor) as total FROM despesas "
+        "SELECT categoria, SUM(valor) FROM despesas "
         "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y "
-        "AND descricao NOT LIKE '[conjunta]%%' GROUP BY categoria ORDER BY total DESC"),
+        "AND descricao NOT LIKE '[conjunta]%%' GROUP BY categoria ORDER BY SUM(valor) DESC"),
         {'u':usuario.id,'m':mes,'y':ano}).fetchall()
     total_gastos = sum(r[1] for r in gastos) or 0
     receita = db.session.execute(text(
         "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
         "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
         {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
-    try:
-        reserva = get_reserva(usuario.id)
-    except Exception:
-        reserva = 0
+    try: reserva = get_reserva(usuario.id)
+    except: reserva = 0
     _, p = calcular_disponivel(usuario)
     poupanca = p.get('poupanca', 0)
+    saldo = receita - total_gastos
 
     NOME_CAT = {'fastfood':'Fast Food','restaurante':'Restaurante','cafe':'Cafe','roupa':'Roupa',
         'tecnologia':'Tecnologia','supermercado':'Supermercado','combustivel':'Combustivel',
         'saude':'Saude','pessoal':'Pessoal','carro':'Carro','lazer':'Lazer','casa':'Casa',
-        'subscricoes':'Subscricoes','animais':'Animais','presentes':'Presentes','viagem':'Viagem',
-        'educacao':'Educacao','desporto':'Desporto','gota':'Bebidas','outros':'Outros'}
-    CORES = {'roupa':(75,159,255),'fastfood':(255,122,69),'combustivel':(255,184,77),
-        'supermercado':(61,220,132),'cafe':(184,124,255),'restaurante':(255,94,94),
-        'tecnologia':(75,159,255),'carro':(120,144,170),'casa':(61,220,132),'outros':(140,150,160)}
+        'subscricoes':'Subscricoes','viagem':'Viagem','gota':'Bebidas','outros':'Outros'}
+    CORES_HEX = {'roupa':'#4b9fff','fastfood':'#ff7a45','combustivel':'#ffb84d',
+        'supermercado':'#3ddc84','cafe':'#b87cff','restaurante':'#ff5e5e',
+        'tecnologia':'#4b9fff','carro':'#789099','casa':'#3ddc84','outros':'#8a9aa8'}
 
-    class PDF(FPDF):
-        def header(self):
-            self.set_fill_color(20, 25, 35)
-            self.rect(0, 0, 210, 45, 'F')
-            self.set_y(12)
-            self.set_font("Helvetica", 'B', 22)
-            self.set_text_color(255, 255, 255)
-            self.cell(0, 10, "Ze das Financas", align='C')
-            self.ln(9)
-            self.set_font("Helvetica", '', 13)
-            self.set_text_color(180, 190, 200)
-            self.cell(0, 8, f"Relatorio de {mes_nome} {ano} - {nome}", align='C')
-            self.ln(20)
-        def footer(self):
-            self.set_y(-15)
-            self.set_font("Helvetica", '', 8)
-            self.set_text_color(150, 150, 150)
-            self.cell(0, 10, "dinheirinhodoze.netlify.app", align='C')
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
 
-    pdf = PDF()
-    pdf.add_page()
+    # Cabeçalho escuro
+    c.setFillColor(colors.HexColor('#141922'))
+    c.rect(0, h-80, w, 80, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 22)
+    c.drawCentredString(w/2, h-38, "Ze das Financas")
+    c.setFont("Helvetica", 12)
+    c.setFillColor(colors.HexColor('#b4bec8'))
+    c.drawCentredString(w/2, h-60, f"Relatorio de {mes_nome} {ano} - {nome}")
 
-    def kpi_box(x, label, valor, cor):
-        pdf.set_fill_color(*cor)
-        pdf.set_draw_color(230, 230, 230)
-        pdf.rect(x, 55, 42, 28, 'DF')
-        pdf.set_xy(x, 60)
-        pdf.set_font("Helvetica", '', 9)
-        pdf.set_text_color(90, 90, 90)
-        pdf.cell(42, 5, label, align='C')
-        pdf.set_xy(x, 68)
-        pdf.set_font("Helvetica", 'B', 14)
-        pdf.set_text_color(30, 30, 30)
-        pdf.cell(42, 8, valor, align='C')
+    # KPIs em 4 caixas
+    kpi_data = [("Receita", f"{receita:.0f}EUR", '#ebf5ff'),
+                ("Gastos",  f"{total_gastos:.0f}EUR", '#fff0eb'),
+                ("Poupanca",f"{poupanca:.0f}EUR", '#ebffed'),
+                ("Reserva", f"{reserva:.0f}EUR", '#fffaeb')]
+    kpi_w, kpi_h, kpi_y = 120, 55, h-160
+    for i, (label, val, cor) in enumerate(kpi_data):
+        kx = 25 + i * 135
+        c.setFillColor(colors.HexColor(cor))
+        c.roundRect(kx, kpi_y, kpi_w, kpi_h, 8, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor('#555'))
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(kx + kpi_w/2, kpi_y + 38, label)
+        c.setFillColor(colors.HexColor('#111'))
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(kx + kpi_w/2, kpi_y + 18, val)
 
-    kpi_box(15, "Receita", f"{receita:.0f}EUR", (235, 245, 255))
-    kpi_box(60, "Gastos", f"{total_gastos:.0f}EUR", (255, 240, 235))
-    kpi_box(105, "Poupanca", f"{poupanca:.0f}EUR", (235, 255, 242))
-    kpi_box(150, "Reserva", f"{reserva:.0f}EUR", (255, 250, 235))
+    # Saldo
+    saldo_y = h - 185
+    c.setFont("Helvetica-Bold", 13)
+    c.setFillColor(colors.HexColor('#3db46e') if saldo >= 0 else colors.HexColor('#dc3c3c'))
+    c.drawCentredString(w/2, saldo_y, f"Saldo do mes: {'+' if saldo>=0 else ''}{saldo:.0f}EUR")
 
-    pdf.set_y(92)
-    saldo = receita - total_gastos
-    pdf.set_font("Helvetica", 'B', 13)
-    if saldo >= 0: pdf.set_text_color(61, 180, 110)
-    else: pdf.set_text_color(220, 60, 60)
-    pdf.cell(0, 10, f"Saldo do mes: {'+' if saldo>=0 else ''}{saldo:.0f}EUR", align='C')
+    # Título categorias
+    c.setFillColor(colors.HexColor('#1e1e1e'))
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(30, h-220, "Para onde foi o dinheiro")
 
-    pdf.set_y(110)
-    pdf.set_font("Helvetica", 'B', 14)
-    pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 10, "Para onde foi o dinheiro")
-    pdf.ln(13)
+    # Linha separadora
+    c.setStrokeColor(colors.HexColor('#e0e0e0'))
+    c.setLineWidth(0.5)
+    c.line(30, h-228, w-30, h-228)
 
+    y = h - 248
     for cat, valor in gastos[:10]:
+        if y < 80: break
         pct = round(valor/total_gastos*100) if total_gastos > 0 else 0
         nome_cat = NOME_CAT.get(cat, cat.capitalize())
-        cor = CORES.get(cat, (150,150,150))
-        y = pdf.get_y()
-        pdf.set_font("Helvetica", '', 11)
-        pdf.set_text_color(50, 50, 50)
-        pdf.cell(55, 8, nome_cat)
-        pdf.set_font("Helvetica", 'B', 11)
-        pdf.cell(28, 8, f"{valor:.0f}EUR")
-        bar_x = 100; bar_w = 75
-        pdf.set_fill_color(235, 235, 235)
-        pdf.rect(bar_x, y+1, bar_w, 6, 'F')
-        pdf.set_fill_color(*cor)
-        pdf.rect(bar_x, y+1, bar_w * pct/100, 6, 'F')
-        pdf.set_xy(bar_x + bar_w + 2, y)
-        pdf.set_font("Helvetica", '', 9)
-        pdf.set_text_color(150, 150, 150)
-        pdf.cell(15, 8, f"{pct}%")
-        pdf.ln(11)
+        cor_hex = CORES_HEX.get(cat, '#8a9aa8')
+        # Nome cat
+        c.setFillColor(colors.HexColor('#333'))
+        c.setFont("Helvetica", 11)
+        c.drawString(30, y, nome_cat)
+        # Valor
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(155, y, f"{valor:.0f}EUR")
+        # Barra
+        bar_x, bar_w, bar_h = 220, 270, 9
+        c.setFillColor(colors.HexColor('#ebebeb'))
+        c.roundRect(bar_x, y-1, bar_w, bar_h, 3, fill=1, stroke=0)
+        if pct > 0:
+            c.setFillColor(colors.HexColor(cor_hex))
+            c.roundRect(bar_x, y-1, bar_w*pct/100, bar_h, 3, fill=1, stroke=0)
+        # %
+        c.setFillColor(colors.HexColor('#999'))
+        c.setFont("Helvetica", 9)
+        c.drawString(bar_x + bar_w + 5, y, f"{pct}%")
+        y -= 22
 
     if not gastos:
-        pdf.set_font("Helvetica", '', 11)
-        pdf.set_text_color(150, 150, 150)
-        pdf.cell(0, 10, "Sem gastos registados este mes.")
+        c.setFillColor(colors.HexColor('#999'))
+        c.setFont("Helvetica", 11)
+        c.drawCentredString(w/2, h-260, "Sem gastos registados este mes")
 
-    return bytes(pdf.output())
+    # Rodapé
+    c.setFillColor(colors.HexColor('#141922'))
+    c.rect(0, 0, w, 35, fill=1, stroke=0)
+    c.setFillColor(colors.HexColor('#8a9aa8'))
+    c.setFont("Helvetica", 9)
+    c.drawCentredString(w/2, 13, "Ze das Financas  *  dinheirinhodoze.netlify.app")
 
+    c.save()
+    return buf.getvalue()
 
 def api_relatorio():
     """Gera relatorio mensal em HTML ou PDF (formato=pdf)."""
