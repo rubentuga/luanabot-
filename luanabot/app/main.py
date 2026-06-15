@@ -562,6 +562,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
         "CREATE TABLE IF NOT EXISTS lembretes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, texto VARCHAR(300), quando TIMESTAMP, enviado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS saldos_contas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, conta VARCHAR(50), valor FLOAT, atualizado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, conta))",
+        "CREATE TABLE IF NOT EXISTS bancos_ligados (id SERIAL PRIMARY KEY, usuario_id INTEGER, banco VARCHAR(50), requisition_id VARCHAR(100), account_id VARCHAR(100), saldo FLOAT DEFAULT 0, atualizado TIMESTAMP, expira TIMESTAMP, ativo BOOLEAN DEFAULT TRUE)",
         "CREATE TABLE IF NOT EXISTS viagens (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), ativa BOOLEAN DEFAULT TRUE, inicio TIMESTAMP DEFAULT NOW(), fim TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS objetivos_casal (id SERIAL PRIMARY KEY, descricao VARCHAR(100), valor_objetivo FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS aportes_casal (id SERIAL PRIMARY KEY, objetivo_id INTEGER NOT NULL, usuario_id INTEGER NOT NULL, valor FLOAT, data TIMESTAMP DEFAULT NOW())",
@@ -1141,17 +1142,10 @@ def api_saude():
 
 def gerar_pdf_relatorio(usuario, mes, ano):
     """Gera PDF do relatório mensal com reportlab (já instalado via pdfplumber)."""
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas as rl_canvas
-        from reportlab.lib import colors
-        import io
-    except ImportError:
-        try:
-            from fpdf import FPDF
-            return _gerar_pdf_fpdf(usuario, mes, ano)
-        except ImportError:
-            raise Exception("Nem reportlab nem fpdf2 disponíveis")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib import colors
+    import io
 
     nomes_mes = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho',
                  'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
@@ -1433,6 +1427,39 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/callback', methods=['GET'])
+def api_banco_callback():
+    """Callback do Enable Banking — recebe o code e cria a sessão."""
+    code = request.args.get('code', '')
+    state = request.args.get('state', '')
+    if not code:
+        return "<h2>Autorização cancelada ou falhou.</h2>", 400
+    try:
+        # state = "usuarioid_banco_timestamp"
+        usuario_id = int(state.split('_')[0]) if state else None
+        sessao = enable_criar_sessao(code)
+        if not sessao or 'accounts' not in sessao:
+            return "<h2>Não consegui criar a sessão. Tenta de novo.</h2>", 500
+        accounts = sessao.get('accounts', [])
+        session_id = sessao.get('session_id', '')
+        if accounts and usuario_id:
+            # Guardar o primeiro account uid no banco mais recente deste user
+            acc_uid = accounts[0].get('uid') if isinstance(accounts[0], dict) else accounts[0]
+            db.session.execute(text(
+                "UPDATE bancos_ligados SET account_id=:a, ativo=TRUE "
+                "WHERE id = (SELECT id FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1)"),
+                {'a': acc_uid, 'u': usuario_id})
+            db.session.commit()
+            # Notificar no WhatsApp
+            u = Usuario.query.get(usuario_id)
+            if u:
+                enviar_mensagem(f"{u.phone}@lid",
+                    "✅ *Banco ligado com sucesso!*\n\nJá podes dizer *saldos reais* para ver os teus saldos 🏦")
+        return "<h2>✅ Banco ligado! Podes voltar ao WhatsApp e dizer 'saldos reais'.</h2>", 200
+    except Exception as e:
+        log.error(f"banco_callback: {e}"); db.session.rollback()
+        return f"<h2>Erro: {e}</h2>", 500
+
 @app.route('/api/dashboard', methods=['GET'])
 def api_dashboard():
     """API para o dashboard visual. Autentica por token."""
@@ -3185,6 +3212,157 @@ def terminar_viagem(phone_raw, usuario):
         log.error(f"terminar_viagem: {e}"); db.session.rollback()
         enviar_mensagem(phone_raw, "Erro ao terminar viagem 😕")
 
+
+# ─── ENABLE BANKING (saldos reais) ───────────────────────────
+ENABLE_BASE = "https://api.enablebanking.com"
+
+def _enable_jwt():
+    """Gera JWT RS256 para autenticar na Enable Banking."""
+    try:
+        import jwt as pyjwt
+        app_id = os.environ.get('ENABLE_APP_ID', '')
+        priv_key = os.environ.get('ENABLE_PRIVATE_KEY', '')
+        if not app_id or not priv_key:
+            return None
+        # A chave pode vir com \\n em vez de quebras reais (env var)
+        priv_key = priv_key.replace('\\n', '\n')
+        iat = int(agora().timestamp())
+        token = pyjwt.encode(
+            {"iss": "enablebanking.com", "aud": "api.enablebanking.com",
+             "iat": iat, "exp": iat + 3600},
+            priv_key, algorithm="RS256", headers={"kid": app_id})
+        return token
+    except Exception as e:
+        log.error(f"enable_jwt: {e}")
+        return None
+
+def _enable_headers():
+    jwt = _enable_jwt()
+    return {"Authorization": f"Bearer {jwt}"} if jwt else None
+
+# Bancos PT na Enable Banking (nome exato do ASPSP)
+BANCOS_ENABLE = {
+    'bpi': 'Banco BPI', 'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos',
+    'millennium': 'Millennium BCP', 'bcp': 'Millennium BCP', 'santander': 'Santander Totta',
+    'novobanco': 'Novo Banco', 'novo banco': 'Novo Banco', 'bankinter': 'Bankinter PT',
+    'activobank': 'ActivoBank', 'montepio': 'Banco Montepio', 'revolut': 'Revolut',
+    'wise': 'Wise', 'crédito agrícola': 'Credito Agricola', 'credito agricola': 'Credito Agricola',
+}
+
+def enable_ligar_banco(phone_raw, usuario, texto):
+    """Inicia ligação a um banco via Enable Banking — gera link de autorização."""
+    import requests as _r
+    from datetime import timezone as _tz
+    t = texto.lower()
+    banco = next((b for b in BANCOS_ENABLE if b in t), None)
+    if not banco:
+        lista = 'BPI, CGD, Millennium, Santander, Novo Banco, Bankinter, ActivoBank, Revolut, Wise'
+        enviar_mensagem(phone_raw,
+            f"🏦 *Ligar banco real*\n\nQual banco?\n_Diz_ *ligar banco BPI*\n\nDisponíveis: {lista}")
+        return
+    headers = _enable_headers()
+    if not headers:
+        enviar_mensagem(phone_raw, "⚠️ O serviço de bancos ainda não está configurado no servidor.")
+        return
+    try:
+        nome_aspsp = BANCOS_ENABLE[banco]
+        body = {
+            "access": {"valid_until": (agora().astimezone(_tz.utc) + timedelta(days=90)).isoformat()},
+            "aspsp": {"name": nome_aspsp, "country": "PT"},
+            "state": f"{usuario.id}_{banco}_{int(agora().timestamp())}",
+            "redirect_url": "https://luanabot-production.up.railway.app/api/banco/callback",
+            "psu_type": "personal",
+        }
+        r = _r.post(f"{ENABLE_BASE}/auth", json=body, headers=headers, timeout=20)
+        if r.status_code == 200:
+            auth_url = r.json().get("url")
+            db.session.execute(text(
+                "INSERT INTO bancos_ligados (usuario_id, banco, requisition_id, expira, ativo) "
+                "VALUES (:u, :b, :s, NOW() + INTERVAL '90 days', FALSE)"),
+                {'u': usuario.id, 'b': banco, 's': body["state"]})
+            db.session.commit()
+            enviar_mensagem(phone_raw,
+                f"🏦 *Ligar {banco.upper()}*\n\n"
+                f"1️⃣ Abre este link:\n{auth_url}\n\n"
+                f"2️⃣ Faz login no banco e autoriza\n"
+                f"3️⃣ Volta aqui e diz *saldos reais*\n\n"
+                f"_A ligação dura 90 dias 🔒_")
+        else:
+            log.error(f"enable auth falhou: {r.status_code} {r.text[:200]}")
+            enviar_mensagem(phone_raw, f"Não consegui ligar ao {banco.upper()} 😕\nO banco pode não estar disponível.")
+    except Exception as e:
+        log.error(f"enable_ligar: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao ligar banco 😕")
+
+def enable_criar_sessao(code):
+    """Troca o code da autorização por uma sessão (account uids)."""
+    import requests as _r
+    headers = _enable_headers()
+    if not headers:
+        return None
+    try:
+        r = _r.post(f"{ENABLE_BASE}/sessions", json={"code": code}, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        log.error(f"enable_sessao: {e}")
+    return None
+
+def enable_atualizar_saldos(usuario, silencioso=True):
+    """Lê saldos reais via Enable Banking. Devolve lista (banco, saldo)."""
+    import requests as _r
+    headers = _enable_headers()
+    if not headers:
+        return []
+    resultados = []
+    try:
+        bancos = db.session.execute(text(
+            "SELECT id, banco, account_id FROM bancos_ligados "
+            "WHERE usuario_id=:u AND ativo=TRUE AND account_id IS NOT NULL"), {'u': usuario.id}).fetchall()
+        for bid, banco, acc_id in bancos:
+            try:
+                r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/balances", headers=headers, timeout=20)
+                if r.status_code == 200:
+                    bals = r.json().get('balances', [])
+                    if bals:
+                        # Procurar saldo disponível ou contabilístico
+                        saldo = None
+                        for b in bals:
+                            amt = b.get('balance_amount', {})
+                            if amt.get('amount'):
+                                saldo = float(amt['amount'])
+                                break
+                        if saldo is not None:
+                            db.session.execute(text(
+                                "UPDATE bancos_ligados SET saldo=:s, atualizado=NOW() WHERE id=:i"),
+                                {'s': saldo, 'i': bid})
+                            db.session.commit()
+                            resultados.append((banco, saldo))
+            except Exception as e:
+                log.error(f"saldo enable {banco}: {e}")
+        return resultados
+    except Exception as e:
+        log.error(f"enable_atualizar: {e}"); db.session.rollback()
+        return []
+
+def enviar_saldos_reais(phone_raw, usuario):
+    """Mostra os saldos reais dos bancos ligados."""
+    enviar_mensagem(phone_raw, "🔄 A ler os saldos do banco... 1 segundo!")
+    saldos = enable_atualizar_saldos(usuario)
+    if not saldos:
+        tem = db.session.execute(text("SELECT COUNT(*) FROM bancos_ligados WHERE usuario_id=:u"), {'u': usuario.id}).scalar() or 0
+        if tem == 0:
+            enviar_mensagem(phone_raw, "🏦 Ainda não ligaste nenhum banco.\n_Diz_ *ligar banco BPI* _para começar_")
+        else:
+            enviar_mensagem(phone_raw, "🤔 Ainda não consigo ler os saldos.\nConfirma que autorizaste no link, ou a ligação pode ter expirado (dura 90 dias).")
+        return
+    total = sum(s for _, s in saldos)
+    msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
+    for banco, saldo in saldos:
+        msg += f"💳 {banco.upper()}:  *{saldo:.2f}€*\n"
+    msg += f"━━━━━━━━━━━━━━\n💰 *Total:* {total:.2f}€"
+    enviar_mensagem(phone_raw, msg)
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -4084,6 +4262,11 @@ def processar_texto(phone_raw, phone, texto):
             cat_meta = m_meta.group(1).strip()
             valor_meta = float(m_meta.group(2))
             processar_meta_categoria(phone_raw, usuario, f"limite {cat_meta} {valor_meta}"); return
+        # ── BANCOS REAIS (Nordigen) ──────────────────────────────────
+        if any(p in t for p in ['ligar banco','conectar banco','adicionar banco','ligar conta']):
+            enable_ligar_banco(phone_raw, usuario, texto); return
+        if any(p in t for p in ['saldos reais','saldo real','saldo do banco','saldos do banco','atualizar saldos','sincronizar banco']):
+            enviar_saldos_reais(phone_raw, usuario); return
         # ── MODO VIAGEM (agrupar gastos) ─────────────────────────────
         if re.search(r'(?:iniciar|começar|come[çc]ar|nova|ativar|modo)\s+viagem', t) or t.strip() in ['viagem nova','nova viagem']:
             iniciar_viagem(phone_raw, usuario, texto); return
@@ -4749,6 +4932,11 @@ def registar_deposito_conjunta(phone_raw, usuario, texto):
         f"📌 {desc}\n"
         f"Diz 'quanto tenho na conjunta' para ver o saldo 💚")
 
+
+def nomes_mes_curto(mes):
+    nomes = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+    return nomes[mes-1] if 1 <= mes <= 12 else '?'
+
 def enviar_conjunta(phone_raw, usuario):
     mes = agora().month; ano = agora().year
     parceiro_phone = get_parceiro_phone(usuario.phone)
@@ -4795,25 +4983,49 @@ def enviar_conjunta(phone_raw, usuario):
             f"Para meter: 'metemos 80 na conjunta'")
         return
 
-    msg = f"💑 Conta conjunta\n\n"
+    pct_gasto = round(gasto_total/total*100) if total > 0 else 0
+    barra = '▓'*(pct_gasto//10) + '░'*(10-pct_gasto//10)
+
+    msg = f"💑 *Conta conjunta* — {nomes_mes_curto(mes)}\n"
+    msg += f"━━━━━━━━━━━━━━\n"
+    msg += f"_Para jantares, lanches, cinema e saídas a dois_ 🍽️🎬\n\n"
+
+    # Quem meteu quanto + equilíbrio
     if depositos:
         msg += "\n".join(depositos) + "\n"
-    msg += f"💰 Total: {total:.0f}€\n\n"
+    msg += f"💰 *Total depositado:* {total:.0f}€\n"
+
+    # Barra de uso
+    msg += f"\n*Já usaram:* {gasto_total:.0f}€ ({pct_gasto}%)\n"
+    msg += f"{barra}\n"
 
     if gastos_rows:
-        msg += f"🛒 Gastos ({gasto_total:.0f}€):\n"
-        msg += "\n".join(gastos_rows[:10]) + "\n"
-        if len(gastos_rows) > 10:
-            msg += f"  ... e mais {len(gastos_rows)-10} gastos\n"
-    else:
-        msg += f"🛒 Sem gastos ainda\n"
+        msg += f"\n🛒 *Onde foi:*\n"
+        msg += "\n".join(gastos_rows[:6]) + "\n"
+        if len(gastos_rows) > 6:
+            msg += f"  _... e mais {len(gastos_rows)-6}_\n"
 
-    msg += f"\n💚 Resta: {max(resta,0):.0f}€"
+    msg += f"\n💚 *Resta:* {max(resta,0):.0f}€"
     if resta < 0:
-        msg += f" ⚠️ Passaram {abs(resta):.0f}€!"
-    if total > 0:
-        msg += f"\n\nPara meter mais: 'metemos X na conjunta'"
+        msg += f"\n⚠️ Passaram {abs(resta):.0f}€ — metam mais!"
 
+    # Equilíbrio entre os dois
+    if len(depositos) == 2 and total > 0:
+        vals = []
+        for uid in ids:
+            v = db.session.execute(text(
+                "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
+                "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+                {'u': uid, 'm': mes, 'y': ano}).scalar() or 0
+            vals.append(v)
+        if abs(vals[0] - vals[1]) > 10:
+            quem_menos = NOMES_CASAL.get(Usuario.query.get(ids[0]).phone) if vals[0] < vals[1] else NOMES_CASAL.get(Usuario.query.get(ids[1]).phone)
+            dif = abs(vals[0] - vals[1])
+            msg += f"\n\n⚖️ {quem_menos} meteu menos {dif:.0f}€ este mês"
+        else:
+            msg += f"\n\n⚖️ Estão equilibrados! 👏"
+
+    msg += f"\n\n💡 _Diz_ *metemos X na conjunta* _para reforçar_"
     enviar_mensagem(phone_raw, msg)
 
 def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
@@ -6620,6 +6832,18 @@ def lembrete_recibo():
                     f"Olá! 📄 Amanhã deves receber o salário!\n"
                     f"Já chegou o recibo? Manda o PDF/foto ou diz o valor 😊")
 
+
+def atualizar_saldos_bancarios():
+    """Job diário: atualiza saldos reais de todos os utilizadores (1x/dia)."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 8 or hoje.minute >= 30: return  # 1x de manhã
+        for u in Usuario.query.all():
+            try:
+                enable_atualizar_saldos(u, silencioso=True)
+            except Exception as e:
+                log.error(f"atualizar_saldos {u.phone}: {e}")
+
 def balanco_pre_salario():
     """No dia antes de receber, faz o balanço do que sobrou e sugere onde meter."""
     with app.app_context():
@@ -6938,6 +7162,7 @@ else:
     scheduler.add_job(lembrete_poupanca_mensal,   'cron', hour=10, minute=0)
     scheduler.add_job(aviso_debitos_fixos,        'cron', hour=9, minute=15)
     scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
+    scheduler.add_job(atualizar_saldos_bancarios, 'cron', hour=8,  minute=0)
     scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
     scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
     scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
