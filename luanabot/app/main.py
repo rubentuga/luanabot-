@@ -3261,20 +3261,40 @@ def terminar_viagem(phone_raw, usuario):
 ENABLE_BASE = "https://api.enablebanking.com"
 
 def _normalizar_chave_pem(raw):
-    """Normaliza chave PEM independentemente do formato do Railway."""
+    """Normaliza chave PEM independentemente do formato do Railway.
+    Aceita: PEM normal, PEM com \n literais, base64 da chave inteira."""
+    import base64 as _b64
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
-    for tentativa in [raw, raw.replace('\\n','\n'), raw.replace('\\\\n','\n'), raw.strip().replace('\\n','\n')]:
+    raw = raw.strip()
+
+    # Tentar base64 puro primeiro (mais fácil de colocar no Railway)
+    if not raw.startswith('-'):
+        try:
+            decoded = _b64.b64decode(raw).decode()
+            load_pem_private_key(decoded.encode(), password=None)
+            return decoded
+        except: pass
+
+    # Tentar variações do PEM
+    for tentativa in [
+        raw,
+        raw.replace('\\n', '\n'),
+        raw.replace('\\\\n', '\n'),
+        raw.strip().replace('\\n', '\n'),
+    ]:
         try:
             load_pem_private_key(tentativa.encode(), password=None)
             return tentativa
         except: continue
-    # Último recurso: reconstruir manualmente
+
+    # Último recurso: reconstruir linha a linha
     import re as _re
-    m = _re.search(r'-----BEGIN[^-]+-----(.+?)-----END[^-]+-----', raw.replace('\\n','\n'), _re.DOTALL)
+    texto = raw.replace('\\n', '\n')
+    m = _re.search(r'-----BEGIN[^-]+-----(.+?)-----END[^-]+-----', texto, _re.DOTALL)
     if m:
-        b64 = ''.join(m.group(1).split())
-        bloco = '\n'.join(b64[i:i+64] for i in range(0, len(b64), 64))
-        reconstruida = f"-----BEGIN PRIVATE KEY-----\n{bloco}\n-----END PRIVATE KEY-----\n"
+        corpo = ''.join(m.group(1).split())
+        linhas = '\n'.join(corpo[i:i+64] for i in range(0, len(corpo), 64))
+        reconstruida = f"-----BEGIN PRIVATE KEY-----\n{linhas}\n-----END PRIVATE KEY-----\n"
         load_pem_private_key(reconstruida.encode(), password=None)
         return reconstruida
     raise ValueError("Formato PEM inválido")
