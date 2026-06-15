@@ -1427,6 +1427,50 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/debug', methods=['GET'])
+def api_banco_debug():
+    """Diagnóstico do Enable Banking — ver o estado das credenciais."""
+    # Verificar token de acesso simples
+    token_acesso = request.args.get('t','')
+    if token_acesso != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    resultado = {}
+    # 1. Variáveis de ambiente
+    app_id = os.environ.get('ENABLE_APP_ID', '')
+    priv_key_raw = os.environ.get('ENABLE_PRIVATE_KEY', '')
+    resultado['app_id'] = app_id[:8] + '...' if app_id else 'NÃO DEFINIDO'
+    resultado['priv_key_len'] = len(priv_key_raw)
+    resultado['priv_key_inicio'] = priv_key_raw[:30] if priv_key_raw else 'NÃO DEFINIDO'
+    resultado['tem_begin'] = 'BEGIN PRIVATE KEY' in priv_key_raw
+    resultado['tem_backslash_n'] = '\\n' in priv_key_raw
+    resultado['tem_newline_real'] = '\n' in priv_key_raw and '\\n' not in priv_key_raw
+    # 2. Tentar normalizar
+    if priv_key_raw:
+        try:
+            chave = _normalizar_chave_pem(priv_key_raw)
+            resultado['normalizacao'] = 'OK'
+            resultado['chave_linhas'] = chave.count('\n')
+        except Exception as e:
+            resultado['normalizacao'] = f'ERRO: {e}'
+    # 3. Tentar JWT
+    try:
+        jwt_token = _enable_jwt()
+        resultado['jwt'] = 'OK' if jwt_token else 'FALHOU (app_id ou chave em falta)'
+    except Exception as e:
+        resultado['jwt'] = f'ERRO: {e}'
+    # 4. Testar API
+    if resultado.get('jwt') == 'OK':
+        try:
+            import requests as _r
+            r = _r.get('https://api.enablebanking.com/aspsps?country=PT',
+                headers=_enable_headers(), timeout=10)
+            resultado['api_status'] = r.status_code
+            if r.status_code == 200:
+                resultado['bancos_pt'] = len(r.json().get('aspsps', []))
+        except Exception as e:
+            resultado['api_erro'] = str(e)
+    return jsonify(resultado)
+
 @app.route('/api/banco/callback', methods=['GET'])
 def api_banco_callback():
     """Callback do Enable Banking — recebe o code e cria a sessão."""
@@ -3216,16 +3260,34 @@ def terminar_viagem(phone_raw, usuario):
 # ─── ENABLE BANKING (saldos reais) ───────────────────────────
 ENABLE_BASE = "https://api.enablebanking.com"
 
+def _normalizar_chave_pem(raw):
+    """Normaliza chave PEM independentemente do formato do Railway."""
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    for tentativa in [raw, raw.replace('\\n','\n'), raw.replace('\\\\n','\n'), raw.strip().replace('\\n','\n')]:
+        try:
+            load_pem_private_key(tentativa.encode(), password=None)
+            return tentativa
+        except: continue
+    # Último recurso: reconstruir manualmente
+    import re as _re
+    m = _re.search(r'-----BEGIN[^-]+-----(.+?)-----END[^-]+-----', raw.replace('\\n','\n'), _re.DOTALL)
+    if m:
+        b64 = ''.join(m.group(1).split())
+        bloco = '\n'.join(b64[i:i+64] for i in range(0, len(b64), 64))
+        reconstruida = f"-----BEGIN PRIVATE KEY-----\n{bloco}\n-----END PRIVATE KEY-----\n"
+        load_pem_private_key(reconstruida.encode(), password=None)
+        return reconstruida
+    raise ValueError("Formato PEM inválido")
+
 def _enable_jwt():
     """Gera JWT RS256 para autenticar na Enable Banking."""
     try:
         import jwt as pyjwt
         app_id = os.environ.get('ENABLE_APP_ID', '')
-        priv_key = os.environ.get('ENABLE_PRIVATE_KEY', '')
-        if not app_id or not priv_key:
+        priv_key_raw = os.environ.get('ENABLE_PRIVATE_KEY', '')
+        if not app_id or not priv_key_raw:
             return None
-        # A chave pode vir com \\n em vez de quebras reais (env var)
-        priv_key = priv_key.replace('\\n', '\n')
+        priv_key = _normalizar_chave_pem(priv_key_raw)
         iat = int(agora().timestamp())
         token = pyjwt.encode(
             {"iss": "enablebanking.com", "aud": "api.enablebanking.com",
