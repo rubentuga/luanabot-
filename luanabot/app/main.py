@@ -1458,6 +1458,34 @@ def api_banco_limpar():
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/banco/identificar', methods=['GET'])
+def api_banco_identificar():
+    """Tenta identificar o tipo de cada conta ligada."""
+    if request.args.get('t') != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    import requests as _r
+    headers = _enable_headers()
+    resultado = []
+    try:
+        bancos = db.session.execute(text(
+            "SELECT id, banco, account_id, saldo FROM bancos_ligados WHERE ativo=TRUE AND account_id IS NOT NULL ORDER BY id")).fetchall()
+        for bid, banco, acc_id, saldo in bancos:
+            info = {'id': bid, 'banco': banco, 'account_id': acc_id, 'saldo_guardado': saldo}
+            if headers:
+                # Tentar /details
+                for endpoint in ['details', 'balances']:
+                    try:
+                        r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/{endpoint}",
+                            headers=headers, timeout=10)
+                        if r.status_code == 200:
+                            info[f'dados_{endpoint}'] = r.json()
+                    except Exception as e:
+                        info[f'erro_{endpoint}'] = str(e)
+            resultado.append(info)
+        return jsonify(resultado)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/banco/estado', methods=['GET'])
 def api_banco_estado():
     """Ver estado bruto da tabela bancos_ligados."""
@@ -1589,10 +1617,36 @@ def api_banco_callback():
                 "WHERE id = (SELECT id FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1)"),
                 {'a': acc_uid_0, 'u': usuario_id})
             # Contas adicionais: inserir como novas linhas
-            nomes_tipo = {0: banco_base, 1: f"{banco_base}_conjunta", 2: f"{banco_base}_extra"}
+            # Tentar identificar tipo de conta via API
+            def _tipo_conta(uid, idx, banco):
+                tipos = {0: banco, 1: f"{banco}_conjunta"}
+                return tipos.get(idx, f"{banco}_{idx}")
+
             for i, acc in enumerate(accounts[1:], 1):
                 acc_uid_i = acc.get('uid') if isinstance(acc, dict) else acc
-                nome_tipo = nomes_tipo.get(i, f"{banco_base}_{i}")
+                # Tentar ler o nome real da conta via API
+                nome_tipo = f"{banco_base}_{i}"
+                try:
+                    import requests as _r2
+                    _h2 = _enable_headers()
+                    if _h2:
+                        r_info = _r2.get(f"{ENABLE_BASE}/accounts/{acc_uid_i}/details",
+                            headers=_h2, timeout=10)
+                        if r_info.status_code == 200:
+                            info = r_info.json()
+                            nome_real = (info.get('name') or info.get('details') or
+                                        info.get('product') or '').lower()
+                            if 'joint' in nome_real or 'conjunta' in nome_real or 'shared' in nome_real:
+                                nome_tipo = f"{banco_base}_conjunta"
+                            elif 'vault' in nome_real or 'savings' in nome_real or 'poupança' in nome_real:
+                                nome_tipo = f"{banco_base}_cofre_{i}"
+                            elif nome_real:
+                                nome_tipo = f"{banco_base}_{nome_real[:20].replace(' ','_')}"
+                            else:
+                                # Fallback: conjunta é normalmente a 2ª conta
+                                nome_tipo = f"{banco_base}_conjunta" if i == 1 else f"{banco_base}_{i}"
+                except Exception:
+                    nome_tipo = f"{banco_base}_conjunta" if i == 1 else f"{banco_base}_{i}"
                 # Verificar se já existe
                 existe = db.session.execute(text(
                     "SELECT 1 FROM bancos_ligados WHERE usuario_id=:u AND account_id=:a"),
@@ -3604,21 +3658,32 @@ def enviar_saldos_reais(phone_raw, usuario):
     NOMES_CONTA = {
         'revolut': '💳 Revolut (pessoal)',
         'revolut_conjunta': '💑 Revolut (conjunta)',
-        'revolut_extra': '💰 Revolut (extra)',
+        'revolut_extra': '💰 Revolut (cofre)',
     }
-    # Deduplicar por saldo (evita mostrar duplicados)
-    vistos = set()
+    # Nomes dinâmicos para cofres numerados
+    def _nome_conta(banco):
+        if banco in NOMES_CONTA:
+            return NOMES_CONTA[banco]
+        if 'conjunta' in banco: return '💑 Revolut (conjunta)'
+        if 'cofre' in banco or 'vault' in banco: return f"🏦 Revolut (cofre)"
+        if '_' in banco:
+            partes = banco.split('_')
+            if partes[-1].isdigit():
+                return f"🏦 Revolut (conta {partes[-1]})"
+        return f"💳 {banco.upper()}"
+    # Deduplicar e filtrar contas com saldo 0 (cofres vazios não interessam)
+    vistos_acc = set()
     saldos_unicos = []
     for banco, saldo in saldos:
-        chave = f"{banco}_{saldo}"
-        if chave not in vistos:
-            vistos.add(chave)
-            saldos_unicos.append((banco, saldo))
+        if banco not in vistos_acc:
+            vistos_acc.add(banco)
+            if saldo > 0 or 'pessoal' in banco or 'conjunta' in banco:
+                saldos_unicos.append((banco, saldo))
     total = sum(s for _, s in saldos_unicos)
     msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
     for banco, saldo in saldos_unicos:
         icon = '💚' if saldo > 100 else ('🟡' if saldo > 20 else '🔴')
-        nome = NOMES_CONTA.get(banco.lower(), f"💳 {banco.upper()}")
+        nome = _nome_conta(banco.lower())
         msg += f"{icon} {nome}:  *{saldo:.2f}€*\n"
     msg += f"━━━━━━━━━━━━━━\n💰 *Total:* {total:.2f}€"
     # Verificar objetivos ligados a cofres
