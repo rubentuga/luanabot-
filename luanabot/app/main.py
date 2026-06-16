@@ -562,6 +562,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS modo_poupanca (usuario_id INTEGER PRIMARY KEY, modo VARCHAR(20) DEFAULT 'equilibrado')",
         "CREATE TABLE IF NOT EXISTS lembretes (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, texto VARCHAR(300), quando TIMESTAMP, enviado BOOLEAN DEFAULT FALSE, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS saldos_contas (id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, conta VARCHAR(50), valor FLOAT, atualizado_em TIMESTAMP DEFAULT NOW(), UNIQUE(usuario_id, conta))",
+        "CREATE TABLE IF NOT EXISTS pagamentos_agendados (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), valor FLOAT, dia_mes INTEGER, prestacoes_total INTEGER DEFAULT 1, prestacoes_pagas INTEGER DEFAULT 0, categoria VARCHAR(50) DEFAULT 'outros', variavel BOOLEAN DEFAULT FALSE, valor_medio FLOAT DEFAULT 0, ativo BOOLEAN DEFAULT TRUE, criado TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS bancos_ligados (id SERIAL PRIMARY KEY, usuario_id INTEGER, banco VARCHAR(50), requisition_id VARCHAR(100), account_id VARCHAR(100), saldo FLOAT DEFAULT 0, atualizado TIMESTAMP, expira TIMESTAMP, ativo BOOLEAN DEFAULT TRUE)",
         "CREATE TABLE IF NOT EXISTS viagens (id SERIAL PRIMARY KEY, usuario_id INTEGER, nome VARCHAR(100), ativa BOOLEAN DEFAULT TRUE, inicio TIMESTAMP DEFAULT NOW(), fim TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS objetivos_casal (id SERIAL PRIMARY KEY, descricao VARCHAR(100), valor_objetivo FLOAT, criado_em TIMESTAMP DEFAULT NOW())",
@@ -3445,6 +3446,152 @@ def enviar_saldos_reais(phone_raw, usuario):
     msg += f"━━━━━━━━━━━━━━\n💰 *Total:* {total:.2f}€"
     enviar_mensagem(phone_raw, msg)
 
+
+# ─── PAGAMENTOS AGENDADOS / PRESTAÇÕES (Klarna, Via Verde, etc) ───
+def registar_pagamento_agendado(phone_raw, usuario, texto):
+    """Regista débito com data ou compra parcelada (Klarna).
+    Ex: 'comprei airpods 200 no klarna, dei 140, faltam 2 de 30 dia 15'
+        'via verde 25 dia 8'
+        'cofidis 248 dia 28'."""
+    t = texto.lower()
+    valor = extrair_valor(texto)
+    # Detetar dia do mês
+    m_dia = re.search(r'dia\s+(\d{1,2})', t)
+    dia_mes = int(m_dia.group(1)) if m_dia else None
+    # Detetar prestações: "2 de 30", "faltam 2 prestações de 30", "2x 30"
+    m_prest = re.search(r'(\d+)\s*(?:presta|x|vezes|meses)\w*\s*(?:de\s+)?(\d+(?:[.,]\d+)?)', t)
+    # Entrada: "dei 140", "entrada de 140", "paguei 140 de entrada"
+    m_entrada = re.search(r'(?:dei|entrada|paguei)\s+(\d+(?:[.,]\d+)?)', t)
+    entrada = float(m_entrada.group(1).replace(',','.')) if m_entrada else 0
+
+    # Nome do pagamento (limpar)
+    nome = re.sub(r'comprei|paguei|gastei|no klarna|na klarna|klarna|via verde|dia \d+|\d+(?:[.,]\d+)?\s*(?:€|euros?)?|dei \d+|faltam|presta\w*|de entrada|entrada', '', t)
+    nome = ' '.join(w for w in nome.split() if len(w) > 1).strip().capitalize()[:40] or 'Pagamento'
+
+    # Klarna / parcelado
+    eh_klarna = 'klarna' in t or m_prest
+    categoria, _, _ = categorizar(texto)
+
+    try:
+        if m_prest:
+            n_prest = int(m_prest.group(1))
+            valor_prest = float(m_prest.group(2).replace(',','.'))
+            db.session.execute(text(
+                "INSERT INTO pagamentos_agendados (usuario_id, nome, valor, dia_mes, prestacoes_total, prestacoes_pagas, categoria) "
+                "VALUES (:u, :n, :v, :d, :pt, 0, :c)"),
+                {'u': usuario.id, 'n': nome, 'v': valor_prest, 'd': dia_mes or 1,
+                 'pt': n_prest, 'c': categoria})
+            db.session.commit()
+            # Se houve entrada, registar como gasto hoje
+            if entrada > 0:
+                db.session.add(Despesa(usuario_id=usuario.id, valor=entrada,
+                    descricao=f"{nome} (entrada)", categoria=categoria, data=agora().replace(tzinfo=None)))
+                db.session.commit()
+            total_restante = valor_prest * n_prest
+            msg = f"💳 *Compra parcelada registada!*\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"🛍️ {nome}\n"
+            if entrada > 0:
+                msg += f"💶 Entrada: {entrada:.0f}€ (registada hoje)\n"
+            msg += f"📅 {n_prest} prestações de {valor_prest:.0f}€\n"
+            msg += f"💰 Falta pagar: {total_restante:.0f}€\n"
+            if dia_mes:
+                msg += f"📆 Sai dia {dia_mes} de cada mês\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"✅ Vou avisar-te antes de cada prestação sair!"
+            enviar_mensagem(phone_raw, msg)
+        elif dia_mes and valor > 0:
+            # Débito mensal fixo (Via Verde, Cofidis, etc)
+            db.session.execute(text(
+                "INSERT INTO pagamentos_agendados (usuario_id, nome, valor, dia_mes, prestacoes_total, categoria) "
+                "VALUES (:u, :n, :v, :d, 999, :c)"),  # 999 = recorrente sem fim
+                {'u': usuario.id, 'n': nome, 'v': valor, 'd': dia_mes, 'c': categoria})
+            db.session.commit()
+            msg = f"📅 *Débito agendado!*\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"💳 {nome}\n"
+            msg += f"💰 {valor:.0f}€\n"
+            msg += f"📆 Sai dia {dia_mes} de cada mês\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"✅ Vou avisar-te 3 dias antes!"
+            enviar_mensagem(phone_raw, msg)
+        elif dia_mes and valor == 0:
+            # Débito VARIÁVEL (Via Verde, luz, água) — valor muda todo o mês
+            db.session.execute(text(
+                "INSERT INTO pagamentos_agendados (usuario_id, nome, valor, dia_mes, prestacoes_total, categoria, variavel) "
+                "VALUES (:u, :n, 0, :d, 999, :c, TRUE)"),
+                {'u': usuario.id, 'n': nome, 'd': dia_mes, 'c': categoria})
+            db.session.commit()
+            msg = f"📅 *Débito variável agendado!*\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"💳 {nome}\n"
+            msg += f"📆 Sai dia {dia_mes} de cada mês\n"
+            msg += f"💡 Valor varia — eu pergunto-te no dia!\n"
+            msg += f"━━━━━━━━━━━━━━\n"
+            msg += f"✅ No dia {dia_mes} pergunto quanto foi 😉"
+            enviar_mensagem(phone_raw, msg)
+        else:
+            enviar_mensagem(phone_raw,
+                "🤔 Não percebi bem. Tenta:\n"
+                "_via verde dia 8_ (valor varia, eu pergunto)\n"
+                "_cofidis 248 dia 28_ (valor fixo)\n"
+                "_airpods 200 no klarna, dei 140, faltam 2 de 30 dia 15_")
+    except Exception as e:
+        log.error(f"pagamento agendado: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao registar 😕")
+
+def ver_agenda(phone_raw, usuario):
+    """Mostra o calendário financeiro do mês."""
+    try:
+        hoje = agora()
+        pagamentos = db.session.execute(text(
+            "SELECT nome, valor, dia_mes, prestacoes_total, prestacoes_pagas, categoria "
+            "FROM pagamentos_agendados WHERE usuario_id=:u AND ativo=TRUE ORDER BY dia_mes"),
+            {'u': usuario.id}).fetchall()
+        # Juntar com despesas futuras
+        futuras = DespesaFutura.query.filter_by(usuario_id=usuario.id, pago=False).all()
+
+        if not pagamentos and not futuras:
+            enviar_mensagem(phone_raw,
+                "📅 Sem pagamentos agendados.\n\n_Adiciona com_ *via verde 25 dia 8* _ou_ *cofidis 248 dia 28*")
+            return
+
+        nomes_mes = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+        msg = f"📅 *Agenda — {nomes_mes[hoje.month-1]}*\n"
+        msg += f"━━━━━━━━━━━━━━\n"
+        total_mes = 0
+        for nome, valor, dia, p_tot, p_pag, cat in pagamentos:
+            em = EMOJI_CAT.get(cat, '💳')
+            falta_dias = dia - hoje.day
+            aviso = ""
+            if 0 <= falta_dias <= 3:
+                aviso = f" ⚠️ {falta_dias}d!" if falta_dias > 0 else " ⚠️ HOJE!"
+            prest_txt = ""
+            if p_tot < 999:
+                prest_txt = f" ({p_pag+1}/{p_tot})"
+            msg += f"`{dia:>2}` {em} {nome}{prest_txt} — *{valor:.0f}€*{aviso}\n"
+            if falta_dias >= 0:
+                total_mes += valor
+        msg += f"━━━━━━━━━━━━━━\n"
+        msg += f"💰 Falta sair este mês: *{total_mes:.0f}€*"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"ver_agenda: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao ver agenda 😕")
+
+def calcular_valor_seguro(usuario):
+    """Disponível menos os pagamentos pendentes até ao salário = valor seguro."""
+    disp, p = calcular_disponivel(usuario)
+    hoje = agora()
+    try:
+        pendentes = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM pagamentos_agendados "
+            "WHERE usuario_id=:u AND ativo=TRUE AND dia_mes >= :d"),
+            {'u': usuario.id, 'd': hoje.day}).scalar() or 0
+    except Exception:
+        pendentes = 0
+    return disp, pendentes, max(disp - pendentes, 0)
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -3616,6 +3763,35 @@ def processar_texto(phone_raw, phone, texto):
                 processar_despesa(phone_raw, usuario, f"{desc_w} {preco_w}€")
             else:
                 enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
+            return
+
+        if estado == 'confirmar_debito_variavel':
+            d = dados_estado
+            pid = d.get('pid'); nome_d = d.get('nome',''); cat_d = d.get('cat','outros')
+            limpar_estado(phone)
+            # Usar média ou valor dado
+            if 'media' in t or 'média' in t:
+                media = db.session.execute(text("SELECT valor_medio FROM pagamentos_agendados WHERE id=:i"), {'i': pid}).scalar() or 0
+                valor_d = media
+            else:
+                valor_d = extrair_valor(texto)
+            if valor_d <= 0:
+                enviar_mensagem(phone_raw, "Não percebi o valor 🤔 Tenta só o número, ex: *24*"); return
+            try:
+                # Registar o gasto
+                db.session.add(Despesa(usuario_id=usuario.id, valor=valor_d,
+                    descricao=nome_d, categoria=cat_d, data=agora().replace(tzinfo=None)))
+                # Atualizar média (média móvel simples)
+                media_atual = db.session.execute(text("SELECT valor_medio FROM pagamentos_agendados WHERE id=:i"), {'i': pid}).scalar() or 0
+                nova_media = valor_d if media_atual == 0 else round((media_atual + valor_d) / 2, 2)
+                db.session.execute(text("UPDATE pagamentos_agendados SET valor_medio=:m WHERE id=:i"), {'m': nova_media, 'i': pid})
+                db.session.commit()
+                em_d = EMOJI_CAT.get(cat_d, '💳')
+                enviar_mensagem(phone_raw,
+                    f"✅ Registado!\n{em_d} {nome_d} — {valor_d:.0f}€\n\n_Média atualizada: {nova_media:.0f}€_")
+            except Exception as e:
+                log.error(f"confirmar debito: {e}"); db.session.rollback()
+                enviar_mensagem(phone_raw, "Erro ao registar 😕")
             return
 
         if estado == 'objetivo_tudo':
@@ -4154,6 +4330,24 @@ def processar_texto(phone_raw, phone, texto):
                 conta_s = next((c for c in contas_s if c in t), None)
                 if conta_s:
                     ver_patrimonio(phone_raw, usuario); return
+        # "quanto posso gastar" → valor seguro (desconta pagamentos pendentes)
+        if any(p in t for p in ['quanto posso gastar','posso gastar quanto','valor seguro','quanto gasto sem problema']):
+            disp_s, pendentes_s, seguro_s = calcular_valor_seguro(usuario)
+            msg_s = f"💰 *Saldo disponível:* {disp_s:.0f}€\n"
+            if pendentes_s > 0:
+                msg_s += f"\n📅 *Pagamentos pendentes:*\n"
+                hoje_s = agora()
+                pgs = db.session.execute(text(
+                    "SELECT nome, valor, dia_mes, categoria FROM pagamentos_agendados "
+                    "WHERE usuario_id=:u AND ativo=TRUE AND dia_mes >= :d ORDER BY dia_mes"),
+                    {'u': usuario.id, 'd': hoje_s.day}).fetchall()
+                for nome_s, val_s, dia_s, cat_s in pgs:
+                    em_s = EMOJI_CAT.get(cat_s, '💳')
+                    msg_s += f"{em_s} {nome_s} → {val_s:.0f}€ (dia {dia_s})\n"
+                msg_s += f"\n💡 *Valor seguro para gastar:*\n*{seguro_s:.0f}€*"
+            else:
+                msg_s += f"\n✅ Sem pagamentos pendentes — podes gastar à vontade!"
+            enviar_mensagem(phone_raw, msg_s); return
         if any(p in t for p in ['quanto tenho','quanto me resta','quanto sobra']):
             foco_qt = None
             if 'conjunta' in t: foco_qt = 'conjunta'
@@ -4344,7 +4538,22 @@ def processar_texto(phone_raw, phone, texto):
             cat_meta = m_meta.group(1).strip()
             valor_meta = float(m_meta.group(2))
             processar_meta_categoria(phone_raw, usuario, f"limite {cat_meta} {valor_meta}"); return
-        # ── BANCOS REAIS (Nordigen) ──────────────────────────────────
+        # ── PAGAMENTOS AGENDADOS / PRESTAÇÕES ────────────────────────
+        if any(p in t for p in ['klarna','via verde','viaverde','cofidis','prestaç','prestac']) or \
+           (re.search(r'dia\s+\d{1,2}', t) and any(w in t for w in ['sai','débito','debito','paga','mensal','todo mes','todos os meses','luz','agua','água','renda','internet'])):
+            registar_pagamento_agendado(phone_raw, usuario, texto); return
+        if t.strip() in ['agenda','calendario','calendário','agenda financeira','pagamentos','proximos pagamentos','próximos pagamentos','o que vou pagar']:
+            ver_agenda(phone_raw, usuario); return
+        # ── BANCOS REAIS (Enable Banking) ────────────────────────────
+        if re.search(r'renovar\s+(\w+)', t):
+            m_banco = re.search(r'renovar\s+(\w+)', t)
+            banco_r = m_banco.group(1) if m_banco else 'revolut'
+            enable_ligar_banco(phone_raw, usuario, f"ligar banco {banco_r}"); return
+        if any(p in t for p in ['ligar banco','conectar banco','adicionar banco','ligar conta']):
+            enable_ligar_banco(phone_raw, usuario, texto); return
+        if any(p in t for p in ['saldos reais','saldo real','saldo do banco','saldos do banco','atualizar saldos','sincronizar banco']):
+            enviar_saldos_reais(phone_raw, usuario); return
+        # ── BANCOS REAIS (Enable Banking) ────────────────────────────
         if any(p in t for p in ['ligar banco','conectar banco','adicionar banco','ligar conta']):
             enable_ligar_banco(phone_raw, usuario, texto); return
         if any(p in t for p in ['saldos reais','saldo real','saldo do banco','saldos do banco','atualizar saldos','sincronizar banco']):
@@ -4786,6 +4995,18 @@ def enviar_plano_salario(phone_raw, usuario, salario):
     if p.get('divida_luana'):fixos_display.append(f"   💸 Dívida Luana — {p['divida_luana']:.0f}€")
     if fixos_display:
         msg += "\n".join(fixos_display) + "\n"
+    # Pagamentos agendados / prestações em curso
+    try:
+        pags_ag = db.session.execute(text(
+            "SELECT nome, valor, dia_mes, prestacoes_total, prestacoes_pagas FROM pagamentos_agendados "
+            "WHERE usuario_id=:u AND ativo=TRUE ORDER BY dia_mes"), {'u': usuario.id}).fetchall()
+        if pags_ag:
+            msg += "\n💳 *Pagamentos este mês:*\n"
+            for nome_pa, val_pa, dia_pa, pt_pa, pp_pa in pags_ag:
+                prest_pa = f" ({pp_pa+1}/{pt_pa})" if pt_pa < 999 else ""
+                msg += f"   {nome_pa}{prest_pa} — {val_pa:.0f}€ (dia {dia_pa})\n"
+    except Exception:
+        pass
     if total_fut > 0:
         msg += f"\n   📅 Despesas mes: {total_fut:.0f}€"
         for d in futuras: msg += f"\n     {d.descricao}: {d.valor_reserva_mensal:.0f}€"
@@ -6915,6 +7136,31 @@ def lembrete_recibo():
                     f"Já chegou o recibo? Manda o PDF/foto ou diz o valor 😊")
 
 
+
+def verificar_ligacoes_expiradas():
+    """Avisa quando a ligação ao banco via Enable Banking está prestes a expirar."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 9 or hoje.minute >= 30: return
+        try:
+            expiram = db.session.execute(text(
+                "SELECT b.usuario_id, b.banco, b.id, u.phone "
+                "FROM bancos_ligados b JOIN usuarios u ON b.usuario_id=u.id "
+                "WHERE b.ativo=TRUE AND b.expira IS NOT NULL "
+                "AND b.expira BETWEEN NOW() AND NOW() + INTERVAL '7 days'")).fetchall()
+            for uid, banco, bid, phone in expiram:
+                dias = db.session.execute(text(
+                    "SELECT EXTRACT(day FROM expira - NOW()) FROM bancos_ligados WHERE id=:i"),
+                    {'i': bid}).scalar() or 0
+                dias = int(dias)
+                if dias in [7, 3, 1]:
+                    enviar_mensagem(f"{phone}@lid",
+                        f"⚠️ *A ligação ao {banco.upper()} expira em {dias} dia{'s' if dias>1 else ''}!*\n\n"
+                        f"Para renovar e continuar a ter os valores automáticos:\n"
+                        f"_Diz_ *renovar {banco}* _para gerar o link_")
+        except Exception as e:
+            log.error(f"verificar_ligacoes: {e}")
+
 def atualizar_saldos_bancarios():
     """Job diário: atualiza saldos reais de todos os utilizadores (1x/dia)."""
     with app.app_context():
@@ -6925,6 +7171,138 @@ def atualizar_saldos_bancarios():
                 enable_atualizar_saldos(u, silencioso=True)
             except Exception as e:
                 log.error(f"atualizar_saldos {u.phone}: {e}")
+
+
+
+def enable_verificar_debitos_variaveis(usuario):
+    """No dia X, vai buscar transações ao Revolut e faz match com débitos variáveis."""
+    import requests as _r
+    from difflib import SequenceMatcher
+    headers = _enable_headers()
+    if not headers:
+        return []
+    hoje = agora()
+    resultados = []
+    try:
+        # Buscar débitos variáveis que saem hoje
+        debitos_hoje = db.session.execute(text(
+            "SELECT id, nome, categoria, valor_medio FROM pagamentos_agendados "
+            "WHERE usuario_id=:u AND ativo=TRUE AND variavel=TRUE AND dia_mes=:d"),
+            {'u': usuario.id, 'd': hoje.day}).fetchall()
+        if not debitos_hoje:
+            return []
+        # Buscar account_id do Revolut
+        acc = db.session.execute(text(
+            "SELECT account_id FROM bancos_ligados "
+            "WHERE usuario_id=:u AND ativo=TRUE AND banco='revolut' AND account_id IS NOT NULL LIMIT 1"),
+            {'u': usuario.id}).fetchone()
+        if not acc:
+            return []
+        acc_id = acc[0]
+        # Ler transações de hoje
+        data_ini = hoje.strftime('%Y-%m-%dT00:00:00')
+        data_fim = hoje.strftime('%Y-%m-%dT23:59:59')
+        r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
+            headers=headers, params={'date_from': data_ini, 'date_to': data_fim}, timeout=20)
+        if r.status_code != 200:
+            log.error(f"transacoes enable: {r.status_code}")
+            return []
+        transacoes = r.json().get('transactions', [])
+        # Fazer match por nome (fuzzy)
+        for pid, nome_d, cat_d, media_d in debitos_hoje:
+            melhor_match = None; melhor_score = 0
+            for tx in transacoes:
+                desc_tx = (tx.get('creditor_name') or tx.get('remittance_information') or '').lower()
+                nome_lower = nome_d.lower()
+                score = SequenceMatcher(None, nome_lower, desc_tx).ratio()
+                # Também aceita se o nome está contido na descrição
+                if nome_lower in desc_tx or any(w in desc_tx for w in nome_lower.split() if len(w) > 3):
+                    score = max(score, 0.8)
+                if score > melhor_score:
+                    melhor_score = score
+                    melhor_match = tx
+            if melhor_match and melhor_score > 0.5:
+                valor_tx = abs(float(melhor_match.get('transaction_amount', {}).get('amount', 0)))
+                if valor_tx > 0:
+                    resultados.append((pid, nome_d, cat_d, valor_tx, melhor_score))
+        return resultados
+    except Exception as e:
+        log.error(f"enable_debitos_variaveis: {e}")
+        return []
+
+def aviso_pagamentos_agendados():
+    """Avisa 3 dias antes de cada pagamento e processa prestações no dia."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 9 or hoje.minute >= 30: return
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                pags = db.session.execute(text(
+                    "SELECT id, nome, valor, dia_mes, prestacoes_total, prestacoes_pagas, categoria "
+                    "FROM pagamentos_agendados WHERE usuario_id=:u AND ativo=TRUE"),
+                    {'u': u.id}).fetchall()
+                for pid, nome, valor, dia, p_tot, p_pag, cat in pags:
+                    falta = dia - hoje.day
+                    em = EMOJI_CAT.get(cat, '💳')
+                    # Aviso 3 dias antes
+                    if falta == 3:
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"📅 *Lembrete de pagamento*\n\n{em} {nome}\n💰 {valor:.0f}€\n📆 Sai dia {dia} (faltam 3 dias)\n\nConfirma que tens saldo 💳")
+                    # No dia: se variável, perguntar; senão registar
+                    elif falta == 0:
+                        eh_variavel = db.session.execute(text(
+                            "SELECT variavel, valor_medio FROM pagamentos_agendados WHERE id=:i"),
+                            {'i': pid}).fetchone()
+                        if eh_variavel and eh_variavel[0]:
+                            media = eh_variavel[1] or 0
+                            # Tentar ler valor real da API do Revolut
+                            api_ok = False
+                            try:
+                                matches = enable_verificar_debitos_variaveis(u)
+                                for m_pid, m_nome, m_cat, m_valor, m_score in matches:
+                                    if m_pid == pid:
+                                        # Encontrou! Registar automático
+                                        db.session.add(Despesa(usuario_id=u.id, valor=m_valor,
+                                            descricao=nome, categoria=cat, data=hoje.replace(tzinfo=None)))
+                                        nova_media = m_valor if media == 0 else round((media + m_valor) / 2, 2)
+                                        db.session.execute(text(
+                                            "UPDATE pagamentos_agendados SET valor_medio=:m WHERE id=:i"),
+                                            {'m': nova_media, 'i': pid})
+                                        db.session.commit()
+                                        em_d = EMOJI_CAT.get(cat, '💳')
+                                        enviar_mensagem(f"{u.phone}@lid",
+                                            f"🤖 *Vi no Revolut:*\n{em_d} {nome} — *{m_valor:.2f}€*\n✅ Registado automaticamente!")
+                                        api_ok = True
+                                        break
+                            except Exception as e_api:
+                                log.error(f"api debito variavel: {e_api}")
+                            # Fallback: perguntar manualmente
+                            if not api_ok:
+                                media_txt = f" (média: {media:.0f}€)" if media > 0 else ""
+                                set_estado(u.phone, 'confirmar_debito_variavel', {'pid': pid, 'nome': nome, 'cat': cat})
+                                enviar_mensagem(f"{u.phone}@lid",
+                                    f"📅 *Hoje sai o {nome}!*{media_txt}\n\nSabes quanto foi? Diz só o valor (ex: _24_)\nou _média_ para usar a estimativa")
+                            continue
+                        db.session.add(Despesa(usuario_id=u.id, valor=valor,
+                            descricao=nome, categoria=cat, data=hoje.replace(tzinfo=None)))
+                        if p_tot < 999:  # parcelado
+                            nova_pag = p_pag + 1
+                            if nova_pag >= p_tot:
+                                db.session.execute(text("UPDATE pagamentos_agendados SET ativo=FALSE, prestacoes_pagas=:p WHERE id=:i"),
+                                    {'p': nova_pag, 'i': pid})
+                                msg_fim = f"\n\n🎉 Última prestação! {nome} está pago por completo!"
+                            else:
+                                db.session.execute(text("UPDATE pagamentos_agendados SET prestacoes_pagas=:p WHERE id=:i"),
+                                    {'p': nova_pag, 'i': pid})
+                                msg_fim = f"\n\n📊 Prestação {nova_pag}/{p_tot} — faltam {p_tot-nova_pag}"
+                        else:
+                            msg_fim = ""
+                        db.session.commit()
+                        enviar_mensagem(f"{u.phone}@lid",
+                            f"💳 *Saiu hoje:*\n{em} {nome} — {valor:.0f}€{msg_fim}")
+            except Exception as e:
+                log.error(f"aviso_pagamentos {u.phone}: {e}"); db.session.rollback()
 
 def balanco_pre_salario():
     """No dia antes de receber, faz o balanço do que sobrou e sugere onde meter."""
@@ -7244,7 +7622,9 @@ else:
     scheduler.add_job(lembrete_poupanca_mensal,   'cron', hour=10, minute=0)
     scheduler.add_job(aviso_debitos_fixos,        'cron', hour=9, minute=15)
     scheduler.add_job(lembrete_salario,           'cron', hour=9,  minute=0)
+    scheduler.add_job(aviso_pagamentos_agendados, 'cron', hour=9,  minute=10)
     scheduler.add_job(atualizar_saldos_bancarios, 'cron', hour=8,  minute=0)
+    scheduler.add_job(verificar_ligacoes_expiradas,'cron', hour=9,  minute=5)
     scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
     scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
     scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
