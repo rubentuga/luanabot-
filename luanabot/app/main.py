@@ -3520,9 +3520,10 @@ def _enable_headers():
 
 # Bancos PT na Enable Banking (nome exato do ASPSP)
 BANCOS_ENABLE = {
-    # Nomes exatos do Enable Banking PT (38 bancos disponíveis)
+    # Nomes exatos do Enable Banking PT
     'bpi': 'BPI', 'banco bpi': 'BPI',
     'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos',
+    'caixa geral': 'Caixa Geral de Depositos',
     'millennium': 'Millennium bcp', 'bcp': 'Millennium bcp', 'millenium': 'Millennium bcp',
     'santander': 'Santander Totta', 'santander totta': 'Santander Totta',
     'novobanco': 'Novo Banco', 'novo banco': 'Novo Banco',
@@ -3531,6 +3532,7 @@ BANCOS_ENABLE = {
     'wise': 'Wise', 'n26': 'N26',
     'credito agricola': 'Credito Agricola', 'crédito agrícola': 'Credito Agricola',
     'ing': 'ING', 'deutsche': 'Deutsche Bank', 'unicre': 'Unicre',
+    'edenred': 'Edenred', 'paypal': 'PayPal',
 }
 
 def enable_ligar_banco(phone_raw, usuario, texto):
@@ -3573,7 +3575,12 @@ def enable_ligar_banco(phone_raw, usuario, texto):
                 f"_A ligação dura 90 dias 🔒_")
         else:
             log.error(f"enable auth falhou: {r.status_code} {r.text[:200]}")
-            enviar_mensagem(phone_raw, f"Não consegui ligar ao {banco.upper()} 😕\nO banco pode não estar disponível.")
+            erro_txt = r.json().get('message', '') if r.headers.get('content-type','').startswith('application/json') else r.text[:100]
+            enviar_mensagem(phone_raw,
+                f"Não consegui gerar o link para o {banco.upper()} 😕\n\n"
+                f"O banco pode não estar disponível no Enable Banking.\n"
+                f"Bancos que funcionam bem: *Revolut*, *Wise*, *N26*\n\n"
+                f"_Erro: {erro_txt[:80]}_")
     except Exception as e:
         log.error(f"enable_ligar: {e}"); db.session.rollback()
         enviar_mensagem(phone_raw, "Erro ao ligar banco 😕")
@@ -4936,9 +4943,26 @@ def processar_texto(phone_raw, phone, texto):
         # ── JÁ PAGUEI AO PARCEIRO (sem valor = splits) ───────────────
         if re.search(r'\bj[áa] paguei\b', t) and not tem_numero(texto):
             if processar_ja_paguei(phone_raw, usuario, texto): return
+        # ── RECIBO DE LOJA / EMAIL DE CONFIRMAÇÃO ──────────────────
+        m_recibo = (re.search(r'\(([A-Za-záàâãéêíóôõúçÁ][\w\s&.]{2,30})\)\s*[\u2014\-\u2013]\s*(\d+[.,]\d{2})', texto)
+                    or re.search(r'\b([A-Za-záàâãéêíóôõúç][\w\s&.]{3,25})\s+[\u2014\-\u2013]\s*(\d+[.,]\d{2})\s*€', texto))
+        if m_recibo and not any(p in t for p in ['wishlist','quero','curtia','ando a ver','entidade']):
+            nome_loja_r = m_recibo.group(1).strip()
+            valor_r = float(m_recibo.group(2).replace(',','.'))
+            if 0.5 < valor_r < 5000 and len(nome_loja_r) > 2:
+                cat_r, emoji_r, nome_r = categorizar(nome_loja_r)
+                db.session.add(Despesa(usuario_id=usuario.id, valor=valor_r,
+                    descricao=nome_r, categoria=cat_r, data=agora().replace(tzinfo=None)))
+                db.session.commit()
+                codigo_r = id_para_codigo(db.session.execute(text("SELECT MAX(id) FROM despesas WHERE usuario_id=:u"),{'u':usuario.id}).scalar() or 0)
+                msg_r = f"{emoji_r} *{nome_r}*\n━━━━━━━━━━━━━━\n💸 Valor:  *{valor_r:.2f}€*\n🏷️ Categoria:  {cat_r.capitalize()}\n📅 Data:  {agora().strftime('%a %d/%m/%Y')}\n🆔 Código:  {codigo_r}\n━━━━━━━━━━━━━━"
+                enviar_mensagem(phone_raw, msg_r); return
         # ── FATURA COM ENTIDADE/REFERÊNCIA ───────────────────────────
         if 'entidade' in t and 'refer' in t:
             if processar_fatura_referencia(phone_raw, usuario, texto): return
+        # "fatura da X" com valor mas SEM entidade MB → é um gasto normal
+        if 'fatura' in t and tem_numero(texto) and 'entidade' not in t:
+            processar_despesa(phone_raw, usuario, texto); return
         if any(p in t for p in ['paguei a fatura','fatura paga','ja paguei a fatura']):
             est_f, dados_f = get_estado(phone)
             if est_f == 'fatura_pendente':
@@ -5489,11 +5513,40 @@ def verificar_sobra_mes(phone_raw, usuario, mes, ano):
 
 # ─── QUANTO TENHO / CONJUNTA / RESUMO ────────────────────────
 def enviar_quanto_tenho(phone_raw, usuario, foco=None):
-    """Responde quanto tens — com foco opcional: 'conjunta', 'reserva', 'poupanca'."""
+    """Responde quanto tens — usa saldo real Revolut quando disponível."""
     disp, p = calcular_disponivel(usuario)
     reserva = get_reserva(usuario.id)
     mes=agora().month; ano=agora().year
     dias = dias_para_salario(usuario)
+    # Tentar saldo real do Revolut via API
+    saldo_rev_real = None
+    saldo_conj_real = None
+    try:
+        import requests as _r
+        h = _enable_headers()
+        if h:
+            # Revolut pessoal
+            acc_rev = db.session.execute(text(
+                "SELECT account_id FROM bancos_ligados WHERE usuario_id=:u AND banco='revolut_pessoal' AND ativo=TRUE LIMIT 1"),
+                {'u': usuario.id}).scalar()
+            if acc_rev:
+                r = _r.get(f"{ENABLE_BASE}/accounts/{acc_rev}/balances", headers=h, timeout=8)
+                if r.status_code == 200:
+                    bals = r.json().get('balances', [])
+                    if bals:
+                        saldo_rev_real = float(bals[0].get('balance_amount',{}).get('amount', 0))
+            # Conjunta
+            acc_conj = db.session.execute(text(
+                "SELECT account_id FROM bancos_ligados WHERE usuario_id=:u AND banco='revolut_conjunta' AND ativo=TRUE LIMIT 1"),
+                {'u': usuario.id}).scalar()
+            if acc_conj:
+                r2 = _r.get(f"{ENABLE_BASE}/accounts/{acc_conj}/balances", headers=h, timeout=8)
+                if r2.status_code == 200:
+                    bals2 = r2.json().get('balances', [])
+                    if bals2:
+                        saldo_conj_real = float(bals2[0].get('balance_amount',{}).get('amount', 0))
+    except Exception as e:
+        log.error(f"quanto_tenho API: {e}")
 
     # Conjunta
     gc = db.session.query(db.func.sum(Despesa.valor)).filter(
@@ -5526,19 +5579,23 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
         enviar_mensagem(phone_raw, msg); return
 
     # Resposta principal
-    msg = f"💳 *Tens {disp:.0f}€ para gastar*"
-    if disp < 0:
-        msg = f"⚠️ *Estás {abs(disp):.0f}€ no vermelho!*"
-    elif disp < 50:
-        msg += " 😬"
-    msg += f"\n"
-    if dias > 0 and disp > 0:
-        msg += f"📅 {dias} dias até ao salário — ~{disp/dias:.0f}€/dia\n"
-    if total_dep_q > 0:
-        msg += f"\n💑 Conjunta:  {resta_conj:.0f}€ disponíveis de {total_dep_q:.0f}€ depositados"
+    # Usar saldo real do Revolut se disponível, senão o calculado
+    saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
+    fonte = " 🔄" if saldo_rev_real is not None else ""
+    msg = f"💳 *Revolut:* {saldo_variavel:.2f}€{fonte}\n"
+    if dias > 0:
+        msg += f"📅 {dias} dias até ao salário\n"
+    # Conjunta — sempre o saldo real se disponível
+    if saldo_conj_real is not None:
+        msg += f"\n💑 *Conjunta:* {saldo_conj_real:.2f}€ 🔄\n"
+    elif total_dep_q > 0:
+        msg += f"\n💑 *Conjunta:* {resta_conj:.0f}€\n"
+    # Resto (manual)
     if reserva > 0:
-        msg += f"\n🛡️ Reserva:  {reserva:.0f}€"
-    msg += f"\n💎 Poupança:  {p['poupanca']:.0f}€"
+        msg += f"\n🛡️ *Bankinter:* {reserva:.0f}€ (reserva)"
+    msg += f"\n💎 *Trade Republic:* {p['poupanca']:.0f}€ (estimativa)"
+    if saldo_rev_real is not None:
+        msg += f"\n\n_🔄 = saldo real Revolut_"
     enviar_mensagem(phone_raw, msg)
 
 def registar_deposito_conjunta(phone_raw, usuario, texto):
@@ -5724,6 +5781,41 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
     cats_estado = {str(i+1): cat for i, (cat, _) in enumerate(por_cat_sorted)}
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
     set_estado(phone, 'resumo_categoria', {'cats': cats_estado, 'mes': mes, 'ano': ano})
+    # Comparação com mês anterior
+    try:
+        mes_ant = mes - 1 if mes > 1 else 12
+        ano_ant = ano if mes > 1 else ano - 1
+        gp_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            db.extract('month',Despesa.data)==mes_ant,
+            db.extract('year',Despesa.data)==ano_ant).scalar() or 0
+        if gp_ant > 0 and gp > 0:
+            diff_pct = round((gp - gp_ant) / gp_ant * 100)
+            nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
+            nome_ant = nomes_m[mes_ant-1]
+            if diff_pct <= -20:
+                msg += f"\n\n🎉 Gastaste *{abs(diff_pct)}% menos* que em {nome_ant}! Boa!"
+            elif diff_pct <= -5:
+                msg += f"\n\n👏 Gastaste *{abs(diff_pct)}% menos* que em {nome_ant}"
+            elif diff_pct >= 30:
+                msg += f"\n\n⚠️ Gastaste *{diff_pct}% mais* que em {nome_ant} ({gp_ant:.0f}€)"
+            elif diff_pct >= 10:
+                msg += f"\n\n📈 Gastaste *{diff_pct}% mais* que em {nome_ant}"
+            # Categoria que mais subiu
+            for cat_c, total_c in por_cat_sorted[:3]:
+                ant_c = db.session.query(db.func.sum(Despesa.valor)).filter(
+                    Despesa.usuario_id==usuario.id, Despesa.categoria==cat_c,
+                    db.extract('month',Despesa.data)==mes_ant,
+                    db.extract('year',Despesa.data)==ano_ant).scalar() or 0
+                if ant_c > 0 and total_c > 0:
+                    diff_c = round((total_c - ant_c) / ant_c * 100)
+                    em_c = EMOJI_CAT.get(cat_c,'💳')
+                    if diff_c <= -30:
+                        msg += f"\n{em_c} {cat_c.capitalize()} -30% vs {nome_ant} 🔥"
+                    elif diff_c >= 50:
+                        msg += f"\n{em_c} {cat_c.capitalize()} +{diff_c}% vs {nome_ant} ⚠️"
+    except Exception as e:
+        log.error(f"comparacao resumo: {e}")
     enviar_mensagem(phone_raw, msg)
 
 def enviar_plano_mes(phone_raw, usuario):
