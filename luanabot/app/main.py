@@ -169,8 +169,17 @@ def dia_pagamento_usuario(usuario, ano=None, mes=None):
     """Calcula dia de pagamento conforme perfil do utilizador."""
     hoje = agora()
     ano = ano or hoje.year; mes = mes or hoje.month
-    dia_base = getattr(usuario, 'dia_pagamento', None) or 21
-    tipo = getattr(usuario, 'pagamento_tipo', None) or 'day_before'
+    # Dias de pagamento por utilizador
+    from sqlalchemy import text as _text
+    if hasattr(usuario, 'phone') and usuario.phone == PHONE_RUBEN:
+        dia_base = 22  # Ruben recebe dia 22 (mesmo que seja segunda)
+        tipo = 'exact'  # sem antecipação
+    elif hasattr(usuario, 'phone') and usuario.phone == PHONE_LUANA:
+        dia_base = getattr(usuario, 'dia_pagamento', None) or 8
+        tipo = 'day_before'
+    else:
+        dia_base = getattr(usuario, 'dia_pagamento', None) or 21
+        tipo = getattr(usuario, 'pagamento_tipo', None) or 'day_before'
     try:
         d = datetime(ano, mes, dia_base)
     except ValueError:
@@ -178,9 +187,10 @@ def dia_pagamento_usuario(usuario, ano=None, mes=None):
     if tipo == 'day_before':
         while d.weekday() >= 5:
             d -= timedelta(days=1)
-    else:  # day_after
+    elif tipo == 'day_after':
         while d.weekday() >= 5:
             d += timedelta(days=1)
+    # 'exact' = sem alteração
     return d
 
 def dia_recibo_mes(ano, mes):
@@ -863,7 +873,13 @@ def webhook():
             if 'audio' in mime or 'ogg' in mime:
                 transcrito = transcrever_audio(url)
                 if transcrito:
-                    enviar_mensagem(phone_raw, f'🎤 Percebi: "{transcrito}"'); texto = transcrito
+                    enviar_mensagem(phone_raw, f'🎤 Percebi: "{transcrito}"')
+                    # Se parece gasto, perguntar pessoal ou conjunta
+                    if extrair_valor(transcrito) > 0:
+                        set_estado(phone, 'confirmar_pessoal_conjunta', {'texto': transcrito})
+                        enviar_mensagem(phone_raw, "É *pessoal* ou *conjunta*?")
+                        return jsonify({'status':'ok'})
+                    texto = transcrito
                 else:
                     enviar_mensagem(phone_raw, "Nao percebi 😕 Escreve!"); return jsonify({'status':'ok'})
             elif 'image' in mime:
@@ -884,7 +900,13 @@ def webhook():
                         u_temp = Usuario.query.filter_by(phone=phone).first()
                         if u_temp and ler_etiqueta_wishlist(phone_raw, u_temp, url, mime):
                             return jsonify({'status':'ok'})
-                        # Vai direto para processar como gasto sem mensagem intermédia
+                        # Perguntar pessoal ou conjunta antes de registar
+                        if resultado and extrair_valor(resultado) > 0:
+                            set_estado(phone, 'confirmar_pessoal_conjunta', {'texto': resultado})
+                            enviar_mensagem(phone_raw,
+                                f"📸 Vi: _{resultado}_\n\n"
+                                f"É *pessoal* ou *conjunta*?\n_Diz_ *ignora* _para cancelar_")
+                            return jsonify({{'status':'ok'}})
                         texto = resultado
                 else:
                     u_temp = Usuario.query.filter_by(phone=phone).first()
@@ -4101,6 +4123,40 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
             return
 
+        if estado == 'confirmar_pessoal_conjunta':
+            d = dados_estado
+            txt_orig = d.get('texto','')
+            limpar_estado(phone)
+            if 'ignora' in t or 'cancelar' in t or 'cancel' in t:
+                enviar_mensagem(phone_raw, "Ok, cancelado 👍"); return
+            eh_conjunta = any(p in t for p in ['conjunta','conjunto','casal','nós','nos dois'])
+            if eh_conjunta:
+                # Registar na conjunta
+                val = extrair_valor(txt_orig)
+                if val > 0:
+                    cat, loja, _ = categorizar(txt_orig)
+                    loja_n = loja or txt_orig[:30]
+                    try:
+                        db.session.add(Despesa(usuario_id=usuario.id, valor=val,
+                            descricao=f"[conjunta] {loja_n}", categoria=cat,
+                            data=agora().replace(tzinfo=None)))
+                        db.session.commit()
+                        em = EMOJI_CAT.get(cat,'💳')
+                        enviar_mensagem(phone_raw,
+                            f"✅ {em} *{loja_n}* — {val:.2f}€\n💑 Registado na *conjunta*")
+                    except Exception as e:
+                        log.error(f"conj pessoal: {e}"); db.session.rollback()
+                        enviar_mensagem(phone_raw, "Erro ao registar 😕")
+                else:
+                    enviar_mensagem(phone_raw, "Não percebi o valor 🤔")
+            elif any(p in t for p in ['pessoal','meu','minha','eu']):
+                processar_despesa(phone_raw, usuario, txt_orig)
+            else:
+                # Não percebeu — repetir
+                set_estado(phone, 'confirmar_pessoal_conjunta', d)
+                enviar_mensagem(phone_raw, "Diz *pessoal* ou *conjunta* 😊")
+            return
+
         if estado == 'confirmar_debito_variavel':
             d = dados_estado
             pid = d.get('pid'); nome_d = d.get('nome',''); cat_d = d.get('cat','outros')
@@ -5185,16 +5241,20 @@ def processar_despesa(phone_raw, usuario, texto):
         {'u':usuario.id,'m':mes_i,'y':ano_i}).scalar() or 1
     pct_cat = round(total_cat / total_mes_geral * 100) if total_mes_geral > 0 else 0
 
-    # ── CARTÃO VISUAL ──
+    # ── CARTÃO VISUAL estilo GranaZen ──
     pessoa_txt = f" · com {pessoa}" if pessoa else ""
+    tipo_conta = "conjunta 💑" if na_conjunta else "pessoal"
     msg = f"{emoji} *{nome_loja}*{pessoa_txt}\n"
-    msg += f"━━━━━━━━━━━━━━\n"
+    msg += f"───────────────────────\n"
     msg += f"💸 Valor:  *{valor:.2f}€*\n"
+    msg += f"🔄 Tipo:  🟥 Despesa\n"
     msg += f"🏷️ Categoria:  {categoria.capitalize()}\n"
-    msg += f"📅 Data:  {data_txt}\n"
+    msg += f"🏦 Conta:  {tipo_conta}\n"
+    msg += f"🗓️ Data:  {data_txt}\n"
     msg += f"🆔 Código:  `{codigo_tx}`\n"
-    msg += f"━━━━━━━━━━━━━━\n"
-    msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.0f}€ ({pct_cat}% dos gastos)"
+    msg += f"───────────────────────\n"
+    msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.0f}€ ({pct_cat}% dos gastos)\n"
+    msg += f"❌ Para anular: *anular {codigo_tx}*"
     # Aviso se passou a meta definida para esta categoria
     try:
         meta_cat = db.session.execute(text(
@@ -5257,8 +5317,22 @@ def processar_receita(phone_raw, usuario, texto):
         usuario.ultimo_salario_mes = f"{agora().year}-{agora().month:02d}"
     except Exception:
         pass
-    db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
+    import random, string
+    codigo_rec = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    rec = Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None))
+    db.session.add(rec)
     db.session.commit()
+    # Cartão de confirmação estilo GranaZen
+    data_str = agora().strftime("%d/%m/%Y")
+    msg_rec = f"✅ *Salário*\n"
+    msg_rec += f"───────────────────────\n"
+    msg_rec += f"💸 Valor:  *{valor:.2f}€*\n"
+    msg_rec += f"🔄 Tipo:  🟩 Receita\n"
+    msg_rec += f"🏷️ Categoria:  Salário\n"
+    msg_rec += f"🏦 Conta:  pessoal\n"
+    msg_rec += f"🗓️ Data:  {data_str}\n"
+    msg_rec += f"───────────────────────"
+    enviar_mensagem(phone_raw, msg_rec)
     enviar_plano_salario(phone_raw, usuario, valor)
     try:
         verificar_aniversarios_proximo_mes(phone_raw, usuario, valor)
@@ -5580,22 +5654,27 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
 
     # Resposta principal
     # Usar saldo real do Revolut se disponível, senão o calculado
+    # Estilo anterior mas Revolut e conjunta com valores reais
     saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
-    fonte = " 🔄" if saldo_rev_real is not None else ""
-    msg = f"💳 *Revolut:* {saldo_variavel:.2f}€{fonte}\n"
+    import datetime as _dt
+    msg = f"💳 *Tens {saldo_variavel:.0f}€ para gastar*"
+    if saldo_variavel < 0:
+        msg = f"⚠️ *Estás {abs(saldo_variavel):.0f}€ no vermelho!*"
+    elif saldo_variavel < 50:
+        msg += " 😬"
+    msg += "\n"
     if dias > 0:
-        msg += f"📅 {dias} dias até ao salário\n"
-    # Conjunta — sempre o saldo real se disponível
-    if saldo_conj_real is not None:
-        msg += f"\n💑 *Conjunta:* {saldo_conj_real:.2f}€ 🔄\n"
+        dia_pag = agora().date() + _dt.timedelta(days=dias)
+        nome_dia = ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'][dia_pag.weekday()]
+        msg += f"📅 {dias} dias · {nome_dia} {dia_pag.day}\n"
+    # Conjunta — saldo real > 0 ou calculado
+    if saldo_conj_real is not None and saldo_conj_real > 0:
+        msg += f"\n💑 Conjunta:  {saldo_conj_real:.2f}€"
     elif total_dep_q > 0:
-        msg += f"\n💑 *Conjunta:* {resta_conj:.0f}€\n"
-    # Resto (manual)
+        msg += f"\n💑 Conjunta:  {resta_conj:.0f}€"
     if reserva > 0:
-        msg += f"\n🛡️ *Bankinter:* {reserva:.0f}€ (reserva)"
-    msg += f"\n💎 *Trade Republic:* {p['poupanca']:.0f}€ (estimativa)"
-    if saldo_rev_real is not None:
-        msg += f"\n\n_🔄 = saldo real Revolut_"
+        msg += f"\n🛡️ Reserva:  {reserva:.0f}€"
+    msg += f"\n💎 Poupança:  {p['poupanca']:.0f}€"
     enviar_mensagem(phone_raw, msg)
 
 def registar_deposito_conjunta(phone_raw, usuario, texto):
@@ -5660,7 +5739,7 @@ def enviar_conjunta(phone_raw, usuario):
         for d in rows:
             desc = d.descricao.replace('[conjunta] ','').replace('[conjunta]','').strip()
             emoji_c = EMOJI_CAT.get(d.categoria,'💳')
-            gastos_rows.append(f"  {emoji_c} {desc[:25]} — {d.valor:.0f}€ ({nome_u})")
+            gastos_rows.append(f"  {emoji_c} {desc[:25]} — {d.valor:.2f}€ ({nome_u})")
             gasto_total += d.valor
 
     resta = total - gasto_total
@@ -5672,7 +5751,7 @@ def enviar_conjunta(phone_raw, usuario):
             f"Para meter: 'metemos 80 na conjunta'")
         return
 
-    pct_gasto = round(gasto_total/total*100) if total > 0 else 0
+    pct_gasto = round(gasto_total/total*100) if total > 0 else 0  # % de uso da conjunta
     barra = '▓'*(pct_gasto//10) + '░'*(10-pct_gasto//10)
 
     msg = f"💑 *Conta conjunta* — {nomes_mes_curto(mes)}\n"
