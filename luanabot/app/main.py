@@ -1428,6 +1428,37 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/organizar', methods=['GET'])
+def api_banco_organizar():
+    """Limpa duplicados e renomeia contas com os nomes corretos."""
+    if request.args.get('t') != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    try:
+        # 1. Apagar duplicados — manter só os IDs certos
+        # Manter: id=1 (pessoal EUR), id=6 (cofre Casa), id=7 (cofre PC), id=8 (conjunta EUR)
+        # Apagar: todos os outros
+        db.session.execute(text("DELETE FROM bancos_ligados WHERE id NOT IN (1, 6, 7, 8)"))
+        # 2. Renomear com nomes claros
+        updates = [
+            (1, 'revolut_pessoal'),
+            (8, 'revolut_conjunta'),
+            (6, 'revolut_cofre_casa'),
+            (7, 'revolut_cofre_pc'),
+        ]
+        for bid, nome in updates:
+            db.session.execute(text("UPDATE bancos_ligados SET banco=:b, ativo=TRUE WHERE id=:i"),
+                {'b': nome, 'i': bid})
+        db.session.commit()
+        # Ver o que ficou
+        restantes = db.session.execute(text(
+            "SELECT id, banco, account_id, saldo FROM bancos_ligados ORDER BY id")).fetchall()
+        return jsonify({'ok': True, 'contas': [
+            {'id':r[0],'banco':r[1],'account_id':r[2][:8]+'...','saldo':r[3]} for r in restantes
+        ]})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/banco/limpar', methods=['GET'])
 def api_banco_limpar():
     """Remove entradas duplicadas da tabela bancos_ligados."""
@@ -3656,28 +3687,28 @@ def enviar_saldos_reais(phone_raw, usuario):
     total = sum(s for _, s in saldos)
     # Nomes mais amigáveis para as contas
     NOMES_CONTA = {
-        'revolut': '💳 Revolut (pessoal)',
+        'revolut': '💳 Revolut',
+        'revolut_pessoal': '💳 Revolut (pessoal)',
         'revolut_conjunta': '💑 Revolut (conjunta)',
-        'revolut_extra': '💰 Revolut (cofre)',
+        'revolut_cofre_casa': '🏠 Cofre Casa',
+        'revolut_cofre_pc': '💻 Cofre PC novo',
     }
-    # Nomes dinâmicos para cofres numerados
     def _nome_conta(banco):
         if banco in NOMES_CONTA:
             return NOMES_CONTA[banco]
         if 'conjunta' in banco: return '💑 Revolut (conjunta)'
-        if 'cofre' in banco or 'vault' in banco: return f"🏦 Revolut (cofre)"
-        if '_' in banco:
-            partes = banco.split('_')
-            if partes[-1].isdigit():
-                return f"🏦 Revolut (conta {partes[-1]})"
-        return f"💳 {banco.upper()}"
+        if 'cofre' in banco:
+            nome_cofre = banco.replace('revolut_cofre_','').replace('_',' ').title()
+            return f"🏦 Cofre {nome_cofre}"
+        return f"💳 {banco.split('_')[0].upper()}"
     # Deduplicar e filtrar contas com saldo 0 (cofres vazios não interessam)
     vistos_acc = set()
     saldos_unicos = []
     for banco, saldo in saldos:
         if banco not in vistos_acc:
             vistos_acc.add(banco)
-            if saldo > 0 or 'pessoal' in banco or 'conjunta' in banco:
+            # Mostrar sempre: pessoal, conjunta, cofres (mesmo vazios)
+            if saldo > 0 or any(k in banco for k in ['pessoal','conjunta','cofre']):
                 saldos_unicos.append((banco, saldo))
     total = sum(s for _, s in saldos_unicos)
     msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
