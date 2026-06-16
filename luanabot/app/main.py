@@ -1428,6 +1428,21 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/estado', methods=['GET'])
+def api_banco_estado():
+    """Ver estado bruto da tabela bancos_ligados."""
+    if request.args.get('t') != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    rows = db.session.execute(text(
+        "SELECT id, usuario_id, banco, requisition_id, account_id, saldo, atualizado, ativo, expira FROM bancos_ligados ORDER BY id DESC LIMIT 10")).fetchall()
+    return jsonify([{
+        'id': r[0], 'usuario_id': r[1], 'banco': r[2],
+        'requisition_id': (r[3] or '')[:20] + '...' if r[3] else None,
+        'account_id': r[4],
+        'saldo': r[5], 'atualizado': str(r[6]) if r[6] else None,
+        'ativo': r[7], 'expira': str(r[8]) if r[8] else None
+    } for r in rows])
+
 @app.route('/api/banco/contas', methods=['GET'])
 def api_banco_contas():
     """Ver todas as contas/subcontas ligadas (incluindo cofres Revolut)."""
