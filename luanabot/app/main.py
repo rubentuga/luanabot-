@@ -1547,18 +1547,39 @@ def api_banco_callback():
         accounts = sessao.get('accounts', [])
         session_id = sessao.get('session_id', '')
         if accounts and usuario_id:
-            # Guardar o primeiro account uid no banco mais recente deste user
-            acc_uid = accounts[0].get('uid') if isinstance(accounts[0], dict) else accounts[0]
+            u = Usuario.query.get(usuario_id)
+            # Guardar TODAS as contas (conta principal + conjunta + cofres)
+            banco_base = db.session.execute(text(
+                "SELECT banco FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1"),
+                {'u': usuario_id}).scalar() or 'revolut'
+            # Primeiro account: atualizar a linha existente
+            acc_uid_0 = accounts[0].get('uid') if isinstance(accounts[0], dict) else accounts[0]
             db.session.execute(text(
                 "UPDATE bancos_ligados SET account_id=:a, ativo=TRUE "
                 "WHERE id = (SELECT id FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1)"),
-                {'a': acc_uid, 'u': usuario_id})
+                {'a': acc_uid_0, 'u': usuario_id})
+            # Contas adicionais: inserir como novas linhas
+            nomes_tipo = {0: banco_base, 1: f"{banco_base}_conjunta", 2: f"{banco_base}_extra"}
+            for i, acc in enumerate(accounts[1:], 1):
+                acc_uid_i = acc.get('uid') if isinstance(acc, dict) else acc
+                nome_tipo = nomes_tipo.get(i, f"{banco_base}_{i}")
+                # Verificar se já existe
+                existe = db.session.execute(text(
+                    "SELECT 1 FROM bancos_ligados WHERE usuario_id=:u AND account_id=:a"),
+                    {'u': usuario_id, 'a': acc_uid_i}).fetchone()
+                if not existe:
+                    db.session.execute(text(
+                        "INSERT INTO bancos_ligados (usuario_id, banco, account_id, ativo, expira) "
+                        "SELECT :u, :b, :a, TRUE, expira FROM bancos_ligados "
+                        "WHERE usuario_id=:u ORDER BY id DESC LIMIT 1"),
+                        {'u': usuario_id, 'b': nome_tipo, 'a': acc_uid_i})
             db.session.commit()
-            # Notificar no WhatsApp
-            u = Usuario.query.get(usuario_id)
+            n_contas = len(accounts)
             if u:
+                tipos = ['principal'] + ['conjunta' if i==1 else f'extra {i}' for i in range(1, n_contas)]
+                lista = '\n'.join(f"  • {t}" for t in tipos)
                 enviar_mensagem(f"{u.phone}@lid",
-                    "✅ *Banco ligado com sucesso!*\n\nJá podes dizer *saldos reais* para ver os teus saldos 🏦")
+                    f"✅ *Banco ligado com sucesso!* ({n_contas} conta{'s' if n_contas>1 else ''})\n\n{lista}\n\nDiz *saldos reais* para ver 🏦")
         return "<h2>✅ Banco ligado! Podes voltar ao WhatsApp e dizer 'saldos reais'.</h2>", 200
     except Exception as e:
         log.error(f"banco_callback: {e}"); db.session.rollback()
