@@ -43,7 +43,7 @@ from pdf_reader import extrair_salario_pdf
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-DASHBOARD_URL = "https://dinheirinhodoze.netlify.app"
+DASHBOARD_URL = "https://zedasfinancas.netlify.app"
 
 app = Flask(__name__)
 
@@ -273,7 +273,7 @@ LOJAS = {
     # Carro
     'oficina':'carro','mecanico':'carro','seguro':'carro','portagem':'carro','via verde':'carro',
     # Lazer
-    'cinema':'lazer','concerto':'lazer','bowling':'lazer','netflix':'subscricoes',
+    'cinema':'lazer','nos':'lazer','uci':'lazer','cinemax':'lazer','forum':'lazer','norteshopping':'lazer','colombo':'lazer','dolce vita':'lazer','arrábida shopping':'lazer','amoreiras':'lazer','concerto':'lazer','bowling':'lazer','netflix':'subscricoes',
     'spotify':'subscricoes','disney':'subscricoes',
     # ─── Lojas expandidas (lista completa) ───
     'pizza hut':'fastfood',
@@ -510,9 +510,13 @@ def extrair_nome_gasto(texto):
     # Remover datas relativas e dias da semana
     for dia in ['segunda','terca','terça','quarta','quinta','sexta','sabado','sábado','domingo']:
         t = t.replace(dia, '')
-    tokens = [w for w in re.findall(r"[a-zà-ú]+", t) if w not in stop and len(w) > 2]
+    lugares = {'almada','forum','dolce','cascais','lisboa','porto','braga','setubal',
+               'faro','coimbra','aveiro','leiria','evora','viseu','guarda','beja',
+               'viana','funchal','shopping','mall','center','centre'}
+    tokens = [w for w in re.findall(r"[a-zà-ú]+", t)
+              if w not in stop and w not in lugares and len(w) > 2]
     if tokens:
-        return ' '.join(tokens[:3]).capitalize()
+        return ' '.join(tokens[:2]).capitalize()
     return 'Gasto'
 
 def categorizar_ia(texto):
@@ -794,8 +798,34 @@ def gastos_cat_mes(usuario, cat, mes, ano):
     ).scalar() or 0
 
 def extrair_valor(texto):
+    # 1. Tentar primeiro valores com € (mais fiável)
+    m_euro = re.findall(r'(\d+[.,]\d{2})\s*(?:€|eur)', texto, re.IGNORECASE)
+    if m_euro:
+        for n in m_euro:
+            try:
+                v = float(n.replace(',','.'))
+                if 0 < v < 100000: return v
+            except: continue
+    # 2. Tentar padrão X,XX ou X.XX (preço típico) excluindo números muito grandes
+    m_preco = re.findall(r'(?<![\d.])(?:\d{1,6}[,.]\d{2})(?![\d])', texto)
+    if m_preco:
+        for n in m_preco:
+            try:
+                v = float(n.replace(',','.'))
+                if 0 < v < 100000: return v
+            except: continue
+    # 3. Tentar inteiro com € (pizza 12€)
+    m_int_euro = re.findall(r'(\d{1,6})\s*(?:€|eur)', texto, re.IGNORECASE)
+    if m_int_euro:
+        for n in m_int_euro:
+            try:
+                v = float(n)
+                if 0 < v < 100000: return v
+            except: continue
+    # 4. Fallback: qualquer número razoável (ignorar códigos de barras > 8 dígitos)
     padrao = re.findall(r'\d[\d.,]*\d|\d+', texto)
     for n in padrao:
+        if len(n.replace('.','').replace(',','')) > 8: continue
         try:
             if '.' in n and ',' in n: v = float(n.replace('.','').replace(',','.'))
             elif ',' in n: v = float(n.replace(',','.'))
@@ -803,7 +833,7 @@ def extrair_valor(texto):
                 decimais = n[n.rfind('.')+1:]
                 v = float(n.replace('.','')) if (len(decimais)==3 and n.replace('.','').isdigit()) else float(n)
             else: v = float(n)
-            if v > 0: return v
+            if 0 < v < 100000: return v
         except: continue
     return 0
 
@@ -1282,7 +1312,7 @@ def gerar_pdf_relatorio(usuario, mes, ano):
     c.rect(0, 0, w, 35, fill=1, stroke=0)
     c.setFillColor(colors.HexColor('#8a9aa8'))
     c.setFont("Helvetica", 9)
-    c.drawCentredString(w/2, 13, "Ze das Financas  *  dinheirinhodoze.netlify.app")
+    c.drawCentredString(w/2, 13, "Ze das Financas  *  zedasfinancas.netlify.app")
 
     c.save()
     return buf.getvalue()
@@ -2143,7 +2173,7 @@ def como_estou(phone_raw, usuario):
 
     msg += "\n━━━━━━━━━━━━\n"
     msg += "💡 *ver transações* · *resumo*\n"
-    msg += "📊 dinheirinhodoze.netlify.app"
+    msg += "📊 zedasfinancas.netlify.app"
     enviar_mensagem(phone_raw, msg)
 
 def processar_assinaturas(phone_raw, usuario, texto):
@@ -3544,7 +3574,7 @@ def _enable_headers():
 BANCOS_ENABLE = {
     # Nomes exatos do Enable Banking PT
     'bpi': 'BPI', 'banco bpi': 'BPI',
-    'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos',
+    'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos', 'cgd pt': 'Caixa Geral de Depositos',
     'caixa geral': 'Caixa Geral de Depositos',
     'millennium': 'Millennium bcp', 'bcp': 'Millennium bcp', 'millenium': 'Millennium bcp',
     'santander': 'Santander Totta', 'santander totta': 'Santander Totta',
@@ -5254,7 +5284,8 @@ def processar_despesa(phone_raw, usuario, texto):
     msg += f"🆔 Código:  `{codigo_tx}`\n"
     msg += f"───────────────────────\n"
     msg += f"📊 {categoria.capitalize()} este mês: {total_cat:.0f}€ ({pct_cat}% dos gastos)\n"
-    msg += f"❌ Para anular: *anular {codigo_tx}*"
+    msg += f"❌ Para anular: *anular {codigo_tx}*\n"
+    msg += f"📊 Ver em zedasfinancas.netlify.app/#movimentos"
     # Aviso se passou a meta definida para esta categoria
     try:
         meta_cat = db.session.execute(text(
@@ -5317,22 +5348,8 @@ def processar_receita(phone_raw, usuario, texto):
         usuario.ultimo_salario_mes = f"{agora().year}-{agora().month:02d}"
     except Exception:
         pass
-    import random, string
-    codigo_rec = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    rec = Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None))
-    db.session.add(rec)
+    db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
     db.session.commit()
-    # Cartão de confirmação estilo GranaZen
-    data_str = agora().strftime("%d/%m/%Y")
-    msg_rec = f"✅ *Salário*\n"
-    msg_rec += f"───────────────────────\n"
-    msg_rec += f"💸 Valor:  *{valor:.2f}€*\n"
-    msg_rec += f"🔄 Tipo:  🟩 Receita\n"
-    msg_rec += f"🏷️ Categoria:  Salário\n"
-    msg_rec += f"🏦 Conta:  pessoal\n"
-    msg_rec += f"🗓️ Data:  {data_str}\n"
-    msg_rec += f"───────────────────────"
-    enviar_mensagem(phone_raw, msg_rec)
     enviar_plano_salario(phone_raw, usuario, valor)
     try:
         verificar_aniversarios_proximo_mes(phone_raw, usuario, valor)
@@ -5498,7 +5515,7 @@ def enviar_plano_salario(phone_raw, usuario, salario):
                 msg += f"Aproveita para reforçar a reserva: _diz_ *reserva {sobra_anterior:.0f}* 🛡️"
         except Exception:
             msg += f"Aproveita para reforçar a reserva: _diz_ *reserva {sobra_anterior:.0f}* 🛡️"
-    msg += "\n━━━━━━━━━━━━\n💡 *onde vai o dinheiro* · 📊 dinheirinhodoze.netlify.app"
+    msg += "\n━━━━━━━━━━━━\n💡 *onde vai o dinheiro* · 📊 zedasfinancas.netlify.app/#plano"
     enviar_mensagem(phone_raw, msg)
     # Sugestão de meta inteligente (mensagem separada, só às vezes)
     try:
@@ -5654,27 +5671,41 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
 
     # Resposta principal
     # Usar saldo real do Revolut se disponível, senão o calculado
-    # Estilo anterior mas Revolut e conjunta com valores reais
-    saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
+    # Formato completo com todas as contas
     import datetime as _dt
+    saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
     msg = f"💳 *Tens {saldo_variavel:.0f}€ para gastar*"
     if saldo_variavel < 0:
         msg = f"⚠️ *Estás {abs(saldo_variavel):.0f}€ no vermelho!*"
     elif saldo_variavel < 50:
         msg += " 😬"
     msg += "\n"
-    if dias > 0:
+    if dias > 0 and saldo_variavel > 0:
         dia_pag = agora().date() + _dt.timedelta(days=dias)
         nome_dia = ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'][dia_pag.weekday()]
-        msg += f"📅 {dias} dias · {nome_dia} {dia_pag.day}\n"
-    # Conjunta — saldo real > 0 ou calculado
+        msg += f"📅 {dias} dias · {nome_dia} {dia_pag.day} · ~{saldo_variavel/dias:.0f}€/dia\n"
+    # Conjunta
     if saldo_conj_real is not None and saldo_conj_real > 0:
         msg += f"\n💑 Conjunta:  {saldo_conj_real:.2f}€"
     elif total_dep_q > 0:
         msg += f"\n💑 Conjunta:  {resta_conj:.0f}€"
+    # Reserva de emergência
     if reserva > 0:
         msg += f"\n🛡️ Reserva:  {reserva:.0f}€"
-    msg += f"\n💎 Poupança:  {p['poupanca']:.0f}€"
+    # Poupança prevista
+    if p.get('poupanca', 0) > 0:
+        msg += f"\n💎 Poupança:  {p['poupanca']:.0f}€"
+    # Outras contas manuais (saldos_contas)
+    try:
+        outras = db.session.execute(text(
+            "SELECT conta, saldo FROM saldos_contas WHERE usuario_id=:u AND conta NOT IN ('revolut','conjunta') ORDER BY conta"),
+            {'u': usuario.id}).fetchall()
+        for conta_o, saldo_o in outras:
+            if saldo_o and saldo_o > 0:
+                emoji_c = '🏦' if 'bankinter' in conta_o.lower() or 'trade' in conta_o.lower() else '💳'
+                msg += f"\n{emoji_c} {conta_o.capitalize()}:  {saldo_o:.0f}€"
+    except: pass
+    msg += f"\n\n📊 zedasfinancas.netlify.app/#saldos"
     enviar_mensagem(phone_raw, msg)
 
 def registar_deposito_conjunta(phone_raw, usuario, texto):
@@ -5854,7 +5885,7 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
             if top_val > 50:
                 msg += f"\n💡 Cortar 30% em {top_cat} = +{top_val*0.3*12:.0f}€/ano"
 
-    msg += "\n\n💡 Diz o *número* da categoria para detalhes\n📊 dinheirinhodoze.netlify.app"
+    msg += "\n\n💡 Diz o *número* da categoria para detalhes\n📊 zedasfinancas.netlify.app"
 
     # Guarda as categorias no estado para o utilizador poder selecionar
     cats_estado = {str(i+1): cat for i, (cat, _) in enumerate(por_cat_sorted)}
