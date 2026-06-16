@@ -1428,6 +1428,40 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/contas', methods=['GET'])
+def api_banco_contas():
+    """Ver todas as contas/subcontas ligadas (incluindo cofres Revolut)."""
+    token_acesso = request.args.get('t','')
+    if token_acesso != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    import requests as _r
+    headers = _enable_headers()
+    if not headers:
+        return jsonify({'error': 'Enable Banking não configurado'}), 500
+    try:
+        # Buscar todas as contas ligadas
+        bancos = db.session.execute(text(
+            "SELECT id, banco, account_id, saldo, atualizado FROM bancos_ligados WHERE ativo=TRUE")).fetchall()
+        resultado = []
+        for bid, banco, acc_id, saldo, atualizado in bancos:
+            if not acc_id: continue
+            # Buscar detalhes da conta na API
+            r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}", headers=headers, timeout=15)
+            if r.status_code == 200:
+                dados = r.json()
+                resultado.append({
+                    'banco': banco, 'account_id': acc_id,
+                    'saldo_guardado': saldo,
+                    'nome': dados.get('name') or dados.get('details') or '',
+                    'iban': dados.get('iban',''),
+                    'tipo': dados.get('product',''),
+                    'moeda': dados.get('currency',''),
+                    'raw': dados
+                })
+        return jsonify({'contas': resultado, 'total': len(resultado)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/banco/debug', methods=['GET'])
 def api_banco_debug():
     """Diagnóstico do Enable Banking — ver o estado das credenciais."""
@@ -3325,11 +3359,17 @@ def _enable_headers():
 
 # Bancos PT na Enable Banking (nome exato do ASPSP)
 BANCOS_ENABLE = {
-    'bpi': 'Banco BPI', 'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos',
-    'millennium': 'Millennium BCP', 'bcp': 'Millennium BCP', 'santander': 'Santander Totta',
-    'novobanco': 'Novo Banco', 'novo banco': 'Novo Banco', 'bankinter': 'Bankinter PT',
-    'activobank': 'ActivoBank', 'montepio': 'Banco Montepio', 'revolut': 'Revolut',
-    'wise': 'Wise', 'crédito agrícola': 'Credito Agricola', 'credito agricola': 'Credito Agricola',
+    # Nomes exatos do Enable Banking PT (38 bancos disponíveis)
+    'bpi': 'BPI', 'banco bpi': 'BPI',
+    'cgd': 'Caixa Geral de Depositos', 'caixa': 'Caixa Geral de Depositos',
+    'millennium': 'Millennium bcp', 'bcp': 'Millennium bcp', 'millenium': 'Millennium bcp',
+    'santander': 'Santander Totta', 'santander totta': 'Santander Totta',
+    'novobanco': 'Novo Banco', 'novo banco': 'Novo Banco',
+    'bankinter': 'Bankinter Portugal', 'activobank': 'ActivoBank',
+    'montepio': 'Banco Montepio', 'revolut': 'Revolut',
+    'wise': 'Wise', 'n26': 'N26',
+    'credito agricola': 'Credito Agricola', 'crédito agrícola': 'Credito Agricola',
+    'ing': 'ING', 'deutsche': 'Deutsche Bank', 'unicre': 'Unicre',
 }
 
 def enable_ligar_banco(phone_raw, usuario, texto):
@@ -3428,22 +3468,81 @@ def enable_atualizar_saldos(usuario, silencioso=True):
         log.error(f"enable_atualizar: {e}"); db.session.rollback()
         return []
 
+def enable_buscar_todas_contas(usuario):
+    """Busca saldos de TODAS as contas/subcontas (cofres incluídos)."""
+    import requests as _r
+    headers = _enable_headers()
+    if not headers: return []
+    resultados = []
+    try:
+        bancos = db.session.execute(text(
+            "SELECT id, banco, account_id FROM bancos_ligados WHERE usuario_id=:u AND ativo=TRUE AND account_id IS NOT NULL"),
+            {'u': usuario.id}).fetchall()
+        for bid, banco, acc_id in bancos:
+            # Ler saldo desta conta
+            r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/balances", headers=headers, timeout=15)
+            if r.status_code == 200:
+                bals = r.json().get('balances', [])
+                for b in bals:
+                    amt = b.get('balance_amount', {})
+                    if amt.get('amount'):
+                        saldo = float(amt['amount'])
+                        tipo = b.get('balance_type', '')
+                        if tipo in ['CLBD','ITAV','XPCD','interimAvailable','closingBooked','']:
+                            resultados.append((banco, acc_id, saldo, tipo))
+                            break
+        return resultados
+    except Exception as e:
+        log.error(f"buscar_todas_contas: {e}")
+        return []
+
+def enable_alertas_saldo(usuario):
+    """Verifica se algum saldo está abaixo do mínimo definido."""
+    try:
+        alertas = db.session.execute(text(
+            "SELECT conta, minimo FROM saldos_contas WHERE usuario_id=:u AND alerta_minimo IS NOT NULL"),
+            {'u': usuario.id}).fetchall()
+        # simplificado: usar saldo guardado
+        for banco_a, minimo_a in alertas:
+            saldo_a = db.session.execute(text(
+                "SELECT saldo FROM bancos_ligados WHERE usuario_id=:u AND banco=:b AND ativo=TRUE"),
+                {'u': usuario.id, 'b': banco_a}).scalar() or 0
+            if saldo_a > 0 and saldo_a < minimo_a:
+                yield banco_a, saldo_a, minimo_a
+    except Exception:
+        return
+
 def enviar_saldos_reais(phone_raw, usuario):
-    """Mostra os saldos reais dos bancos ligados."""
-    enviar_mensagem(phone_raw, "🔄 A ler os saldos do banco... 1 segundo!")
+    """Mostra os saldos reais dos bancos ligados, incluindo cofres."""
+    enviar_mensagem(phone_raw, "🔄 A ler os saldos... 1 segundo!")
     saldos = enable_atualizar_saldos(usuario)
     if not saldos:
         tem = db.session.execute(text("SELECT COUNT(*) FROM bancos_ligados WHERE usuario_id=:u"), {'u': usuario.id}).scalar() or 0
         if tem == 0:
-            enviar_mensagem(phone_raw, "🏦 Ainda não ligaste nenhum banco.\n_Diz_ *ligar banco BPI* _para começar_")
+            enviar_mensagem(phone_raw, "🏦 Ainda não ligaste nenhum banco.\n_Diz_ *ligar banco revolut* _para começar_")
         else:
-            enviar_mensagem(phone_raw, "🤔 Ainda não consigo ler os saldos.\nConfirma que autorizaste no link, ou a ligação pode ter expirado (dura 90 dias).")
+            enviar_mensagem(phone_raw, "🤔 Não consigo ler os saldos agora.\nA ligação pode ter expirado — diz *renovar revolut*")
         return
     total = sum(s for _, s in saldos)
     msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
     for banco, saldo in saldos:
-        msg += f"💳 {banco.upper()}:  *{saldo:.2f}€*\n"
+        icon = '💚' if saldo > 100 else ('🟡' if saldo > 20 else '🔴')
+        msg += f"{icon} {banco.upper()}:  *{saldo:.2f}€*\n"
     msg += f"━━━━━━━━━━━━━━\n💰 *Total:* {total:.2f}€"
+    # Verificar objetivos ligados a cofres
+    try:
+        objs = db.session.execute(text(
+            "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca "
+            "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 3"),
+            {'u': usuario.id}).fetchall()
+        if objs:
+            msg += f"\n\n🎯 *Objetivos:*\n"
+            for desc_o, val_o, at_o in objs:
+                pct = round((at_o or 0)/val_o*100) if val_o else 0
+                barra = '█'*(pct//10) + '░'*(10-pct//10)
+                msg += f"{emoji_objetivo(desc_o)} {desc_o}: {barra} {pct}%\n"
+    except Exception:
+        pass
     enviar_mensagem(phone_raw, msg)
 
 
@@ -7304,6 +7403,36 @@ def aviso_pagamentos_agendados():
             except Exception as e:
                 log.error(f"aviso_pagamentos {u.phone}: {e}"); db.session.rollback()
 
+
+def alerta_saldo_baixo():
+    """Avisa se o saldo do Revolut cair abaixo de 50€ após atualização diária."""
+    with app.app_context():
+        hoje = agora()
+        if hoje.hour != 8 or hoje.minute >= 30: return
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                saldo_rev = db.session.execute(text(
+                    "SELECT saldo FROM bancos_ligados WHERE usuario_id=:u AND banco='revolut' AND ativo=TRUE"),
+                    {'u': u.id}).scalar()
+                if saldo_rev is not None and saldo_rev < 50:
+                    # Ver se tem pagamentos pendentes esta semana
+                    pendentes = db.session.execute(text(
+                        "SELECT nome, valor, dia_mes FROM pagamentos_agendados "
+                        "WHERE usuario_id=:u AND ativo=TRUE AND dia_mes BETWEEN :d1 AND :d2 ORDER BY dia_mes"),
+                        {'u': u.id, 'd1': hoje.day, 'd2': hoje.day+7}).fetchall()
+                    msg = f"⚠️ *Saldo baixo no Revolut!*\n💳 Tens apenas {saldo_rev:.2f}€"
+                    if pendentes:
+                        msg += f"\n\n📅 E tens pagamentos a sair:\n"
+                        for n_p, v_p, d_p in pendentes:
+                            msg += f"  • {n_p} — {v_p:.0f}€ (dia {d_p})\n"
+                        total_p = sum(v for _,v,_ in pendentes)
+                        if total_p > saldo_rev:
+                            msg += f"\n🚨 *Não tens saldo suficiente!* Faltam {total_p-saldo_rev:.0f}€"
+                    enviar_mensagem(f"{u.phone}@lid", msg)
+            except Exception as e:
+                log.error(f"alerta_saldo: {e}")
+
 def balanco_pre_salario():
     """No dia antes de receber, faz o balanço do que sobrou e sugere onde meter."""
     with app.app_context():
@@ -7625,6 +7754,7 @@ else:
     scheduler.add_job(aviso_pagamentos_agendados, 'cron', hour=9,  minute=10)
     scheduler.add_job(atualizar_saldos_bancarios, 'cron', hour=8,  minute=0)
     scheduler.add_job(verificar_ligacoes_expiradas,'cron', hour=9,  minute=5)
+    scheduler.add_job(alerta_saldo_baixo,         'cron', hour=8,  minute=30)
     scheduler.add_job(fecho_mes,                  'cron', hour=10, minute=0)
     scheduler.add_job(aviso_meio_mes,             'cron', hour=10, minute=0)
     scheduler.add_job(aviso_uma_semana_salario,   'cron', hour=10, minute=0)
