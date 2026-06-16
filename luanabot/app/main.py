@@ -1428,6 +1428,36 @@ def health():
     return jsonify({'status':'ok','bot':'Ze das Financas v7'})
 
 # ─── API DASHBOARD ───────────────────────────────────────────
+@app.route('/api/banco/limpar', methods=['GET'])
+def api_banco_limpar():
+    """Remove entradas duplicadas da tabela bancos_ligados."""
+    if request.args.get('t') != 'zef2026':
+        return jsonify({'error': 'acesso negado'}), 401
+    try:
+        # Manter só a entrada mais recente por account_id
+        db.session.execute(text("""
+            DELETE FROM bancos_ligados
+            WHERE id NOT IN (
+                SELECT MAX(id) FROM bancos_ligados
+                WHERE account_id IS NOT NULL
+                GROUP BY usuario_id, account_id
+            ) AND account_id IS NOT NULL
+        """))
+        # Apagar entradas sem account_id e inativas
+        db.session.execute(text(
+            "DELETE FROM bancos_ligados WHERE account_id IS NULL AND ativo=FALSE"))
+        db.session.commit()
+        # Ver o que ficou
+        restantes = db.session.execute(text(
+            "SELECT id, banco, account_id, saldo, ativo FROM bancos_ligados ORDER BY id")).fetchall()
+        return jsonify({
+            'ok': True,
+            'restantes': [{'id':r[0],'banco':r[1],'account_id':r[2],'saldo':r[3],'ativo':r[4]} for r in restantes]
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/banco/estado', methods=['GET'])
 def api_banco_estado():
     """Ver estado bruto da tabela bancos_ligados."""
@@ -3570,10 +3600,26 @@ def enviar_saldos_reais(phone_raw, usuario):
             enviar_mensagem(phone_raw, "🤔 Não consigo ler os saldos agora.\nA ligação pode ter expirado — diz *renovar revolut*")
         return
     total = sum(s for _, s in saldos)
-    msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
+    # Nomes mais amigáveis para as contas
+    NOMES_CONTA = {
+        'revolut': '💳 Revolut (pessoal)',
+        'revolut_conjunta': '💑 Revolut (conjunta)',
+        'revolut_extra': '💰 Revolut (extra)',
+    }
+    # Deduplicar por saldo (evita mostrar duplicados)
+    vistos = set()
+    saldos_unicos = []
     for banco, saldo in saldos:
+        chave = f"{banco}_{saldo}"
+        if chave not in vistos:
+            vistos.add(chave)
+            saldos_unicos.append((banco, saldo))
+    total = sum(s for _, s in saldos_unicos)
+    msg = f"🏦 *Saldos reais*\n━━━━━━━━━━━━━━\n"
+    for banco, saldo in saldos_unicos:
         icon = '💚' if saldo > 100 else ('🟡' if saldo > 20 else '🔴')
-        msg += f"{icon} {banco.upper()}:  *{saldo:.2f}€*\n"
+        nome = NOMES_CONTA.get(banco.lower(), f"💳 {banco.upper()}")
+        msg += f"{icon} {nome}:  *{saldo:.2f}€*\n"
     msg += f"━━━━━━━━━━━━━━\n💰 *Total:* {total:.2f}€"
     # Verificar objetivos ligados a cofres
     try:
@@ -3582,11 +3628,16 @@ def enviar_saldos_reais(phone_raw, usuario):
             "WHERE usuario_id=:u AND concluido=FALSE ORDER BY id DESC LIMIT 3"),
             {'u': usuario.id}).fetchall()
         if objs:
-            msg += f"\n\n🎯 *Objetivos:*\n"
-            for desc_o, val_o, at_o in objs:
-                pct = round((at_o or 0)/val_o*100) if val_o else 0
-                barra = '█'*(pct//10) + '░'*(10-pct//10)
-                msg += f"{emoji_objetivo(desc_o)} {desc_o}: {barra} {pct}%\n"
+            # Filtrar objetivos com nomes válidos (não os de teste)
+            objs_validos = [(d,v,a) for d,v,a in objs
+                           if v and v > 0 and len(d) > 2
+                           and 'sabes' not in d.lower() and d.lower() not in ['novo','gasto','poupança']]
+            if objs_validos:
+                msg += f"\n\n🎯 *Objetivos:*\n"
+                for desc_o, val_o, at_o in objs_validos:
+                    pct = round((at_o or 0)/val_o*100) if val_o else 0
+                    barra = '█'*(pct//10) + '░'*(10-pct//10)
+                    msg += f"{emoji_objetivo(desc_o)} {desc_o}: {barra} {pct}%\n"
     except Exception:
         pass
     enviar_mensagem(phone_raw, msg)
