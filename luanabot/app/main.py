@@ -1454,26 +1454,36 @@ def api_banco_contas():
     if not headers:
         return jsonify({'error': 'Enable Banking não configurado'}), 500
     try:
-        # Buscar todas as contas ligadas
         bancos = db.session.execute(text(
-            "SELECT id, banco, account_id, saldo, atualizado FROM bancos_ligados WHERE ativo=TRUE")).fetchall()
+            "SELECT id, banco, account_id, saldo, atualizado FROM bancos_ligados WHERE ativo=TRUE AND account_id IS NOT NULL")).fetchall()
         resultado = []
         for bid, banco, acc_id, saldo, atualizado in bancos:
-            if not acc_id: continue
-            # Buscar detalhes da conta na API
-            r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                dados = r.json()
-                resultado.append({
-                    'banco': banco, 'account_id': acc_id,
-                    'saldo_guardado': saldo,
-                    'nome': dados.get('name') or dados.get('details') or '',
-                    'iban': dados.get('iban',''),
-                    'tipo': dados.get('product',''),
-                    'moeda': dados.get('currency',''),
-                    'raw': dados
-                })
-        return jsonify({'contas': resultado, 'total': len(resultado)})
+            info = {'banco': banco, 'account_id': acc_id, 'saldo': saldo, 'atualizado': str(atualizado) if atualizado else None}
+            # Tentar obter detalhes via API (pode falhar)
+            try:
+                r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/balances", headers=headers, timeout=10)
+                if r.status_code == 200:
+                    bals = r.json().get('balances', [])
+                    if bals:
+                        info['saldo_api'] = float(bals[0].get('balance_amount', {}).get('amount', 0))
+                        info['tipo_saldo'] = bals[0].get('balance_type','')
+            except Exception:
+                pass
+            # Tentar transações recentes para ver cofres
+            try:
+                r2 = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
+                    headers=headers, params={'limit': 5}, timeout=10)
+                if r2.status_code == 200:
+                    txs = r2.json().get('transactions', [])
+                    info['ultimas_transacoes'] = [{
+                        'desc': tx.get('remittance_information','') or tx.get('creditor_name',''),
+                        'valor': tx.get('transaction_amount',{}).get('amount',''),
+                        'data': tx.get('booking_date','')
+                    } for tx in txs[:3]]
+            except Exception:
+                pass
+            resultado.append(info)
+        return jsonify({'contas': resultado, 'total': len(resultado), 'nota': 'saldo=da BD, saldo_api=ao vivo'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
