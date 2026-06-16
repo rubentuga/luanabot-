@@ -3884,6 +3884,43 @@ def calcular_valor_seguro(usuario):
         pendentes = 0
     return disp, pendentes, max(disp - pendentes, 0)
 
+
+def ligar_objetivo_cofre(usuario_id, desc_objetivo):
+    """Tenta ligar um objetivo a um cofre do Revolut pelo nome."""
+    try:
+        # Procurar cofre com nome parecido
+        cofres = db.session.execute(text(
+            "SELECT id, banco, account_id FROM bancos_ligados "
+            "WHERE usuario_id=:u AND banco LIKE 'revolut_cofre_%' AND ativo=TRUE"),
+            {'u': usuario_id}).fetchall()
+        desc_lower = desc_objetivo.lower().replace(' ','_')
+        for cid, banco, acc_id in cofres:
+            nome_cofre = banco.replace('revolut_cofre_','').lower()
+            if nome_cofre in desc_lower or desc_lower in nome_cofre:
+                return acc_id, banco
+    except Exception:
+        pass
+    return None, None
+
+def saldo_cofre_objetivo(usuario_id, desc_objetivo):
+    """Lê o saldo real do cofre ligado a um objetivo."""
+    import requests as _r
+    acc_id, _ = ligar_objetivo_cofre(usuario_id, desc_objetivo)
+    if not acc_id:
+        return None
+    headers = _enable_headers()
+    if not headers:
+        return None
+    try:
+        r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/balances", headers=headers, timeout=10)
+        if r.status_code == 200:
+            bals = r.json().get('balances', [])
+            if bals:
+                return float(bals[0].get('balance_amount',{}).get('amount', 0))
+    except Exception:
+        pass
+    return None
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -6909,11 +6946,21 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
                 {'id':usuario.id}).fetchall()
             if not rows:
                 enviar_mensagem(phone_raw, "Nao tens objetivos ainda 🎯\nCria: 'quero poupar 500€ para ferias'"); return
-            msg = "🎯 Objetivos:\n\n"
-            for r in rows:
-                pct = int(r[2]/r[1]*100) if r[1]>0 else 0
+            msg = "🎯 *Objetivos:*\n\n"
+            for desc_r, val_r, at_r in rows:
+                at_real = at_r or 0
+                # Tentar saldo real do cofre
+                saldo_cofre = saldo_cofre_objetivo(usuario.id, desc_r)
+                if saldo_cofre is not None:
+                    at_real = saldo_cofre
+                    fonte = "🔄 ao vivo"
+                else:
+                    fonte = ""
+                pct = int(at_real/val_r*100) if val_r>0 else 0
                 barra = '█'*(pct//10) + '░'*(10-pct//10)
-                msg += f"📌 {r[0]}\n{barra} {pct}%\n{r[2]:.0f}€ de {r[1]:.0f}€\n\n"
+                em = emoji_objetivo(desc_r)
+                msg += f"{em} *{desc_r}*\n"
+                msg += f"{barra} {pct}% · {at_real:.0f}€ de {val_r:.0f}€ {fonte}\n\n"
             enviar_mensagem(phone_raw, msg)
         except Exception as e:
             log.error(f"objetivos: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
