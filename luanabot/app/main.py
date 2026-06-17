@@ -54,6 +54,171 @@ def add_cors(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
+@app.route('/api/despesa/editar', methods=['POST', 'OPTIONS'])
+def api_despesa_editar():
+    """Edita uma despesa por ID (descricao, valor, categoria)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    token = data.get('token', '')
+    did = data.get('id')
+    if not phone or token != phone[:8] + 'zef':
+        return jsonify({'error': 'unauthorized'}), 401
+    if not did:
+        return jsonify({'error': 'id obrigatorio'}), 400
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error': 'user not found'}), 404
+        d = Despesa.query.filter_by(id=did, usuario_id=usuario.id).first()
+        if not d:
+            return jsonify({'error': 'despesa not found'}), 404
+        if data.get('descricao') is not None:
+            d.descricao = data['descricao']
+        if data.get('valor') is not None:
+            d.valor = float(data['valor'])
+        if data.get('categoria') is not None:
+            d.categoria = data['categoria']
+        db.session.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"api_despesa_editar: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/despesa/apagar', methods=['POST', 'OPTIONS'])
+def api_despesa_apagar():
+    """Apaga uma despesa por ID."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    token = data.get('token', '')
+    did = data.get('id')
+    if not phone or token != phone[:8] + 'zef':
+        return jsonify({'error': 'unauthorized'}), 401
+    if not did:
+        return jsonify({'error': 'id obrigatorio'}), 400
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error': 'user not found'}), 404
+        d = Despesa.query.filter_by(id=did, usuario_id=usuario.id).first()
+        if not d:
+            return jsonify({'error': 'despesa not found'}), 404
+        db.session.delete(d)
+        db.session.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"api_despesa_apagar: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/reset', methods=['POST', 'OPTIONS'])
+def api_reset():
+    """Reset de dados financeiros do utilizador, mantendo a configuracao de gestao."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    token = data.get('token', '')
+    escopo = data.get('escopo', 'valores')  # 'valores' ou 'tudo'
+    if not phone or token != phone[:8] + 'zef':
+        return jsonify({'error': 'unauthorized'}), 401
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error': 'user not found'}), 404
+        uid = usuario.id
+        # Tabelas por usuario_id
+        tabelas_uid = ['saldos_contas', 'reserva_emergencia', 'dividas_pessoais',
+                       'objetivos_poupanca', 'marcos_objetivo', 'recorrentes',
+                       'pagamentos_agendados', 'conjunta_depositos', 'aportes_casal',
+                       'assinaturas', 'metas_categoria', 'km_combustivel', 'splitting']
+        if escopo == 'tudo':
+            tabelas_uid += ['wishlist', 'objetivos_casal']
+        for t in tabelas_uid:
+            try:
+                db.session.execute(text(f"DELETE FROM {t} WHERE usuario_id=:u"), {'u': uid})
+            except Exception as e:
+                log.warning(f"reset {t}: {e}")
+        # Tabelas por phone
+        for t in ['abastecimentos', 'picos']:
+            try:
+                db.session.execute(text(f"DELETE FROM {t} WHERE user_phone=:p"), {'p': phone})
+            except Exception as e:
+                log.warning(f"reset {t}: {e}")
+        # Despesas e receitas (modelos ORM)
+        try:
+            Despesa.query.filter_by(usuario_id=uid).delete()
+            Receita.query.filter_by(usuario_id=uid).delete()
+            DespesaFutura.query.filter_by(usuario_id=uid).delete()
+        except Exception as e:
+            log.warning(f"reset despesas/receitas: {e}")
+        db.session.commit()
+        return jsonify({'ok': True, 'escopo': escopo})
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"api_reset: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/conta', methods=['POST', 'OPTIONS'])
+def api_conta():
+    """Cria ou atualiza o saldo de uma conta manualmente."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    token = data.get('token', '')
+    conta = (data.get('conta') or '').strip()
+    valor = data.get('valor')
+    if not phone or token != phone[:8] + 'zef':
+        return jsonify({'error': 'unauthorized'}), 401
+    if not conta or valor is None:
+        return jsonify({'error': 'conta e valor obrigatorios'}), 400
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error': 'user not found'}), 404
+        db.session.execute(text(
+            "INSERT INTO saldos_contas (usuario_id, conta, valor) VALUES (:u, :c, :v) "
+            "ON CONFLICT (usuario_id, conta) DO UPDATE SET valor=:v, atualizado_em=NOW()"),
+            {'u': usuario.id, 'c': conta, 'v': float(valor)})
+        db.session.commit()
+        return jsonify({'ok': True, 'conta': conta, 'valor': float(valor)})
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"api_conta: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pico', methods=['POST', 'OPTIONS'])
+def api_pico():
+    """Adiciona horas extra (pico) manualmente."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.get_json() or {}
+    phone = data.get('phone', '')
+    token = data.get('token', '')
+    horas = data.get('horas')
+    datap = data.get('data', '')  # opcional YYYY-MM-DD
+    if not phone or token != phone[:8] + 'zef':
+        return jsonify({'error': 'unauthorized'}), 401
+    if horas is None:
+        return jsonify({'error': 'horas obrigatorio'}), 400
+    try:
+        if not datap:
+            datap = agora().strftime('%Y-%m-%d')
+        db.session.execute(text(
+            "INSERT INTO picos (user_phone, data, extra) VALUES (:p, :d, :e)"),
+            {'p': phone, 'd': datap, 'e': float(horas)})
+        db.session.commit()
+        return jsonify({'ok': True, 'horas': float(horas), 'data': datap})
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"api_pico: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/comando', methods=['POST'])
 def api_comando():
     """Executa comando como se fosse mensagem WhatsApp do utilizador."""
@@ -1815,7 +1980,7 @@ def api_dashboard():
 
     # Transações recentes (últimos 30 registos)
     transacoes = db.session.execute(text(
-        "SELECT descricao, valor, categoria, data FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
+        "SELECT descricao, valor, categoria, data, id FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
         {'id':usuario.id}).fetchall()
 
     nomes_mes_full = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
@@ -1835,7 +2000,7 @@ def api_dashboard():
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
         'dias_salario': dias_para_salario(usuario),
-        'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else ''} for r in transacoes],
+        'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
 
 # ─── MEDIA ───────────────────────────────────────────────────
