@@ -1342,6 +1342,19 @@ def api_saude():
             {'u': usuario.id}).fetchall()
         patrimonio = sum(s[1] for s in saldos)
 
+                # Construir lista de contas incluindo conjunta e reserva
+        contas_lista = [{'conta': s[0], 'valor': round(s[1], 2)} for s in saldos]
+        try:
+            saldo_conj = db.session.execute(text(
+                "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u"),
+                {'u': usuario.id}).scalar() or 0
+            if saldo_conj and saldo_conj != 0:
+                contas_lista.append({'conta': 'Conta Conjunta', 'valor': round(float(saldo_conj), 2), 'tipo': 'conjunta'})
+        except Exception as e:
+            log.warning(f"saldo conjunta api: {e}")
+        if reserva and reserva != 0:
+            contas_lista.append({'conta': 'Reserva de Emergência', 'valor': round(float(reserva), 2), 'tipo': 'reserva'})
+
         return jsonify({
             'score': score,
             'disponivel': round(disp, 2),
@@ -1350,7 +1363,7 @@ def api_saude():
             'salario': round(salario, 2),
             'poupanca_prevista': round(p.get('poupanca', 0), 2),
             'patrimonio': round(patrimonio, 2),
-            'contas': [{'conta': s[0], 'valor': round(s[1], 2)} for s in saldos]
+            'contas': contas_lista
         })
     except Exception as e:
         log.error(f"api_saude: {e}")
