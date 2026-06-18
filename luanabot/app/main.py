@@ -1870,32 +1870,46 @@ def api_banco_callback():
         def _get_uid(acc):
             if isinstance(acc, str): return acc
             return acc.get('uid') or acc.get('id') or acc.get('resourceId') or acc.get('account_id') or str(acc)
-        # Se accounts vazio, tentar buscar via /accounts?session_id=...
-        if not accounts and usuario_id and sessao:
+        # Se accounts vazio, guardar session_id e tentar buscar contas
+        session_id = sessao.get('session_id') or sessao.get('id') or ''
+        if not accounts and usuario_id and session_id:
             try:
                 import requests as _r3
                 _h3 = _enable_headers()
-                session_id = sessao.get('session_id') or sessao.get('id') or ''
-                if session_id and _h3:
-                    # Endpoint correto: GET /accounts com query param
-                    r_acc = _r3.get(f"{ENABLE_BASE}/accounts",
-                        params={"session_id": session_id},
-                        headers=_h3, timeout=20)
-                    log.info(f"Enable accounts fallback: {r_acc.status_code} {r_acc.text[:300]}")
-                    if r_acc.status_code == 200:
-                        acc_data = r_acc.json()
-                        accounts = acc_data if isinstance(acc_data, list) else acc_data.get('accounts', [])
-                    if not accounts:
-                        # Segunda tentativa: /accounts sem filtro (pega todos da app)
-                        r_acc2 = _r3.get(f"{ENABLE_BASE}/accounts", headers=_h3, timeout=20)
-                        log.info(f"Enable accounts fallback2: {r_acc2.status_code} {r_acc2.text[:500]}")
-                        if r_acc2.status_code == 200:
-                            acc_data2 = r_acc2.json()
-                            all_accs = acc_data2 if isinstance(acc_data2, list) else acc_data2.get('accounts', [])
-                            # Filtrar só os desta sessão
-                            accounts = [a for a in all_accs if a.get('session_id') == session_id] or all_accs
+                if _h3:
+                    # Enable Banking: GET /accounts?session_id=<id>
+                    for endpoint in [
+                        f"{ENABLE_BASE}/accounts?session_id={session_id}",
+                        f"{ENABLE_BASE}/sessions/{session_id}",
+                        f"{ENABLE_BASE}/sessions/{session_id}/accounts",
+                    ]:
+                        r_acc = _r3.get(endpoint, headers=_h3, timeout=20)
+                        log.info(f"Enable accounts try {endpoint}: {r_acc.status_code} {r_acc.text[:200]}")
+                        if r_acc.status_code == 200:
+                            acc_data = r_acc.json()
+                            # Pode vir como lista, dict com 'accounts', ou dict com dados da sessão
+                            if isinstance(acc_data, list):
+                                accounts = acc_data
+                            elif 'accounts' in acc_data:
+                                accounts = acc_data['accounts']
+                            elif 'uid' in acc_data or 'id' in acc_data:
+                                # É a conta em si
+                                accounts = [acc_data]
+                            if accounts:
+                                break
             except Exception as e:
                 log.error(f"Enable accounts fallback: {e}")
+        # Se ainda sem accounts, guardar session_id para tentar mais tarde
+        if not accounts and usuario_id and session_id:
+            try:
+                db.session.execute(text(
+                    "UPDATE bancos_ligados SET requisition_id=:s "
+                    "WHERE id=(SELECT id FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1)"),
+                    {'s': session_id, 'u': usuario_id})
+                db.session.commit()
+                log.info(f"Enable: session_id guardado para busca posterior: {session_id}")
+            except Exception as e:
+                log.error(f"Enable: guardar session_id: {e}")
         if accounts and usuario_id:
             u = Usuario.query.get(usuario_id)
             banco_base = db.session.execute(text(
