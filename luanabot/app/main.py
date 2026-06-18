@@ -1865,14 +1865,32 @@ def api_banco_callback():
             return "<h2>Não consegui criar a sessão. Tenta de novo.</h2>", 500
         accounts = sessao.get('accounts', [])
         session_id = sessao.get('session_id', '')
+        log.info(f"Enable callback: sessao={sessao}, accounts={accounts}, usuario_id={usuario_id}")
+        # Normalizar accounts — pode vir como lista de strings ou lista de dicts com uid/id/resourceId
+        def _get_uid(acc):
+            if isinstance(acc, str): return acc
+            return acc.get('uid') or acc.get('id') or acc.get('resourceId') or acc.get('account_id') or str(acc)
+        # Se accounts vazio, tentar buscar via API de accounts
+        if not accounts and usuario_id and sessao:
+            try:
+                import requests as _r3
+                _h3 = _enable_headers()
+                session_id = sessao.get('session_id') or sessao.get('id') or ''
+                if session_id and _h3:
+                    r_acc = _r3.get(f"{ENABLE_BASE}/sessions/{session_id}/accounts", headers=_h3, timeout=20)
+                    log.info(f"Enable accounts fallback: {r_acc.status_code} {r_acc.text[:300]}")
+                    if r_acc.status_code == 200:
+                        acc_data = r_acc.json()
+                        accounts = acc_data if isinstance(acc_data, list) else acc_data.get('accounts', [])
+            except Exception as e:
+                log.error(f"Enable accounts fallback: {e}")
         if accounts and usuario_id:
             u = Usuario.query.get(usuario_id)
-            # Guardar TODAS as contas (conta principal + conjunta + cofres)
             banco_base = db.session.execute(text(
                 "SELECT banco FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1"),
                 {'u': usuario_id}).scalar() or 'revolut'
-            # Primeiro account: atualizar a linha existente
-            acc_uid_0 = accounts[0].get('uid') if isinstance(accounts[0], dict) else accounts[0]
+            acc_uid_0 = _get_uid(accounts[0])
+            log.info(f"Enable callback: guardando account_id={acc_uid_0} banco={banco_base}")
             db.session.execute(text(
                 "UPDATE bancos_ligados SET account_id=:a, ativo=TRUE "
                 "WHERE id = (SELECT id FROM bancos_ligados WHERE usuario_id=:u ORDER BY id DESC LIMIT 1)"),
@@ -7618,7 +7636,6 @@ def processar_salarios_pendentes():
                 enviar_mensagem(phone_raw,
                     f"💰 Bom dia! O salário caiu na conta!\n"
                     f"Recebeste *{valor:.2f}€* 🎉")
-                # Gestão completa (regista receita + plano + verificações)
                 processar_receita(phone_raw, u, f"recebi {valor}")
                 try:
                     u.ultimo_salario_mes = f"{hoje.year}-{hoje.month:02d}"
@@ -7630,6 +7647,29 @@ def processar_salarios_pendentes():
                 log.info(f"Salário pendente processado: user {uid} = {valor}€")
             except Exception as e:
                 log.error(f"processar pendente {row_id}: {e}"); db.session.rollback()
+
+        # Fallback: utilizadores cujo dia de pagamento é hoje mas não puseram valor
+        try:
+            for u in Usuario.query.all():
+                if not u.phone or u.phone == PHONE_RUBEN: continue
+                pag = dia_pagamento_usuario(u, hoje.year, hoje.month)
+                if pag.date() != hoje.date(): continue
+                # Verificar se já processámos este mês
+                mes_atual = f"{hoje.year}-{hoje.month:02d}"
+                if u.ultimo_salario_mes == mes_atual: continue
+                # Verificar se tem salário pendente (já respondeu)
+                pendente = db.session.execute(text(
+                    "SELECT id FROM salarios_pendentes WHERE usuario_id=:u AND processado=FALSE"),
+                    {'u': u.id}).fetchone()
+                if pendente: continue
+                # Não respondeu — perguntar agora
+                set_estado(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')})
+                enviar_mensagem(f"{u.phone}@lid",
+                    f"Bom dia! 💰 Hoje é dia de receber o salário!\n"
+                    f"Já caiu na conta? Manda o valor ou o recibo 📄")
+                log.info(f"Fallback recibo enviado para {u.phone}")
+        except Exception as e:
+            log.error(f"fallback salarios: {e}")
 
 
 def alertas_preditivos():
