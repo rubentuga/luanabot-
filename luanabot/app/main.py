@@ -1870,18 +1870,30 @@ def api_banco_callback():
         def _get_uid(acc):
             if isinstance(acc, str): return acc
             return acc.get('uid') or acc.get('id') or acc.get('resourceId') or acc.get('account_id') or str(acc)
-        # Se accounts vazio, tentar buscar via API de accounts
+        # Se accounts vazio, tentar buscar via /accounts?session_id=...
         if not accounts and usuario_id and sessao:
             try:
                 import requests as _r3
                 _h3 = _enable_headers()
                 session_id = sessao.get('session_id') or sessao.get('id') or ''
                 if session_id and _h3:
-                    r_acc = _r3.get(f"{ENABLE_BASE}/sessions/{session_id}/accounts", headers=_h3, timeout=20)
+                    # Endpoint correto: GET /accounts com query param
+                    r_acc = _r3.get(f"{ENABLE_BASE}/accounts",
+                        params={"session_id": session_id},
+                        headers=_h3, timeout=20)
                     log.info(f"Enable accounts fallback: {r_acc.status_code} {r_acc.text[:300]}")
                     if r_acc.status_code == 200:
                         acc_data = r_acc.json()
                         accounts = acc_data if isinstance(acc_data, list) else acc_data.get('accounts', [])
+                    if not accounts:
+                        # Segunda tentativa: /accounts sem filtro (pega todos da app)
+                        r_acc2 = _r3.get(f"{ENABLE_BASE}/accounts", headers=_h3, timeout=20)
+                        log.info(f"Enable accounts fallback2: {r_acc2.status_code} {r_acc2.text[:500]}")
+                        if r_acc2.status_code == 200:
+                            acc_data2 = r_acc2.json()
+                            all_accs = acc_data2 if isinstance(acc_data2, list) else acc_data2.get('accounts', [])
+                            # Filtrar só os desta sessão
+                            accounts = [a for a in all_accs if a.get('session_id') == session_id] or all_accs
             except Exception as e:
                 log.error(f"Enable accounts fallback: {e}")
         if accounts and usuario_id:
