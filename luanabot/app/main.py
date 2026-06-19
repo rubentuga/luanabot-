@@ -4446,18 +4446,24 @@ def processar_texto(phone_raw, phone, texto):
             pares_detetados = _extrair_pares_valor_nome(texto, todos_nomes)
 
             if len(pares_detetados) >= 2:
-                # Registar todos de uma vez
+                # Registar todos de uma vez — objetivo + despesa (sai do disponível)
                 feedback = []
+                total_apartado = 0
                 for nome_p, valor_p in pares_detetados.items():
                     try:
                         db.session.execute(text(
                             "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u,:d,:v,0)"),
                             {'u':usuario.id,'d':f'🎁 Prenda {nome_p}','v':valor_p})
+                        db.session.add(Despesa(usuario_id=usuario.id, valor=valor_p,
+                            descricao=f'🎁 Prenda {nome_p} (apartado)', categoria='presentes',
+                            data=agora().replace(tzinfo=None)))
                         feedback.append(f"💝 {nome_p}: {valor_p:.0f}€")
+                        total_apartado += valor_p
                     except Exception: pass
                 db.session.commit()
-                enviar_mensagem(phone_raw, "✅ Apartado!\n" + "\n".join(feedback) + "\nVê em 'objetivos' 🎁")
-                # Remover da fila os que já foram tratados
+                enviar_mensagem(phone_raw,
+                    "✅ Apartado!\n" + "\n".join(feedback) +
+                    f"\n💳 Total {total_apartado:.0f}€ já saiu do disponível\nVê em 'objetivos' 🎁")
                 fila_restante = [a for a in fila_aniv if a['nome'] not in pares_detetados]
                 _avancar_fila_aniversarios(phone_raw, phone, fila_restante)
                 return
@@ -4476,8 +4482,11 @@ def processar_texto(phone_raw, phone, texto):
                     db.session.execute(text(
                         "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u,:d,:v,0)"),
                         {'u':usuario.id,'d':f'🎁 Prenda {nome_aniv}','v':valor_prenda})
+                    db.session.add(Despesa(usuario_id=usuario.id, valor=valor_prenda,
+                        descricao=f'🎁 Prenda {nome_aniv} (apartado)', categoria='presentes',
+                        data=agora().replace(tzinfo=None)))
                     db.session.commit()
-                    enviar_mensagem(phone_raw, f"💝 Apartei {valor_prenda:.0f}€ para a prenda do(a) {nome_aniv}!\nVê em 'objetivos' 🎁")
+                    enviar_mensagem(phone_raw, f"💝 Apartei {valor_prenda:.0f}€ para a prenda do(a) {nome_aniv}!\n💳 Já saiu do disponível deste mês\nVê em 'objetivos' 🎁")
                 except Exception: enviar_mensagem(phone_raw, "Erro 😕")
             _avancar_fila_aniversarios(phone_raw, phone, fila_aniv)
             return
