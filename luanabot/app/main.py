@@ -710,6 +710,72 @@ def categorizar_ia(texto):
         log.error(f"categorizar_ia: {e}")
     return 'outros', '💳', 'Gasto'
 
+
+FIXO_KEYWORDS = {
+    'mae': ['mae','mãe'],
+    'carro': ['carro','taigo','prestacao','prestação','seguro carro'],
+    'credito1': ['credito bpi','crédito bpi','credito1'],
+    'credito2': ['credito revolut','crédito revolut','credito2'],
+    'combustivel': ['gasolina','combustivel','combustível','abasteci','galp','bp ','repsol','cepsa'],
+    'ordem': ['ordem'],
+    'unhas': ['unhas','manicure'],
+}
+FIXO_META_KEYS = {'total_fixos','salario','fundo','sobra','gastar','poupanca','modo','subsidio','despesas_mes'}
+
+def verificar_fixos_completos(usuario, p):
+    """Verifica se TODOS os fixos do mês já foram pagos. Devolve True só na 1ª vez que completar."""
+    mes = agora().month; ano = agora().year
+    chaves_fixos = [k for k in p.keys() if k not in FIXO_META_KEYS and p.get(k, 0) > 0]
+    if not chaves_fixos:
+        return False
+    try:
+        despesas_mes = db.session.execute(text(
+            "SELECT descricao, categoria FROM despesas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:a"),
+            {'u': usuario.id, 'm': mes, 'a': ano}).fetchall()
+    except Exception:
+        return False
+    pagos = set()
+    for desc, cat in despesas_mes:
+        texto_check = ((desc or '') + ' ' + (cat or '')).lower()
+        for chave in chaves_fixos:
+            if chave in pagos: continue
+            kws = FIXO_KEYWORDS.get(chave, [chave])
+            if any(kw in texto_check for kw in kws):
+                pagos.add(chave)
+    # Conjunta conta-se separadamente (tabela própria)
+    if 'conjunta' in chaves_fixos and 'conjunta' not in pagos:
+        try:
+            tem_dep = db.session.execute(text(
+                "SELECT COUNT(*) FROM conjunta_depositos WHERE usuario_id=:u "
+                "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:a"),
+                {'u': usuario.id, 'm': mes, 'a': ano}).scalar()
+            if tem_dep:
+                pagos.add('conjunta')
+        except Exception:
+            pass
+    if pagos != set(chaves_fixos):
+        return False
+    # Já completou — verificar se é a primeira vez a avisar este mês
+    mes_chave = f"{ano}-{mes:02d}"
+    try:
+        ja_avisado = db.session.execute(text(
+            "SELECT dados->>'fixos_completos_mes' FROM estado_utilizador WHERE phone=:p"),
+            {'p': usuario.phone}).scalar()
+        if ja_avisado == mes_chave:
+            return False
+        db.session.execute(text(
+            "INSERT INTO estado_utilizador (phone, estado, dados, atualizado) "
+            "VALUES (:p, 'normal', jsonb_build_object('fixos_completos_mes', :mc), NOW()) "
+            "ON CONFLICT (phone) DO UPDATE SET dados = COALESCE(estado_utilizador.dados,'{}'::jsonb) || jsonb_build_object('fixos_completos_mes', :mc)"),
+            {'p': usuario.phone, 'mc': mes_chave})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"verificar_fixos_completos marcar: {e}")
+        db.session.rollback()
+        return False
+    return True
+
 def categorizar(texto):
     t = texto.lower()
     aprendidas = carregar_aprendidas()
@@ -951,14 +1017,19 @@ def calcular_disponivel(usuario):
     # Fixos já deduzidos no plano — só conta o EXCESSO acima do orçamento
     # Ex: gasolina orçamento=50€, gastou 70€ → só conta 20€ no disponível
     fixos_usuario = p  # já tem os fixos calculados
-    combustivel_orcamento = fixos_usuario.get('combustivel', 0)
-    combustivel_real = db.session.query(db.func.sum(Despesa.valor)).filter(
-        Despesa.usuario_id==usuario.id,
-        Despesa.categoria=='combustivel',
-        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
-    ).scalar() or 0
-    # Desconto: os fixos já estão no plano, só o excesso afeta o disponível
-    desconto_fixos = min(combustivel_real, combustivel_orcamento)
+    # Mapa: chave do fixo -> categoria de despesa correspondente
+    FIXO_CATEGORIA = {'combustivel': 'combustivel', 'unhas': 'pessoal'}
+    desconto_fixos = 0
+    for chave_fixo, cat_desp in FIXO_CATEGORIA.items():
+        orcamento = fixos_usuario.get(chave_fixo, 0)
+        if orcamento <= 0:
+            continue
+        real = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            Despesa.categoria==cat_desp,
+            db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        ).scalar() or 0
+        desconto_fixos += min(real, orcamento)
     gastos = gastos_raw - desconto_fixos
     # Dinheiro extra que entrou este mes ("meti X na conta") soma ao disponivel
     extras = db.session.query(db.func.sum(Receita.valor)).filter(
@@ -1113,7 +1184,7 @@ def webhook():
                             enviar_mensagem(phone_raw,
                                 f"📸 Vi: _{resultado}_\n\n"
                                 f"É *pessoal* ou *conjunta*?\n_Diz_ *ignora* _para cancelar_")
-                            return jsonify({{'status':'ok'}})
+                            return jsonify({'status':'ok'})
                         texto = resultado
                 else:
                     u_temp = Usuario.query.filter_by(phone=phone).first()
@@ -4677,6 +4748,28 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, "Erro ao registar 😕")
             return
 
+        if estado == 'objetivo_valor_pendente':
+            d_pend = dados_estado
+            valor_pend = extrair_valor(texto)
+            if valor_pend == 0:
+                enviar_mensagem(phone_raw, "Preciso de um número 🙂 Ex: 200€"); return
+            limpar_estado(phone)
+            emoji_d = emoji_objetivo(d_pend.get('desc','')) if d_pend.get('desc') else '🎯'
+            set_estado(phone, 'objetivo_tudo', {'valor': valor_pend, 'desc': d_pend.get('desc',''), 'emoji': emoji_d})
+            desc_txt = f" para *{d_pend['desc']}*" if d_pend.get('desc') else ""
+            msg = f"{emoji_d} *Novo objetivo: {valor_pend:.0f}€*{desc_txt}\n\n"
+            msg += f"Conta-me numa mensagem:\n"
+            if not d_pend.get('desc'):
+                msg += f"📝 *Para quê* (ex: Viagem, PS5)\n"
+            msg += f"📅 *Até quando* (ex: dezembro, daqui a 6 meses)\n"
+            msg += f"💰 *Quanto já tens* (ou diz que não tens)\n\n"
+            if d_pend.get('conjunto'):
+                msg += f"_(já percebi que é com o teu par 💑)_"
+            else:
+                msg += f"_Se for a dois, diz \"com a Luana\" 💑_"
+            enviar_mensagem(phone_raw, msg)
+            return
+
         if estado == 'objetivo_tudo':
             d = dados_estado
             valor_obj = d.get('valor', 0)
@@ -5306,6 +5399,8 @@ def processar_texto(phone_raw, phone, texto):
                           'recebi o','prémio','premio','comissao','comissão','duodecimo','duodécimo',
                           'subsidio','subsídio','caiu na conta','ja caiu','já caiu','ja entrou','já entrou']
         if any(p in t for p in verbos_receita) and tem_numero(texto):
+            if eh_dinheiro_extra(t):
+                processar_dinheiro_extra(phone_raw, usuario, texto); return
             processar_receita(phone_raw, usuario, texto); return
 
         # ── RESUMO POR PESSOA ──
@@ -5781,6 +5876,13 @@ def processar_despesa(phone_raw, usuario, texto):
     elif categoria=='combustivel' and total_cat>BASE_COMBUSTIVEL:
         excesso_g = total_cat - BASE_COMBUSTIVEL
         msg += f"\n⚠️ Já gastaste {total_cat:.0f}€ em gasolina (orçamento {BASE_COMBUSTIVEL}€) — *{excesso_g:.0f}€ acima!*"
+    elif categoria=='pessoal':
+        orcamento_unhas = get_fixos_usuario(usuario.phone, agora().month, usuario.id).get('unhas', 0)
+        if orcamento_unhas > 0 and total_cat > orcamento_unhas:
+            excesso_u = total_cat - orcamento_unhas
+            msg += f"\n⚠️ Foi {excesso_u:.0f}€ a mais que o previsto nos fixos ({orcamento_unhas:.0f}€) — só esse valor saiu do para gastar!"
+        elif orcamento_unhas > 0 and total_cat <= orcamento_unhas:
+            msg += f"\n✅ Dentro do orçamento dos fixos ({orcamento_unhas:.0f}€) — não saiu nada do para gastar!"
     elif agora().weekday() in [4,5] and agora().hour>=20 and categoria in ['restaurante','fastfood','cafe'] and not _d_rel and 'almoc' not in texto.lower() and 'almoç' not in texto.lower():
         msg += "\n🍻 Noite de fim de semana! Aproveita 😎"
     elif total_cat_ant>0 and total_cat>total_cat_ant*1.3:
@@ -5797,7 +5899,43 @@ def processar_despesa(phone_raw, usuario, texto):
     enviar_mensagem(phone_raw, msg)
     verificar_badges(usuario, phone_raw)
 
+    # Verificar se completou TODOS os fixos do mês
+    try:
+        _, p_check = calcular_disponivel(usuario)
+        if verificar_fixos_completos(usuario, p_check):
+            enviar_mensagem(phone_raw, "🎉 *Pagaste todos os fixos deste mês!* Tás em dia com tudo 💪")
+    except Exception as e:
+        log.error(f"check fixos completos: {e}")
+
 # ─── RECEITA / PLANO ─────────────────────────────────────────
+
+def eh_dinheiro_extra(t):
+    """Deteta dinheiro avulso (prendas, avós, amigos) que NÃO é o salário."""
+    fontes_extra = ['avo','avó','avô','avos','avós','padrinho','madrinha','tio','tia',
+                     'presente','prenda','rifa','sorteio','reembolso de','devolveram',
+                     'amigo','amiga','colega','emprestimo','empréstimo','vendi','venda']
+    fontes_salario = ['ordenado','salario','salário','vencimento','duodecimo','duodécimo',
+                       'subsidio','subsídio','entidade','empresa','trabalho','patrao','patrão']
+    tem_extra = any(f in t for f in fontes_extra)
+    tem_salario = any(f in t for f in fontes_salario)
+    return tem_extra and not tem_salario
+
+def processar_dinheiro_extra(phone_raw, usuario, texto):
+    """Regista dinheiro avulso (não-salário) — soma ao disponível sem tocar no plano mensal."""
+    valor = extrair_valor(texto)
+    if valor == 0:
+        enviar_mensagem(phone_raw, "Quanto recebeste? 💰"); return
+    try:
+        db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Extra',
+                                data=agora().replace(tzinfo=None)))
+        db.session.commit()
+        enviar_mensagem(phone_raw,
+            f"🎁 +{valor:.0f}€ registado!\n"
+            f"Já está disponível para gastar — não afeta o teu plano do salário 😊")
+    except Exception as e:
+        log.error(f"processar_dinheiro_extra: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro 😕")
+
 def processar_receita(phone_raw, usuario, texto):
     valor = extrair_valor(texto)
     limpar_salarios_pendentes(usuario.id)  # evita duplo registo pelo job das 9h
@@ -6220,6 +6358,14 @@ def registar_deposito_conjunta(phone_raw, usuario, texto):
         f"💑 *+{valor:.0f}€ na conjunta!* ✅\n"
         f"{'📌 '+desc+chr(10) if not is_fixo else ''}"
         f"A avisar o {outro_nome}… 🔔")
+
+    # Verificar se completou TODOS os fixos do mês
+    try:
+        _, p_check2 = calcular_disponivel(usuario)
+        if verificar_fixos_completos(usuario, p_check2):
+            enviar_mensagem(phone_raw, "🎉 *Pagaste todos os fixos deste mês!* Tás em dia com tudo 💪")
+    except Exception as e:
+        log.error(f"check fixos completos conjunta: {e}")
 
 
 def nomes_mes_curto(mes):
@@ -7659,15 +7805,23 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
         return
 
     valor = extrair_valor(texto)
-    if valor == 0:
-        enviar_mensagem(phone_raw, "Quanto queres poupar? Ex: 'quero poupar 500€ para ferias'"); return
     desc = 'Objetivo'
-    m_para = re.search(r'para\s+(?:um |uma |o |a |uns |umas )?([a-zà-ú][a-zà-úA-ZÀ-Ú\s]{2,30})', texto, re.IGNORECASE)
+    m_para = re.search(r'para\s+(?:ir a |um |uma |o |a |uns |umas )?([a-zà-ú][a-zà-úA-ZÀ-Ú]+(?:\s+[a-zà-ú][a-zà-úA-ZÀ-Ú]+)?)(?=\s+(?:em|no|na|com|daqui|ate|para)\b|[.,!?]|$)', texto, re.IGNORECASE)
     if m_para and '?' not in texto:
         candidato = m_para.group(1).strip()
         stop_frase = ['sabes','quero','que ','isso','aquilo','isto','ver eles','poupar']
         if not any(s in candidato.lower() for s in stop_frase):
             desc = candidato[:30].capitalize()
+    eh_conjunto_pre = any(p in texto.lower() for p in ['luana','ruben','casal','juntos','conjunto','nós','nos dois','comigo'])
+
+    if valor == 0:
+        # Guardar o que já sabemos e esperar o valor na próxima mensagem
+        phone_pend = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+        set_estado(phone_pend, 'objetivo_valor_pendente',
+                   {'desc': desc if desc != 'Objetivo' else '', 'conjunto': eh_conjunto_pre})
+        desc_q = f' para *{desc}*' if desc != 'Objetivo' else ''
+        enviar_mensagem(phone_raw, f"💰 Quanto queres poupar{desc_q}?")
+        return
 
     # Perguntar TUDO de uma vez (estilo GranaZen) — depois parseia a resposta completa
     phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
