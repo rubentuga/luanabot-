@@ -942,12 +942,24 @@ def calcular_disponivel(usuario):
     ja_recebeu = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
     salario_efetivo = (usuario.salario_liquido or 0) if ja_recebeu else 0
     p = calcular_plano(salario_efetivo, modo, futuras, phone=usuario.phone, usuario_id=usuario.id)
-    gastos = db.session.query(db.func.sum(Despesa.valor)).filter(
+    gastos_raw = db.session.query(db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%'),
         ~Despesa.descricao.like('[reserva]%'),
     ).scalar() or 0
+    # Fixos já deduzidos no plano — só conta o EXCESSO acima do orçamento
+    # Ex: gasolina orçamento=50€, gastou 70€ → só conta 20€ no disponível
+    fixos_usuario = p  # já tem os fixos calculados
+    combustivel_orcamento = fixos_usuario.get('combustivel', 0)
+    combustivel_real = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id==usuario.id,
+        Despesa.categoria=='combustivel',
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+    ).scalar() or 0
+    # Desconto: os fixos já estão no plano, só o excesso afeta o disponível
+    desconto_fixos = min(combustivel_real, combustivel_orcamento)
+    gastos = gastos_raw - desconto_fixos
     # Dinheiro extra que entrou este mes ("meti X na conta") soma ao disponivel
     extras = db.session.query(db.func.sum(Receita.valor)).filter(
         Receita.usuario_id==usuario.id,
@@ -1303,6 +1315,30 @@ def api_debug():
         resultados['carro_consumo'] = f'ERRO: {type(e).__name__}'
 
     return jsonify(resultados)
+
+@app.route('/api/sync-saldos', methods=['GET'])
+def api_sync_saldos():
+    """Força atualização dos saldos reais (Revolut via Enable Banking) e devolve as contas."""
+    token = request.args.get('token','')
+    phone = request.args.get('phone','')
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario:
+            return jsonify({'error':'not found'}), 404
+        try:
+            enable_atualizar_saldos(usuario, silencioso=True)
+        except Exception as e:
+            log.error(f"sync-saldos enable {phone}: {e}")
+        saldos = db.session.execute(text(
+            "SELECT conta, valor FROM saldos_contas WHERE usuario_id=:u ORDER BY valor DESC"),
+            {'u': usuario.id}).fetchall()
+        return jsonify({'ok': True, 'contas': [{'conta': s[0], 'valor': round(float(s[1] or 0), 2)} for s in saldos]})
+    except Exception as e:
+        log.error(f"sync-saldos {phone}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/saude', methods=['GET'])
 def api_saude():
@@ -2035,6 +2071,15 @@ def api_dashboard():
         "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
         {'id':usuario.id}).fetchall()
 
+    # Compromissos / pagamentos agendados (para o dashboard mostrar "dia X tenho Y")
+    try:
+        compromissos = db.session.execute(text(
+            "SELECT nome, COALESCE(valor, valor_medio, 0), dia_mes, categoria FROM pagamentos_agendados "
+            "WHERE usuario_id=:id AND ativo=TRUE ORDER BY dia_mes ASC"),
+            {'id':usuario.id}).fetchall()
+    except Exception:
+        compromissos = []
+
     # Transações recentes (últimos 30 registos)
     transacoes = db.session.execute(text(
         "SELECT descricao, valor, categoria, data, id FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
@@ -2056,6 +2101,7 @@ def api_dashboard():
         'wishlist': [{'nome': r[0], 'preco': r[1], 'marca': r[2], 'cat': r[3]} for r in wishlist],
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
+        'compromissos': [{'nome': r[0], 'valor': round(float(r[1] or 0), 2), 'dia': r[2], 'dia_mes': r[2], 'cat': r[3]} for r in compromissos],
         'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
@@ -4202,6 +4248,131 @@ def saldo_cofre_objetivo(usuario_id, desc_objetivo):
         pass
     return None
 
+
+
+# ─── DETEÇÃO AUTOMÁTICA DE TRANSAÇÕES REVOLUT ──────────────────────────
+def enable_buscar_transacoes_recentes(usuario, minutos=35):
+    """Busca transações do Revolut dos últimos N minutos."""
+    import requests as _r
+    from datetime import timezone as _tz
+    headers = _enable_headers()
+    if not headers:
+        return []
+    try:
+        # Buscar contas Revolut pessoal
+        contas = db.session.execute(text(
+            "SELECT account_id, banco FROM bancos_ligados "
+            "WHERE usuario_id=:u AND ativo=TRUE AND account_id IS NOT NULL "
+            "AND banco NOT LIKE '%cofre%' AND banco NOT LIKE '%conjunta%'"),
+            {'u': usuario.id}).fetchall()
+        if not contas:
+            return []
+        todas_txs = []
+        agora_utc = agora()
+        desde = agora_utc - timedelta(minutes=minutos)
+        for acc_id, banco in contas:
+            try:
+                r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
+                    headers=headers,
+                    params={
+                        'date_from': desde.strftime('%Y-%m-%dT%H:%M:%S'),
+                        'date_to': agora_utc.strftime('%Y-%m-%dT%H:%M:%S'),
+                    }, timeout=15)
+                if r.status_code == 200:
+                    txs = r.json().get('transactions', [])
+                    for tx in txs:
+                        tx['_banco'] = banco
+                    todas_txs.extend(txs)
+            except Exception as e:
+                log.error(f"enable_txs {banco}: {e}")
+        return todas_txs
+    except Exception as e:
+        log.error(f"enable_buscar_txs: {e}")
+        return []
+
+def tx_ja_registada(usuario_id, tx_id, valor, desc, data_tx):
+    """Verifica se esta transação já foi registada (por ID externo ou por match desc+valor+data)."""
+    try:
+        # Verificar por transaction_id externo
+        if tx_id:
+            existe = db.session.execute(text(
+                "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u AND descricao LIKE :tid"),
+                {'u': usuario_id, 'tid': f'%[txid:{tx_id}]%'}).scalar()
+            if existe:
+                return True
+        # Verificar por match desc+valor dentro de ±2h
+        from datetime import timezone as _tz
+        data_dt = datetime.fromisoformat(data_tx.replace('Z','')) if isinstance(data_tx, str) else data_tx
+        existe2 = db.session.execute(text(
+            "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u "
+            "AND ABS(valor - :v) < 0.01 "
+            "AND data BETWEEN :d1 AND :d2 "
+            "AND descricao ILIKE :desc"),
+            {'u': usuario_id, 'v': abs(valor),
+             'd1': data_dt - timedelta(hours=2),
+             'd2': data_dt + timedelta(hours=2),
+             'desc': f'%{desc[:15]}%' if desc else '%'}).scalar()
+        return bool(existe2)
+    except Exception as e:
+        log.error(f"tx_ja_registada: {e}")
+        return False
+
+def processar_tx_revolut_auto(phone_raw, usuario, tx):
+    """Processa uma transação Revolut detetada automaticamente."""
+    valor_raw = tx.get('transaction_amount', {}).get('amount', 0)
+    valor = float(valor_raw) if valor_raw else 0
+    # Só despesas (valores negativos ou créditos de lojas)
+    if valor >= 0:
+        return  # receita ou transferência positiva — ignorar
+    valor = abs(valor)
+    desc = (tx.get('creditor_name') or tx.get('remittance_information') or
+            tx.get('additional_information') or 'Pagamento Revolut').strip()
+    tx_id = tx.get('transaction_id') or tx.get('internal_transaction_id') or ''
+    data_tx = tx.get('booking_date') or tx.get('value_date') or agora().isoformat()
+
+    # Verificar se já foi registada
+    if tx_ja_registada(usuario.id, tx_id, valor, desc, data_tx):
+        return
+
+    # Categorizar
+    cat, loja, _ = categorizar(desc)
+    loja_n = loja or desc[:30]
+    em = EMOJI_CAT.get(cat, '💳')
+
+    # Registar automaticamente
+    try:
+        desc_bd = f"{loja_n} [txid:{tx_id}]" if tx_id else loja_n
+        db.session.add(Despesa(
+            usuario_id=usuario.id, valor=valor,
+            descricao=desc_bd, categoria=cat,
+            data=agora().replace(tzinfo=None)))
+        db.session.commit()
+        log.info(f"Tx Revolut auto: {loja_n} {valor}€ → {cat}")
+    except Exception as e:
+        log.error(f"registar tx auto: {e}")
+        db.session.rollback()
+        return
+
+    # Notificar utilizador
+    enviar_mensagem(phone_raw,
+        f"{em} *{loja_n}* — {valor:.2f}€\n"
+        f"💜 Detetado no Revolut e registado automaticamente!\n"
+        f"_Diz 'corrige' se a categoria estiver errada_")
+
+def sincronizar_revolut():
+    """Job a cada 30 min: deteta novas transações Revolut e regista automaticamente."""
+    with app.app_context():
+        for u in Usuario.query.all():
+            if not u.phone: continue
+            try:
+                phone_raw = f"{u.phone}@lid"
+                txs = enable_buscar_transacoes_recentes(u, minutos=35)
+                for tx in txs:
+                    processar_tx_revolut_auto(phone_raw, u, tx)
+            except Exception as e:
+                log.error(f"sincronizar_revolut {u.phone}: {e}")
+
+
 # ─── PROCESSAR TEXTO ─────────────────────────────────────────
 def processar_texto(phone_raw, phone, texto):
     try:
@@ -4949,7 +5120,7 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in gasolina_keywords) or e_municipio_gas or e_na_local:
             gasolina_barata(phone_raw, t); return
 
-        if any(p in t for p in ['recebemos','metemos','depositamos','deposito']) and 'conjunta' in t and tem_numero(texto):
+        if any(p in t for p in ['recebemos','metemos','depositamos','deposito','meti','coloquei','pus','transferi']) and 'conjunta' in t and tem_numero(texto):
             registar_deposito_conjunta(phone_raw, usuario, texto); return
         # Gasto conjunta sem descricao clara — perguntar em que
         if 'conjunta' in t and tem_numero(texto) and not any(p in t for p in ['quanto','tenho','sobra','resta','ver','recebemos','metemos','depositamos']):
@@ -5897,38 +6068,51 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
     import datetime as _dt
     saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
     msg = f"💳 *Tens {saldo_variavel:.0f}€ para gastar*"
-    if saldo_variavel < 0:
-        msg = f"⚠️ *Estás {abs(saldo_variavel):.0f}€ no vermelho!*"
-    elif saldo_variavel < 50:
-        msg += " 😬"
-    msg += "\n"
+    is_ruben = usuario.phone == PHONE_RUBEN
+
+    msg = ""
+
+    # Ruben: saldo real Revolut + calculado
+    if is_ruben:
+        if saldo_rev_real is not None:
+            msg += f"💜 Revolut: *{saldo_rev_real:.2f}€* _(saldo real)_\n"
+        if saldo_variavel >= 0:
+            cor = "😊" if saldo_variavel > 200 else ("😬" if saldo_variavel < 50 else "👍")
+            msg += f"💳 Para gastar: *{saldo_variavel:.0f}€* _(com o que me disseste)_ {cor}\n"
+        else:
+            msg += f"⚠️ *Estás {abs(saldo_variavel):.0f}€ no vermelho!*\n"
+    else:
+        # Luana: só calculado
+        if saldo_variavel < 0:
+            msg += f"⚠️ *Estás {abs(saldo_variavel):.0f}€ no vermelho!*\n"
+        else:
+            cor = "😊" if saldo_variavel > 200 else ("😬" if saldo_variavel < 50 else "👍")
+            msg += f"💳 Para gastar: *{saldo_variavel:.0f}€* {cor}\n"
+
+    # Conjunta — saldo real Revolut
+    if saldo_conj_real is not None and saldo_conj_real > 0:
+        msg += f"💑 Conjunta: *{saldo_conj_real:.2f}€*\n"
+    elif total_dep_q > 0:
+        msg += f"💑 Conjunta: *{resta_conj:.0f}€*\n"
+
+    # Reserva
+    if reserva > 0:
+        msg += f"🛡️ Reserva: *{reserva:.0f}€*\n"
+
+    # Poupança
+    if p.get('poupanca', 0) > 0:
+        msg += f"💎 Poupança: *{p['poupanca']:.0f}€*\n"
+
+    # Dias até salário — no fim
     if dias > 0 and saldo_variavel > 0:
+        import datetime as _dt
         dia_pag = agora().date() + _dt.timedelta(days=dias)
         nome_dia = ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'][dia_pag.weekday()]
-        msg += f"📅 {dias} dias · {nome_dia} {dia_pag.day} · ~{saldo_variavel/dias:.0f}€/dia\n"
-    # Conjunta
-    if saldo_conj_real is not None and saldo_conj_real > 0:
-        msg += f"\n💑 Conjunta:  {saldo_conj_real:.2f}€"
-    elif total_dep_q > 0:
-        msg += f"\n💑 Conjunta:  {resta_conj:.0f}€"
-    # Reserva de emergência
-    if reserva > 0:
-        msg += f"\n🛡️ Reserva:  {reserva:.0f}€"
-    # Poupança prevista
-    if p.get('poupanca', 0) > 0:
-        msg += f"\n💎 Poupança:  {p['poupanca']:.0f}€"
-    # Outras contas manuais (saldos_contas)
-    try:
-        outras = db.session.execute(text(
-            "SELECT conta, saldo FROM saldos_contas WHERE usuario_id=:u AND conta NOT IN ('revolut','conjunta') ORDER BY conta"),
-            {'u': usuario.id}).fetchall()
-        for conta_o, saldo_o in outras:
-            if saldo_o and saldo_o > 0:
-                emoji_c = '🏦' if 'bankinter' in conta_o.lower() or 'trade' in conta_o.lower() else '💳'
-                msg += f"\n{emoji_c} {conta_o.capitalize()}:  {saldo_o:.0f}€"
-    except: pass
-    msg += f"\n\n📊 zedasfinancas.netlify.app/#saldos"
+        msg += f"\n📅 {dias} dias · {nome_dia} {dia_pag.day} · ~{saldo_variavel/dias:.0f}€/dia\n"
+
+    msg += f"\n📊 zedasfinancas.netlify.app/#saldos"
     enviar_mensagem(phone_raw, msg)
+
 
 def registar_deposito_conjunta(phone_raw, usuario, texto):
     valor = extrair_valor(texto)
@@ -5947,11 +6131,27 @@ def registar_deposito_conjunta(phone_raw, usuario, texto):
         log.error(f"deposito_conjunta: {e}"); db.session.rollback()
         enviar_mensagem(phone_raw, "Erro 😕"); return
     meu_nome = NOMES_CASAL.get(usuario.phone, 'O parceiro')
-    notificar_parceiro(usuario.phone, f"💑 {meu_nome} adicionou {valor:.0f}€ à conjunta ({desc})")
+    # Verificar se é o depósito mensal fixo (perto do valor fixo configurado)
+    fixo_conj = 50  # valor fixo da conjunta
+    is_fixo = abs(valor - fixo_conj) <= 5
+    meu_nome_curto = meu_nome.replace('O ','').replace('A ','')
+    outro_nome = 'Luana' if usuario.phone == PHONE_RUBEN else 'Ruben'
+    
+    # Notificar parceiro
+    if is_fixo:
+        notificar_parceiro(usuario.phone,
+            f"💑 *{meu_nome_curto} já meteu os {valor:.0f}€ na conjunta!*\n"
+            f"Já meteste os teus? 😊")
+    else:
+        notificar_parceiro(usuario.phone,
+            f"💑 {meu_nome_curto} adicionou {valor:.0f}€ à conjunta\n"
+            f"📌 {desc}")
+    
+    # Confirmar ao próprio
     enviar_mensagem(phone_raw,
-        f"💑 +{valor:.0f}€ adicionado à conjunta!\n"
-        f"📌 {desc}\n"
-        f"Diz 'quanto tenho na conjunta' para ver o saldo 💚")
+        f"💑 *+{valor:.0f}€ na conjunta!* ✅\n"
+        f"{'📌 '+desc+chr(10) if not is_fixo else ''}"
+        f"A avisar o {outro_nome}… 🔔")
 
 
 def nomes_mes_curto(mes):
@@ -8449,6 +8649,7 @@ else:
     scheduler.add_job(verificar_despesas_futuras, 'cron', hour=8,  minute=0)
     scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
     scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
+    scheduler.add_job(sincronizar_revolut,        'interval', minutes=30)
     scheduler.add_job(watchdog_waha,              'interval', minutes=10)
     scheduler.start()
 log.info("Ze das Financas v7 iniciado")
