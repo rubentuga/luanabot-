@@ -2731,6 +2731,44 @@ def simular_compra(phone_raw, usuario, texto):
 
 # ─── ANIVERSÁRIO AO RECEBER SALÁRIO ──────────────────────────
 
+
+def _extrair_pares_valor_nome(texto, nomes):
+    """Extrai pares nome+valor de frases como '20 sogra 100 taty' ou 'sogra 20 taty 100',
+    associando cada número ao nome mais próximo no texto. Devolve dict {nome: valor}."""
+    import re as _re
+    t_lower = texto.lower()
+    pos_nomes = []
+    for nome in nomes:
+        idx = t_lower.find(nome.lower())
+        if idx >= 0:
+            pos_nomes.append((idx, idx + len(nome), nome))
+    pos_numeros = []
+    for m in _re.finditer(r'(\d+(?:[.,]\d+)?)', texto):
+        pos_numeros.append((m.start(), m.end(), float(m.group(1).replace(',', '.'))))
+    if not pos_nomes or not pos_numeros:
+        return {}
+    resultado = {}
+    usados_nomes = set()
+    for num_start, num_end, valor in pos_numeros:
+        melhor_nome = None
+        melhor_dist = float('inf')
+        for n_start, n_end, nome in pos_nomes:
+            if nome in usados_nomes:
+                continue
+            if num_end <= n_start:
+                dist = n_start - num_end
+            elif n_end <= num_start:
+                dist = num_start - n_end
+            else:
+                dist = 0
+            if dist < melhor_dist:
+                melhor_dist = dist
+                melhor_nome = nome
+        if melhor_nome and melhor_dist <= 20:
+            resultado[melhor_nome] = valor
+            usados_nomes.add(melhor_nome)
+    return resultado
+
 def _avancar_fila_aniversarios(phone_raw, phone, fila):
     """Avança para o próximo aniversário pendente na fila, ou termina se vazia."""
     if not fila:
@@ -4400,8 +4438,30 @@ def processar_texto(phone_raw, phone, texto):
         if estado == 'aniv_apartar_valor':
             nome_aniv = dados_estado.get('nome','')
             fila_aniv = dados_estado.get('fila', [])
-            valor_prenda = extrair_valor(texto)
             limpar_estado(phone)
+
+            # Tentar apanhar MÚLTIPLOS valores+nomes na mesma frase
+            # ex: "20 sogra 100 taty" ou "sogra 20 taty 100"
+            todos_nomes = [nome_aniv] + [a['nome'] for a in fila_aniv]
+            pares_detetados = _extrair_pares_valor_nome(texto, todos_nomes)
+
+            if len(pares_detetados) >= 2:
+                # Registar todos de uma vez
+                feedback = []
+                for nome_p, valor_p in pares_detetados.items():
+                    try:
+                        db.session.execute(text(
+                            "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u,:d,:v,0)"),
+                            {'u':usuario.id,'d':f'🎁 Prenda {nome_p}','v':valor_p})
+                        feedback.append(f"💝 {nome_p}: {valor_p:.0f}€")
+                    except Exception: pass
+                db.session.commit()
+                enviar_mensagem(phone_raw, "✅ Apartado!\n" + "\n".join(feedback) + "\nVê em 'objetivos' 🎁")
+                # Remover da fila os que já foram tratados
+                fila_restante = [a for a in fila_aniv if a['nome'] not in pares_detetados]
+                _avancar_fila_aniversarios(phone_raw, phone, fila_restante)
+                return
+
             # Se a mensagem parece OUTRO comando, sai do fluxo e processa normalmente
             palavras_cmd = ['entrei','sai','saí','gastei','quanto','picos','quero','nike','poupar',
                             'juntar','vamos','viagem','objetivo','meta','recebi','saldo','lembra',
@@ -4409,6 +4469,8 @@ def processar_texto(phone_raw, phone, texto):
             if any(w in t for w in palavras_cmd) or len(t.split()) > 4:
                 limpar_estado(phone)
                 processar_texto(phone_raw, phone, texto); return
+
+            valor_prenda = extrair_valor(texto)
             if valor_prenda > 0:
                 try:
                     db.session.execute(text(
