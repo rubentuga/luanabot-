@@ -1316,30 +1316,6 @@ def api_debug():
 
     return jsonify(resultados)
 
-@app.route('/api/sync-saldos', methods=['GET'])
-def api_sync_saldos():
-    """Força atualização dos saldos reais (Revolut via Enable Banking) e devolve as contas."""
-    token = request.args.get('token','')
-    phone = request.args.get('phone','')
-    expected = (phone[:8] + 'zef') if phone else ''
-    if not token or token != expected:
-        return jsonify({'error':'unauthorized'}), 401
-    try:
-        usuario = Usuario.query.filter_by(phone=phone).first()
-        if not usuario:
-            return jsonify({'error':'not found'}), 404
-        try:
-            enable_atualizar_saldos(usuario, silencioso=True)
-        except Exception as e:
-            log.error(f"sync-saldos enable {phone}: {e}")
-        saldos = db.session.execute(text(
-            "SELECT conta, valor FROM saldos_contas WHERE usuario_id=:u ORDER BY valor DESC"),
-            {'u': usuario.id}).fetchall()
-        return jsonify({'ok': True, 'contas': [{'conta': s[0], 'valor': round(float(s[1] or 0), 2)} for s in saldos]})
-    except Exception as e:
-        log.error(f"sync-saldos {phone}: {e}")
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/saude', methods=['GET'])
 def api_saude():
     """Score de saúde financeira + patrimônio para o dashboard."""
@@ -2071,15 +2047,6 @@ def api_dashboard():
         "SELECT descricao, valor_objetivo, valor_atual FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
         {'id':usuario.id}).fetchall()
 
-    # Compromissos / pagamentos agendados (para o dashboard mostrar "dia X tenho Y")
-    try:
-        compromissos = db.session.execute(text(
-            "SELECT nome, COALESCE(valor, valor_medio, 0), dia_mes, categoria FROM pagamentos_agendados "
-            "WHERE usuario_id=:id AND ativo=TRUE ORDER BY dia_mes ASC"),
-            {'id':usuario.id}).fetchall()
-    except Exception:
-        compromissos = []
-
     # Transações recentes (últimos 30 registos)
     transacoes = db.session.execute(text(
         "SELECT descricao, valor, categoria, data, id FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
@@ -2101,7 +2068,6 @@ def api_dashboard():
         'wishlist': [{'nome': r[0], 'preco': r[1], 'marca': r[2], 'cat': r[3]} for r in wishlist],
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0)} for r in objetivos],
-        'compromissos': [{'nome': r[0], 'valor': round(float(r[1] or 0), 2), 'dia': r[2], 'dia_mes': r[2], 'cat': r[3]} for r in compromissos],
         'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
@@ -2764,6 +2730,18 @@ def simular_compra(phone_raw, usuario, texto):
 
 
 # ─── ANIVERSÁRIO AO RECEBER SALÁRIO ──────────────────────────
+
+def _avancar_fila_aniversarios(phone_raw, phone, fila):
+    """Avança para o próximo aniversário pendente na fila, ou termina se vazia."""
+    if not fila:
+        return
+    proximo = fila[0]
+    resto = fila[1:]
+    set_estado(phone, 'aniv_apartar', {'nome': proximo['nome'], 'dias': proximo['dias'], 'fila': resto})
+    enviar_mensagem(phone_raw,
+        f"🎂 E o(a) *{proximo['nome']}*? Faz anos daqui a {proximo['dias']} dias!\n"
+        f"Queres apartar dinheiro para a prenda? (sim/não)")
+
 def verificar_aniversarios_proximo_mes(phone_raw, usuario, salario):
     """Chamado quando o salário é registado — verifica aniversários próximos."""
     hoje = agora().date()
@@ -2784,18 +2762,32 @@ def verificar_aniversarios_proximo_mes(phone_raw, usuario, salario):
         }).fetchall()
     except Exception: return
 
+    fila_aniv = []
     for nome, data_aniv in rows:
         try:
             prox = data_aniv.replace(year=hoje.year)
             if prox < hoje: prox = prox.replace(year=hoje.year+1)
             dias = (prox - hoje).days
             if 0 < dias <= 30:
-                phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-                set_estado(phone, 'aniv_apartar', {'nome': nome, 'dias': dias})
-                enviar_mensagem(phone_raw,
-                    f"🎂 Lembrete: {nome} faz anos daqui a {dias} dias!\n"
-                    f"Queres apartar dinheiro para a prenda? (sim/não)")
+                fila_aniv.append({'nome': nome, 'dias': dias})
         except Exception: continue
+
+    if fila_aniv:
+        phone = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+        # Guardar TODOS na fila — não sobrescreve, processa um a um
+        primeiro = fila_aniv[0]
+        resto = fila_aniv[1:]
+        set_estado(phone, 'aniv_apartar', {'nome': primeiro['nome'], 'dias': primeiro['dias'], 'fila': resto})
+        if len(fila_aniv) == 1:
+            enviar_mensagem(phone_raw,
+                f"🎂 Lembrete: {primeiro['nome']} faz anos daqui a {primeiro['dias']} dias!\n"
+                f"Queres apartar dinheiro para a prenda? (sim/não)")
+        else:
+            nomes = ', '.join(f"{a['nome']} ({a['dias']}d)" for a in fila_aniv)
+            enviar_mensagem(phone_raw,
+                f"🎂 Aniversários a chegar: {nomes}\n\n"
+                f"Vamos um de cada vez — *{primeiro['nome']}* faz anos daqui a {primeiro['dias']} dias!\n"
+                f"Queres apartar dinheiro para a prenda? (sim/não)")
 
 
 # ─── OBJETIVOS CASAL COM CONTRIBUIÇÕES ───────────────────────
@@ -4389,21 +4381,25 @@ def processar_texto(phone_raw, phone, texto):
         if estado == 'aniv_apartar':
             nome_aniv = dados_estado.get('nome','')
             dias_aniv = dados_estado.get('dias', 0)
+            fila_aniv = dados_estado.get('fila', [])
             limpar_estado(phone)
             palavras = t.strip().split()
-            # "quero" sozinho = sim; "quero uns nike" = outro comando
-            eh_sim = t.strip() in ['sim','s','yes','claro','sim quero','quero'] or (palavras and palavras[0] in ['sim','yes','claro'] and len(palavras)<=2)
-            if eh_sim:
-                set_estado(phone, 'aniv_apartar_valor', {'nome': nome_aniv})
-                enviar_mensagem(phone_raw, f"💝 Quanto queres apartar para a prenda do(a) {nome_aniv}?")
-            elif t.strip() in ['nao','não','n','no','agora nao','agora não']:
+            # Deteta "sim" em qualquer posição da frase (mais flexível)
+            tem_sim = any(p in ['sim','s','yes','claro','quero'] for p in palavras)
+            tem_nao = any(p in ['nao','não','n','no'] for p in palavras) and not tem_sim
+            if tem_nao:
                 enviar_mensagem(phone_raw, f"Ok! Podes sempre apartar depois dizendo 'prenda {nome_aniv} 50€' 💪")
+                _avancar_fila_aniversarios(phone_raw, phone, fila_aniv)
+            elif tem_sim:
+                set_estado(phone, 'aniv_apartar_valor', {'nome': nome_aniv, 'fila': fila_aniv})
+                enviar_mensagem(phone_raw, f"💝 Quanto queres apartar para a prenda do(a) {nome_aniv}?")
             else:
                 # Mensagem não relacionada — sai do estado e processa normalmente
                 processar_texto(phone_raw, phone, texto)
             return
         if estado == 'aniv_apartar_valor':
             nome_aniv = dados_estado.get('nome','')
+            fila_aniv = dados_estado.get('fila', [])
             valor_prenda = extrair_valor(texto)
             limpar_estado(phone)
             # Se a mensagem parece OUTRO comando, sai do fluxo e processa normalmente
@@ -4421,6 +4417,7 @@ def processar_texto(phone_raw, phone, texto):
                     db.session.commit()
                     enviar_mensagem(phone_raw, f"💝 Apartei {valor_prenda:.0f}€ para a prenda do(a) {nome_aniv}!\nVê em 'objetivos' 🎁")
                 except Exception: enviar_mensagem(phone_raw, "Erro 😕")
+            _avancar_fila_aniversarios(phone_raw, phone, fila_aniv)
             return
         if estado == 'conjunta_sem_desc':
             valor_c = dados_estado.get('valor', 0)
