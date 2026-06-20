@@ -714,12 +714,22 @@ def categorizar_ia(texto):
 FIXO_KEYWORDS = {
     'mae': ['mae','mãe'],
     'carro': ['carro','taigo','prestacao','prestação','seguro carro'],
-    'credito1': ['credito bpi','crédito bpi','credito1'],
-    'credito2': ['credito revolut','crédito revolut','credito2'],
+    'credito1': [('credito','bpi'),('crédito','bpi')],
+    'credito2': [('credito','revolut'),('crédito','revolut')],
     'combustivel': ['gasolina','combustivel','combustível','abasteci','galp','bp ','repsol','cepsa'],
     'ordem': ['ordem'],
     'unhas': ['unhas','manicure'],
 }
+
+def _fixo_keyword_bate(texto_check, kws):
+    """Verifica se as keywords batem — strings normais (substring) ou tuplos (todas as palavras presentes)."""
+    for kw in kws:
+        if isinstance(kw, tuple):
+            if all(palavra in texto_check for palavra in kw):
+                return True
+        elif kw in texto_check:
+            return True
+    return False
 FIXO_META_KEYS = {'total_fixos','salario','fundo','sobra','gastar','poupanca','modo','subsidio','despesas_mes'}
 
 def verificar_fixos_completos(usuario, p):
@@ -741,7 +751,7 @@ def verificar_fixos_completos(usuario, p):
         for chave in chaves_fixos:
             if chave in pagos: continue
             kws = FIXO_KEYWORDS.get(chave, [chave])
-            if any(kw in texto_check for kw in kws):
+            if _fixo_keyword_bate(texto_check, kws):
                 pagos.add(chave)
     # Conjunta conta-se separadamente (tabela própria)
     if 'conjunta' in chaves_fixos and 'conjunta' not in pagos:
@@ -847,6 +857,21 @@ def criar_tabelas():
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS pagamento_tipo VARCHAR(20) DEFAULT 'day_before'",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS salario_liquido FLOAT DEFAULT 0",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_salario_mes VARCHAR(7) DEFAULT ''",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_carro FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_ordem FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_unhas FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_conjunta FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_combustivel FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_mae FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_credito1 FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_credito2 FLOAT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS fixo_carro_fim_mes INTEGER DEFAULT 7",
+        # Semear valores atuais SO se ainda estiver NULL (nao sobrescreve edicoes futuras)
+        "UPDATE usuarios SET fixo_mae=100, fixo_credito1=50, fixo_credito2=50, fixo_carro=200, "
+        "fixo_conjunta=50, fixo_combustivel=50, fixo_carro_fim_mes=7 "
+        "WHERE phone='264909371768998' AND fixo_mae IS NULL",
+        "UPDATE usuarios SET fixo_carro=350, fixo_ordem=20, fixo_unhas=50, fixo_conjunta=50, "
+        "fixo_combustivel=50 WHERE phone='84516500680875' AND fixo_carro IS NULL",
     ]
     for sql in colunas_extra:
         try:
@@ -945,16 +970,64 @@ def set_saldo_divida(usuario_id, credor, saldo, parcela_mensal=500):
     except Exception as e:
         log.error(f"set_saldo_divida: {e}"); db.session.rollback()
 
+
+FIXO_NOME_COLUNA = {
+    'carro': 'fixo_carro', 'ordem': 'fixo_ordem', 'unhas': 'fixo_unhas',
+    'conjunta': 'fixo_conjunta', 'combustivel': 'fixo_combustivel', 'gasolina': 'fixo_combustivel',
+    'mae': 'fixo_mae', 'mãe': 'fixo_mae',
+    'credito1': 'fixo_credito1', 'creditobpi': 'fixo_credito1', 'bpi': 'fixo_credito1',
+    'credito2': 'fixo_credito2', 'creditorevolut': 'fixo_credito2', 'revolut': 'fixo_credito2',
+}
+
+def processar_alterar_fixo(phone_raw, usuario, nome_fixo, valor_str):
+    """Atualiza um valor fixo do plano mensal direto na BD, sem precisar de deploy."""
+    nome_norm = nome_fixo.lower().replace(' ', '')
+    coluna = FIXO_NOME_COLUNA.get(nome_norm)
+    if not coluna:
+        opcoes = ', '.join(sorted(set(FIXO_NOME_COLUNA.keys())))
+        enviar_mensagem(phone_raw, f"Não conheço esse fixo 🤔\nOpções: {opcoes}")
+        return
+    try:
+        valor = float(valor_str.replace(',', '.'))
+    except Exception:
+        enviar_mensagem(phone_raw, "Valor inválido 😕"); return
+    try:
+        db.session.execute(text(f"UPDATE usuarios SET {coluna}=:v WHERE id=:u"),
+                            {'v': valor, 'u': usuario.id})
+        db.session.commit()
+        enviar_mensagem(phone_raw, f"✅ Fixo *{nome_fixo}* atualizado para {valor:.2f}€!\nJá conta assim no próximo plano 😊")
+    except Exception as e:
+        db.session.rollback()
+        log.error(f"processar_alterar_fixo: {e}")
+        enviar_mensagem(phone_raw, "Erro ao atualizar 😕")
+
 def get_fixos_usuario(phone, mes, usuario_id=None):
-    """Devolve os fixos mensais do utilizador."""
+    """Devolve os fixos mensais do utilizador, lidos da BD (editáveis sem deploy).
+    Defaults mantidos como fallback caso a BD ainda não tenha valores."""
+    row = None
+    try:
+        row = db.session.execute(text(
+            "SELECT fixo_carro, fixo_ordem, fixo_unhas, fixo_conjunta, fixo_combustivel, "
+            "fixo_mae, fixo_credito1, fixo_credito2, fixo_carro_fim_mes "
+            "FROM usuarios WHERE phone=:p"), {'p': phone}).fetchone()
+    except Exception as e:
+        log.error(f"get_fixos_usuario DB: {e}")
+
+    def v(idx, default):
+        try:
+            return float(row[idx]) if row and row[idx] is not None else default
+        except Exception:
+            return default
+
     if phone == PHONE_RUBEN:
+        fim_mes_carro = int(row[8]) if row and row[8] is not None else 7
         fixos = {
-            'mae':        100,
-            'credito1':    50,
-            'credito2':    50,
-            'carro':      200 if mes <= 7 else 0,
-            'conjunta':    50,
-            'combustivel': 50,
+            'mae':         v(5, 100),
+            'credito1':    v(6, 50),
+            'credito2':    v(7, 50),
+            'carro':       v(0, 200) if mes <= fim_mes_carro else 0,
+            'conjunta':    v(3, 50),
+            'combustivel': v(4, 50),
         }
         # Dívida à Luana — usa saldo real da BD se disponível
         if usuario_id:
@@ -976,11 +1049,11 @@ def get_fixos_usuario(phone, mes, usuario_id=None):
         return fixos
     else:  # Luana (default)
         return {
-            'carro':       350,
-            'ordem':        20,
-            'unhas':        50 if mes <= 9 else 25,
-            'conjunta':     50,
-            'combustivel':  BASE_COMBUSTIVEL,
+            'carro':       v(0, 350),
+            'ordem':       v(1, 20),
+            'unhas':       v(2, 50),
+            'conjunta':    v(3, 50),
+            'combustivel': v(4, BASE_COMBUSTIVEL),
         }
 
 def calcular_plano(salario, modo='equilibrado', despesas_futuras_valor=0, phone=None, usuario_id=None):
@@ -3956,6 +4029,41 @@ BANCOS_ENABLE = {
     'edenred': 'Edenred', 'paypal': 'PayPal',
 }
 
+BANCOS_ENABLE_SEARCH = {
+    'bpi': 'bpi', 'banco bpi': 'bpi',
+    'cgd': 'caixa', 'caixa': 'caixa', 'cgd pt': 'caixa', 'caixa geral': 'caixa',
+    'millennium': 'millennium', 'bcp': 'millennium', 'millenium': 'millennium',
+    'santander': 'santander', 'santander totta': 'santander',
+    'novobanco': 'novo banco', 'novo banco': 'novo banco',
+    'bankinter': 'bankinter', 'activobank': 'activobank',
+    'montepio': 'montepio', 'revolut': 'revolut',
+    'wise': 'wise', 'n26': 'n26',
+    'credito agricola': 'agricola', 'crédito agrícola': 'agricola',
+    'ing': 'ing', 'deutsche': 'deutsche', 'unicre': 'unicre',
+    'edenred': 'edenred', 'paypal': 'paypal',
+}
+
+def _buscar_nome_aspsp_real(banco_chave):
+    """Consulta a lista REAL de bancos do Enable Banking e devolve o nome exato esperado.
+    Evita o erro 'Wrong ASPSP name provided' por adivinhar nomes errados."""
+    import requests as _r2
+    palavra_busca = BANCOS_ENABLE_SEARCH.get(banco_chave, banco_chave)
+    try:
+        headers = _enable_headers()
+        if not headers:
+            return BANCOS_ENABLE.get(banco_chave)
+        r = _r2.get('https://api.enablebanking.com/aspsps?country=PT', headers=headers, timeout=15)
+        if r.status_code == 200:
+            aspsps = r.json().get('aspsps', [])
+            for a in aspsps:
+                nome = a.get('name', '')
+                if palavra_busca.lower() in nome.lower():
+                    return nome
+    except Exception as e:
+        log.error(f"_buscar_nome_aspsp_real: {e}")
+    # Fallback para o nome adivinhado se a busca falhar
+    return BANCOS_ENABLE.get(banco_chave)
+
 def enable_ligar_banco(phone_raw, usuario, texto):
     """Inicia ligação a um banco via Enable Banking — gera link de autorização."""
     import requests as _r
@@ -3972,7 +4080,12 @@ def enable_ligar_banco(phone_raw, usuario, texto):
         enviar_mensagem(phone_raw, "⚠️ O serviço de bancos ainda não está configurado no servidor.")
         return
     try:
-        nome_aspsp = BANCOS_ENABLE[banco]
+        nome_aspsp = _buscar_nome_aspsp_real(banco)
+        if not nome_aspsp:
+            enviar_mensagem(phone_raw,
+                f"Não encontrei o {banco.upper()} na lista de bancos disponíveis 😕\n"
+                f"Bancos que funcionam bem: *Revolut*, *Wise*, *N26*")
+            return
         body = {
             "access": {"valid_until": (agora().astimezone(_tz.utc) + timedelta(days=90)).isoformat()},
             "aspsp": {"name": nome_aspsp, "country": "PT"},
@@ -4364,7 +4477,7 @@ def enable_buscar_transacoes_recentes(usuario, minutos=35):
         contas = db.session.execute(text(
             "SELECT account_id, banco FROM bancos_ligados "
             "WHERE usuario_id=:u AND ativo=TRUE AND account_id IS NOT NULL "
-            "AND banco NOT LIKE '%cofre%' AND banco NOT LIKE '%conjunta%'"),
+            "AND banco NOT LIKE '%cofre%'"),
             {'u': usuario.id}).fetchall()
         if not contas:
             return []
@@ -4430,6 +4543,8 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
             tx.get('additional_information') or 'Pagamento Revolut').strip()
     tx_id = tx.get('transaction_id') or tx.get('internal_transaction_id') or ''
     data_tx = tx.get('booking_date') or tx.get('value_date') or agora().isoformat()
+    banco_origem = tx.get('_banco', '')
+    eh_conjunta = 'conjunta' in banco_origem
 
     # Verificar se já foi registada
     if tx_ja_registada(usuario.id, tx_id, valor, desc, data_tx):
@@ -4440,25 +4555,34 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
     loja_n = loja or desc[:30]
     em = EMOJI_CAT.get(cat, '💳')
 
-    # Registar automaticamente
+    # Registar automaticamente — gastos da conjunta marcados [conjunta] (não afetam o para gastar pessoal)
     try:
-        desc_bd = f"{loja_n} [txid:{tx_id}]" if tx_id else loja_n
+        prefixo = '[conjunta] ' if eh_conjunta else ''
+        desc_bd = f"{prefixo}{loja_n} [txid:{tx_id}]" if tx_id else f"{prefixo}{loja_n}"
         db.session.add(Despesa(
             usuario_id=usuario.id, valor=valor,
             descricao=desc_bd, categoria=cat,
             data=agora().replace(tzinfo=None)))
         db.session.commit()
-        log.info(f"Tx Revolut auto: {loja_n} {valor}€ → {cat}")
+        log.info(f"Tx Revolut auto: {loja_n} {valor}€ → {cat} (conjunta={eh_conjunta})")
     except Exception as e:
         log.error(f"registar tx auto: {e}")
         db.session.rollback()
         return
 
-    # Notificar utilizador
-    enviar_mensagem(phone_raw,
-        f"{em} *{loja_n}* — {valor:.2f}€\n"
-        f"💜 Detetado no Revolut e registado automaticamente!\n"
-        f"_Diz 'corrige' se a categoria estiver errada_")
+    if eh_conjunta:
+        # Avisar OS DOIS — gasto saiu da conta conjunta, não afeta o disponível pessoal
+        meu_nome_tx = NOMES_CASAL.get(usuario.phone, 'Alguém')
+        msg_tx = (f"{em} *{loja_n}* — {valor:.2f}€\n"
+                  f"💑 Saiu da conta conjunta (detetado automaticamente)")
+        enviar_mensagem(phone_raw, msg_tx)
+        notificar_parceiro(usuario.phone, msg_tx)
+    else:
+        # Notificar utilizador (despesa pessoal)
+        enviar_mensagem(phone_raw,
+            f"{em} *{loja_n}* — {valor:.2f}€\n"
+            f"💜 Detetado no Revolut e registado automaticamente!\n"
+            f"_Diz 'corrige' se a categoria estiver errada_")
 
 def sincronizar_revolut():
     """Job a cada 30 min: deteta novas transações Revolut e regista automaticamente."""
@@ -5462,22 +5586,55 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['quem gastou mais','comparar','competicao','competição','batalha']):
             enviar_comparacao_casal(phone_raw, usuario); return
 
-        # ── X PAGOU / MARCAR SPLIT PAGO ──
+        # -- X PAGOU / MARCAR SPLIT PAGO (alguem pagou-me) --
         m_pagou = re.search(r'([A-Za-zÀ-ú]{2,})\s+pagou', t)
         if m_pagou:
             pessoa_pagou = m_pagou.group(1).capitalize()
             try:
                 r = db.session.execute(text(
-                    "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE RETURNING descricao,valor_cada"),
+                    "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE AND descricao NOT LIKE '[EU DEVO]%' RETURNING descricao,valor_cada"),
                     {'u':usuario.id,'p':pessoa_pagou}).fetchone()
                 db.session.commit()
-                if r: enviar_mensagem(phone_raw, f"✅ {pessoa_pagou} pagou {r[1]:.2f}€ — {r[0]}! 🎉")
-                else: enviar_mensagem(phone_raw, f"Não encontrei splits pendentes com {pessoa_pagou} 🤔")
+                if r:
+                    enviar_mensagem(phone_raw, f"OK {pessoa_pagou} pagou {r[1]:.2f}EUR -- {r[0]}!")
+                    meu_nome_p = NOMES_CASAL.get(usuario.phone, 'Alguem')
+                    parceiro_phone_p = get_parceiro_phone(usuario.phone)
+                    nome_parceiro_p = NOMES_CASAL.get(parceiro_phone_p, '').lower() if parceiro_phone_p else ''
+                    if parceiro_phone_p and pessoa_pagou.lower() == nome_parceiro_p:
+                        notificar_parceiro(usuario.phone, f"{meu_nome_p} confirmou que recebeu os {r[1]:.2f}EUR! Divida fechada.")
+                else: enviar_mensagem(phone_raw, f"Nao encontrei splits pendentes com {pessoa_pagou}")
             except Exception as e:
-                log.error(f"pagou: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+                log.error(f"pagou: {e}"); enviar_mensagem(phone_raw, "Erro")
+            return
+
+        # -- JA PAGUEI A/AO [PESSOA] (eu liquidei o que devia) --
+        m_ja_paguei = re.search(r'(?:ja|j\u00e1)\s+paguei\s+(?:ao|\u00e0|a)\s+([A-Za-z\u00c0-\u00fa]{2,})', t)
+        if m_ja_paguei:
+            pessoa_paga = m_ja_paguei.group(1).capitalize()
+            try:
+                r = db.session.execute(text(
+                    "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE AND descricao LIKE '[EU DEVO]%' RETURNING descricao,valor_cada"),
+                    {'u':usuario.id,'p':pessoa_paga}).fetchone()
+                db.session.commit()
+                if r:
+                    desc_limpa = r[0].replace('[EU DEVO] ', '')
+                    enviar_mensagem(phone_raw, f"OK! Marquei como pago -- {r[1]:.2f}EUR ao {pessoa_paga} ({desc_limpa})")
+                    meu_nome_jp = NOMES_CASAL.get(usuario.phone, 'Alguem')
+                    parceiro_phone_jp = get_parceiro_phone(usuario.phone)
+                    nome_parceiro_jp = NOMES_CASAL.get(parceiro_phone_jp, '').lower() if parceiro_phone_jp else ''
+                    if parceiro_phone_jp and pessoa_paga.lower() == nome_parceiro_jp:
+                        notificar_parceiro(usuario.phone, f"{meu_nome_jp} pagou-te os {r[1]:.2f}EUR que devia! Divida fechada.")
+                else:
+                    enviar_mensagem(phone_raw, f"Nao encontrei nenhuma divida tua ao {pessoa_paga} em aberto")
+            except Exception as e:
+                log.error(f"ja_paguei: {e}"); enviar_mensagem(phone_raw, "Erro")
             return
 
         # ── DÍVIDAS ──
+        m_fixo_set = re.search(r'(?:mudar |alterar |trocar )?fixo\s+([a-zà-ú0-9]+(?:\s+[a-zà-ú0-9]+)?)\s+(?:para\s+)?([\d]+(?:[.,]\d+)?)', t)
+        if m_fixo_set:
+            processar_alterar_fixo(phone_raw, usuario, m_fixo_set.group(1), m_fixo_set.group(2)); return
+
         if any(p in t for p in ['devo ','deve-me','devem-me','me deve']) and tem_numero(texto):
             processar_dividas(phone_raw, usuario, texto); return
 
@@ -7570,6 +7727,15 @@ def processar_dividas(phone_raw, usuario, texto):
                 {'u':usuario.id,'d':f'[EU DEVO] {desc}','vt':valor,'vc':valor,'p':pessoa})
             db.session.commit()
             enviar_mensagem(phone_raw, f"📝 Anotado! Deves {valor:.2f}€ ao {pessoa}\nNão te esqueças de pagar! 😬")
+            # Se a pessoa é o parceiro -> notificar diretamente
+            meu_nome_d2 = NOMES_CASAL.get(usuario.phone, 'Alguem')
+            parceiro_phone_d2 = get_parceiro_phone(usuario.phone)
+            nome_parceiro_d2 = NOMES_CASAL.get(parceiro_phone_d2, '').lower() if parceiro_phone_d2 else ''
+            if parceiro_phone_d2 and pessoa.lower() == nome_parceiro_d2:
+                notificar_parceiro(usuario.phone,
+                    f"💸 {meu_nome_d2} deve-te {valor:.2f}€!\n"
+                    f"📝 Motivo: {desc}\n\n"
+                    f"Quando ele(a) pagar, ele(a) diz 'já paguei ao {nome_parceiro_d2}' 😉")
         else:
             db.session.execute(text("INSERT INTO splitting (usuario_id,descricao,valor_total,valor_cada,pessoa,pago) VALUES (:u,:d,:vt,:vc,:p,FALSE)"),
                 {'u':usuario.id,'d':desc,'vt':valor,'vc':valor,'p':pessoa})
