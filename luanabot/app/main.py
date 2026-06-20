@@ -54,6 +54,52 @@ def add_cors(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
+@app.route('/qr', methods=['GET'])
+def qr_facil():
+    """Endpoint fixo para reobter o QR do WhatsApp rapidamente, sem curl/SQL.
+    Abre isto no browser sempre que o WhatsApp desligar: /qr"""
+    import requests as _r
+    try:
+        # Verificar estado atual
+        r_status = _r.get(f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+                           headers={'X-Api-Key': WAHA_API_KEY}, timeout=10)
+        status = r_status.json().get('status', '') if r_status.status_code == 200 else 'DESCONHECIDO'
+
+        if status == 'WORKING':
+            return ("<h2>✅ WhatsApp já está ligado!</h2>"
+                    "<p>Não precisas de fazer nada. Se mesmo assim quiseres religar, "
+                    "<a href='/qr?forcar=1'>clica aqui para forçar novo QR</a>.</p>")
+
+        forcar = request.args.get('forcar', '')
+        if status not in ('SCAN_QR_CODE', 'STARTING') or forcar:
+            # Sessão morta ou a pedido — apagar e recriar
+            _r.delete(f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+                      headers={'X-Api-Key': WAHA_API_KEY}, timeout=10)
+            import time; time.sleep(2)
+            _r.post(f"{WAHA_URL}/api/sessions",
+                     headers={'X-Api-Key': WAHA_API_KEY, 'Content-Type': 'application/json'},
+                     json={'name': WAHA_SESSION, 'start': True}, timeout=15)
+            import time; time.sleep(6)
+
+        r_img = _r.get(f"{WAHA_URL}/api/screenshot?session={WAHA_SESSION}",
+                        headers={'X-Api-Key': WAHA_API_KEY}, timeout=15)
+        if r_img.status_code == 200 and r_img.content[:8].startswith(b'\x89PNG\r\n\x1a\n'):
+            import base64 as _b64
+            img_b64 = _b64.b64encode(r_img.content).decode()
+            return (f"<html><body style='text-align:center;font-family:sans-serif;padding:20px'>"
+                    f"<h2>📱 Lê este QR no WhatsApp</h2>"
+                    f"<p>Definições → Aparelhos ligados → Ligar aparelho</p>"
+                    f"<img src='data:image/png;base64,{img_b64}' style='max-width:350px'><br>"
+                    f"<small>Se não aparecer QR, <a href='/qr?forcar=1'>força novo</a> ou "
+                    f"<a href='/qr'>atualiza a página</a> (expira em ~20s)</small>"
+                    f"</body></html>")
+        else:
+            return (f"<h2>⏳ A preparar sessão...</h2>"
+                    f"<p>Estado: {status}. <a href='/qr'>Atualiza a página</a> em 5 segundos.</p>")
+    except Exception as e:
+        log.error(f"qr_facil: {e}")
+        return f"<h2>Erro: {e}</h2><p><a href='/qr?forcar=1'>Tentar forçar</a></p>"
+
 @app.route('/api/despesa/editar', methods=['POST', 'OPTIONS'])
 def api_despesa_editar():
     """Edita uma despesa por ID (descricao, valor, categoria)."""
