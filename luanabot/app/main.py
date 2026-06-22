@@ -382,26 +382,15 @@ def dia_pagamento_usuario(usuario, ano=None, mes=None):
     ano = ano or hoje.year; mes = mes or hoje.month
     # Dias de pagamento por utilizador
     from sqlalchemy import text as _text
-    dia_pagamento_db = getattr(usuario, 'dia_pagamento', None)
-    pagamento_tipo_db = getattr(usuario, 'pagamento_tipo', None)
-    if dia_pagamento_db is None and hasattr(usuario, 'id'):
-        try:
-            row = db.session.execute(_text(
-                "SELECT dia_pagamento, pagamento_tipo FROM usuarios WHERE id=:id"),
-                {'id': usuario.id}).fetchone()
-            if row:
-                dia_pagamento_db = row[0]; pagamento_tipo_db = row[1]
-        except Exception:
-            db.session.rollback()
     if hasattr(usuario, 'phone') and usuario.phone == PHONE_RUBEN:
-        dia_base = dia_pagamento_db or 22
-        tipo = pagamento_tipo_db or 'exact'
+        dia_base = 22  # Ruben recebe dia 22 (mesmo que seja segunda)
+        tipo = 'exact'  # sem antecipação
     elif hasattr(usuario, 'phone') and usuario.phone == PHONE_LUANA:
-        dia_base = dia_pagamento_db or 21
-        tipo = pagamento_tipo_db or 'day_before'
+        dia_base = getattr(usuario, 'dia_pagamento', None) or 8
+        tipo = 'day_before'
     else:
-        dia_base = dia_pagamento_db or 21
-        tipo = pagamento_tipo_db or 'day_before'
+        dia_base = getattr(usuario, 'dia_pagamento', None) or 21
+        tipo = getattr(usuario, 'pagamento_tipo', None) or 'day_before'
     try:
         d = datetime(ano, mes, dia_base)
     except ValueError:
@@ -1572,46 +1561,6 @@ def api_debug():
 
     return jsonify(resultados)
 
-@app.route('/api/sync-saldos', methods=['GET'])
-def api_sync_saldos():
-    """Força atualização dos saldos reais (Revolut via Enable Banking).
-    enable_atualizar_saldos() grava em bancos_ligados; replicamos para saldos_contas."""
-    token = request.args.get('token','')
-    phone = request.args.get('phone','')
-    expected = (phone[:8] + 'zef') if phone else ''
-    if not token or token != expected:
-        return jsonify({'error':'unauthorized'}), 401
-    try:
-        usuario = Usuario.query.filter_by(phone=phone).first()
-        if not usuario:
-            return jsonify({'error':'not found'}), 404
-        try:
-            resultados = enable_atualizar_saldos(usuario, silencioso=True)
-        except Exception as e:
-            log.error(f"sync-saldos enable {phone}: {e}")
-            resultados = []
-        NOMES_CONTA_DISPLAY = {
-            'revolut_pessoal':'Revolut','revolut_conjunta':'Conta Conjunta',
-            'revolut_cofre_casa':'Cofre Casa','revolut_cofre_pc':'Cofre PC novo','revolut':'Revolut',
-        }
-        for banco, saldo in (resultados or []):
-            try:
-                nome_display = NOMES_CONTA_DISPLAY.get(banco, banco.replace('_',' ').title())
-                db.session.execute(text(
-                    "INSERT INTO saldos_contas (usuario_id, conta, valor, atualizado_em) VALUES (:u,:c,:v,NOW()) "
-                    "ON CONFLICT (usuario_id, conta) DO UPDATE SET valor=:v, atualizado_em=NOW()"),
-                    {'u': usuario.id, 'c': nome_display, 'v': float(saldo)})
-                db.session.commit()
-            except Exception as e:
-                log.error(f"sync-saldos ponte {banco}: {e}"); db.session.rollback()
-        saldos = db.session.execute(text(
-            "SELECT conta, valor FROM saldos_contas WHERE usuario_id=:u ORDER BY valor DESC"),
-            {'u': usuario.id}).fetchall()
-        return jsonify({'ok': True, 'sincronizados': len(resultados or []), 'contas': [{'conta': s[0], 'valor': round(float(s[1] or 0), 2)} for s in saldos]})
-    except Exception as e:
-        log.error(f"sync-saldos {phone}: {e}")
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/saude', methods=['GET'])
 def api_saude():
     """Score de saúde financeira + patrimônio para o dashboard."""
@@ -1652,17 +1601,15 @@ def api_saude():
 
                 # Construir lista de contas incluindo conjunta e reserva
         contas_lista = [{'conta': s[0], 'valor': round(s[1], 2)} for s in saldos]
-        ja_tem_conjunta = any('conjunta' in c['conta'].lower() for c in contas_lista)
-        if not ja_tem_conjunta:
-            try:
-                saldo_conj = db.session.execute(text(
-                    "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u"),
-                    {'u': usuario.id}).scalar() or 0
+        try:
+            saldo_conj = db.session.execute(text(
+                "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u"),
+                {'u': usuario.id}).scalar() or 0
+            if saldo_conj and saldo_conj != 0:
                 contas_lista.append({'conta': 'Conta Conjunta', 'valor': round(float(saldo_conj), 2), 'tipo': 'conjunta'})
-            except Exception as e:
-                log.warning(f"saldo conjunta api: {e}")
-        ja_tem_reserva = any('reserva' in c['conta'].lower() for c in contas_lista)
-        if not ja_tem_reserva:
+        except Exception as e:
+            log.warning(f"saldo conjunta api: {e}")
+        if reserva and reserva != 0:
             contas_lista.append({'conta': 'Reserva de Emergência', 'valor': round(float(reserva), 2), 'tipo': 'reserva'})
 
         return jsonify({
@@ -2319,87 +2266,16 @@ def api_dashboard():
             db.extract('year',Despesa.data)==y
         ).scalar() or 0
         nomes = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
-        try:
-            rec_m = db.session.execute(text(
-                "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
-                "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
-                {'u':usuario.id,'m':m,'y':y}).scalar() or 0
-        except Exception:
-            rec_m = 0
-        historico.append({'mes': nomes[m-1], 'total': round(total, 2), 'receitas': round(float(rec_m), 2)})
+        historico.append({'mes': nomes[m-1], 'total': round(total, 2)})
 
     # Disponível
     modo = get_modo(usuario.id)
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
-    mes_atual_str = f"{ano}-{mes:02d}"
-    ja_recebeu_flag = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
-    # Cross-check robusto: se já há receitas lançadas este mês que cobrem o salário
-    # (ex: registado como "Extra" em vez de "Salario"), conta como recebido mesmo sem a flag.
-    try:
-        _receitas_check = db.session.execute(text(
-            "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
-            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
-            {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
-        _receitas_check = float(_receitas_check)
-    except Exception:
-        _receitas_check = 0.0
-    sal_liq = usuario.salario_liquido or 0
-    ja_recebeu = ja_recebeu_flag or (sal_liq > 0 and _receitas_check >= sal_liq * 0.9)
-    salario_efetivo = sal_liq if ja_recebeu else 0
-    p = calcular_plano(salario_efetivo, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
+    p = calcular_plano(usuario.salario_liquido or 0, modo, total_fut, phone=usuario.phone)
     gastos_mes = sum(v for _, v in por_cat)
     disp = p['gastar'] - gastos_mes
     reserva = get_reserva(usuario.id)
-
-    # Despesas fixas previstas (sempre, independente de salário) — inclui dívida à Luana (usuario_id necessário)
-    p_fixos = calcular_plano(usuario.salario_liquido or 0, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
-    NOMES_FIXOS = {
-        'mae':'Mãe','credito1':'Crédito 1','credito2':'Crédito 2','carro':'Carro',
-        'conjunta':'Conjunta','combustivel':'Combustível','divida_luana':'Dívida à Luana',
-        'ordem':'Ordem','unhas':'Unhas','despesas_mes':'Despesas previstas',
-    }
-    chaves_excluir = {'total_fixos','salario','fundo','sobra','gastar','poupanca','modo','subsidio'}
-    fixos_lista = [{'nome': NOMES_FIXOS.get(k, k.replace('_',' ').capitalize()), 'valor': round(v, 2)}
-                   for k, v in p_fixos.items() if k not in chaves_excluir and isinstance(v,(int,float)) and v]
-
-    # ─── RECEBIDO / A RECEBER / PAGO / A PAGAR (valores REAIS da BD) ───
-    recebido_mes = round(_receitas_check, 2)  # já calculado acima (cross-check do salário)
-    try:
-        sal_pend = db.session.execute(text(
-            "SELECT COALESCE(SUM(valor),0) FROM salarios_pendentes WHERE usuario_id=:u AND processado=FALSE"),
-            {'u':usuario.id}).scalar() or 0
-    except Exception:
-        sal_pend = 0
-    try:
-        split_receber = db.session.execute(text(
-            "SELECT COALESCE(SUM(valor_cada),0) FROM splitting WHERE usuario_id=:u AND pago=FALSE"),
-            {'u':usuario.id}).scalar() or 0
-    except Exception:
-        split_receber = 0
-    a_receber = round(float(sal_pend) + float(split_receber), 2)
-    # Só soma o salário a "a receber" se realmente ainda não entrou nada que o cubra
-    # (evita duplicar quando o salário já foi lançado por outra via, ex: "dinheiro extra")
-    if not ja_recebeu and sal_liq > 0 and sal_pend == 0:
-        falta_receber = max(0, sal_liq - recebido_mes)
-        a_receber = round(a_receber + falta_receber, 2)
-    pago_mes = round(float(gastos_mes), 2)
-    try:
-        a_pagar = db.session.execute(text(
-            "SELECT COALESCE(SUM(COALESCE(valor,valor_medio,0)),0) FROM pagamentos_agendados "
-            "WHERE usuario_id=:u AND ativo=TRUE AND prestacoes_pagas < prestacoes_total"),
-            {'u':usuario.id}).scalar() or 0
-        a_pagar = round(float(a_pagar), 2)
-    except Exception:
-        a_pagar = 0.0
-    receitas_total = round(recebido_mes + a_receber, 2)
-    try:
-        saldo_bancario = db.session.execute(text(
-            "SELECT COALESCE(SUM(valor),0) FROM saldos_contas WHERE usuario_id=:u"),
-            {'u':usuario.id}).scalar() or 0
-        saldo_bancario = round(float(saldo_bancario), 2)
-    except Exception:
-        saldo_bancario = 0.0
 
     # Wishlist
     wishlist = db.session.execute(text(
@@ -2415,73 +2291,6 @@ def api_dashboard():
     objetivos = db.session.execute(text(
         "SELECT descricao, valor_objetivo, valor_atual, data_meta FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
         {'id':usuario.id}).fetchall()
-
-    # Dívidas pessoais
-    try:
-        dividas_rows = db.session.execute(text(
-            "SELECT credor, saldo, parcela_mensal FROM dividas_pessoais WHERE usuario_id=:id AND saldo>0"),
-            {'id':usuario.id}).fetchall()
-    except Exception:
-        dividas_rows = []
-
-    # Compromissos / pagamentos agendados
-    try:
-        compromissos = db.session.execute(text(
-            "SELECT nome, COALESCE(valor, valor_medio, 0), dia_mes, categoria, prestacoes_pagas, prestacoes_total FROM pagamentos_agendados "
-            "WHERE usuario_id=:id AND ativo=TRUE ORDER BY dia_mes ASC"),
-            {'id':usuario.id}).fetchall()
-    except Exception:
-        compromissos = []
-
-    # Próximos aniversários (60 dias)
-    try:
-        hoje_d = agora().date()
-        em_60 = hoje_d + timedelta(days=60)
-        aniv_rows = db.session.execute(text("""
-            SELECT nome, data_aniv FROM aniversarios WHERE usuario_id=:id
-            AND ((EXTRACT(month FROM data_aniv)=:m1 AND EXTRACT(day FROM data_aniv)>=:d1)
-                OR (EXTRACT(month FROM data_aniv)=:m2 AND EXTRACT(day FROM data_aniv)<=:d2))
-            """), {'id':usuario.id,'m1':hoje_d.month,'d1':hoje_d.day,'m2':em_60.month,'d2':em_60.day}).fetchall()
-        aniversarios = []
-        for nome, data_aniv in aniv_rows:
-            prox = data_aniv.replace(year=hoje_d.year)
-            if prox < hoje_d: prox = prox.replace(year=hoje_d.year+1)
-            aniversarios.append({'nome': nome, 'data': prox.strftime('%d/%m'), 'dias': (prox-hoje_d).days})
-        aniversarios.sort(key=lambda a:a['dias'])
-    except Exception:
-        aniversarios = []
-
-    # Previsão de fim de mês
-    previsao = None
-    try:
-        import calendar as _cal
-        _, ult_dia = _cal.monthrange(ano, mes)
-        dia_atual = agora().day if (mes==agora().month and ano==agora().year) else ult_dia
-        if dia_atual > 0 and gastos_mes > 0:
-            ritmo_diario = gastos_mes / dia_atual
-            previsao_total = ritmo_diario * ult_dia
-            sobra_prevista = p['gastar'] - previsao_total
-            previsao = {'dia_atual': dia_atual, 'ultimo_dia': ult_dia, 'ritmo_diario': round(ritmo_diario, 2),
-                        'gasto_projetado': round(previsao_total, 2), 'sobra_prevista': round(sobra_prevista, 2),
-                        'no_caminho': sobra_prevista >= 0}
-    except Exception:
-        previsao = None
-
-    # Combustível
-    combustivel = None
-    try:
-        ab_rows = db.session.execute(text(
-            "SELECT data, km_percorridos, valor, custo_por_km FROM abastecimentos "
-            "WHERE user_phone=:p ORDER BY data DESC LIMIT 5"), {'p': usuario.phone}).fetchall()
-        if ab_rows:
-            st = db.session.execute(text(
-                "SELECT COALESCE(SUM(km_percorridos),0), COALESCE(SUM(valor),0), COALESCE(AVG(custo_por_km),0), COUNT(*) "
-                "FROM abastecimentos WHERE user_phone=:p"), {'p': usuario.phone}).fetchone()
-            combustivel = {'total_km': round(float(st[0] or 0)), 'total_eur': round(float(st[1] or 0), 2),
-                'custo_100km': round(float(st[2] or 0) * 100, 2), 'n': int(st[3] or 0),
-                'ultimos': [{'data': r[0].strftime('%d/%m') if r[0] else '—', 'km': round(float(r[1] or 0)), 'valor': round(float(r[2] or 0), 2)} for r in ab_rows]}
-    except Exception:
-        combustivel = None
 
     # Transações recentes (últimos 30 registos)
     transacoes = db.session.execute(text(
@@ -2505,20 +2314,6 @@ def api_dashboard():
         'splits': [{'desc': r[0], 'valor': r[1], 'pessoa': r[2]} for r in splits],
         'objetivos': [{'desc': r[0], 'objetivo': r[1], 'atual': r[2], 'pct': round(r[2]/r[1]*100 if r[1] else 0),
                        'dias_falta': (r[3] - agora().replace(tzinfo=None).date()).days if r[3] else None} for r in objetivos],
-        'dividas': [{'nome': r[0].capitalize(), 'pessoa': r[0].capitalize(), 'valor': round(float(r[1] or 0), 2), 'parcela': round(float(r[2] or 0), 2), 'tipo': 'devo'} for r in dividas_rows],
-        'compromissos': [{'nome': r[0], 'valor': round(float(r[1] or 0), 2), 'dia': r[2], 'dia_mes': r[2], 'cat': r[3], 'pago': (r[4] or 0) >= (r[5] or 1)} for r in compromissos],
-        'aniversarios': aniversarios,
-        'fixos': fixos_lista,
-        'total_fixos': round(p_fixos.get('total_fixos',0), 2),
-        'ja_recebeu_salario': ja_recebeu,
-        'receitas_mes': receitas_total,
-        'recebido': recebido_mes,
-        'a_receber': a_receber,
-        'pago': pago_mes,
-        'a_pagar': a_pagar,
-        'saldo_bancario': saldo_bancario,
-        'previsao': previsao,
-        'combustivel': combustivel,
         'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
@@ -6000,10 +5795,23 @@ def processar_texto(phone_raw, phone, texto):
                 log.error(f"pagou: {e}"); enviar_mensagem(phone_raw, "Erro")
             return
 
-        # -- JA PAGUEI A/AO [PESSOA] (eu liquidei o que devia) --
-        m_ja_paguei = re.search(r'(?:ja|j\u00e1)\s+paguei\s+(?:ao|\u00e0|a)\s+([A-Za-z\u00c0-\u00fa]{2,})', t)
-        if m_ja_paguei:
-            pessoa_paga = m_ja_paguei.group(1).capitalize()
+        # ── JÁ PAGUEI [A/AO/DA/DO + PESSOA] (eu liquidei o que devia) ──
+        # Robusto a várias frases: "já paguei à Luana", "já paguei os 500 da Luana",
+        # "já paguei o Vitor" — basta "já paguei" + o nome aparecer na frase.
+        pessoa_paga = None
+        if re.search(r'\b(?:ja|já)\s+paguei\b', t):
+            parceiro_phone_jp0 = get_parceiro_phone(usuario.phone)
+            nome_parceiro_jp0 = NOMES_CASAL.get(parceiro_phone_jp0, '') if parceiro_phone_jp0 else ''
+            if nome_parceiro_jp0 and nome_parceiro_jp0.lower() in t:
+                pessoa_paga = nome_parceiro_jp0
+            else:
+                m_ja_paguei = re.search(r'(?:ao|à|a|da|do|de|o|os)\s+([A-Za-zÀ-ú]{2,})\s*$', texto.strip(), re.IGNORECASE)
+                if not m_ja_paguei:
+                    m_ja_paguei = re.search(r'(?:ao|à|a|da|do|de|o|os)\s+([A-Za-zÀ-ú]{2,})\b', texto, re.IGNORECASE)
+                if m_ja_paguei:
+                    pessoa_paga = m_ja_paguei.group(1).capitalize()
+
+        if pessoa_paga:
             try:
                 r = db.session.execute(text(
                     "UPDATE splitting SET pago=TRUE WHERE usuario_id=:u AND LOWER(pessoa)=LOWER(:p) AND pago=FALSE AND descricao LIKE '[EU DEVO]%' RETURNING descricao,valor_cada"),
@@ -6011,14 +5819,37 @@ def processar_texto(phone_raw, phone, texto):
                 db.session.commit()
                 if r:
                     desc_limpa = r[0].replace('[EU DEVO] ', '')
-                    enviar_mensagem(phone_raw, f"OK! Marquei como pago -- {r[1]:.2f}EUR ao {pessoa_paga} ({desc_limpa})")
+                    enviar_mensagem(phone_raw, f"OK! Marquei como pago — {r[1]:.2f}€ ao {pessoa_paga} ({desc_limpa})")
                     meu_nome_jp = NOMES_CASAL.get(usuario.phone, 'Alguem')
                     parceiro_phone_jp = get_parceiro_phone(usuario.phone)
                     nome_parceiro_jp = NOMES_CASAL.get(parceiro_phone_jp, '').lower() if parceiro_phone_jp else ''
                     if parceiro_phone_jp and pessoa_paga.lower() == nome_parceiro_jp:
-                        notificar_parceiro(usuario.phone, f"{meu_nome_jp} pagou-te os {r[1]:.2f}EUR que devia! Divida fechada.")
+                        notificar_parceiro(usuario.phone, f"{meu_nome_jp} pagou-te os {r[1]:.2f}€ que devia! Dívida fechada.")
                 else:
-                    enviar_mensagem(phone_raw, f"Nao encontrei nenhuma divida tua ao {pessoa_paga} em aberto")
+                    # Fallback: dívida grande tipo carro (tabela dividas_pessoais, com saldo+parcela)
+                    saldo_dp, parcela_dp = get_saldo_divida(usuario.id, pessoa_paga)
+                    if saldo_dp > 0:
+                        valor_pago_dp = extrair_valor(texto) or parcela_dp
+                        novo_saldo_dp = max(0, saldo_dp - valor_pago_dp)
+                        set_saldo_divida(usuario.id, pessoa_paga, novo_saldo_dp, parcela_dp)
+                        try:
+                            db.session.add(Despesa(usuario_id=usuario.id, valor=valor_pago_dp, categoria='outros',
+                                descricao=f'Pagamento dívida {pessoa_paga}', data=agora().replace(tzinfo=None)))
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+                        meu_nome_dp = NOMES_CASAL.get(usuario.phone, 'Parceiro')
+                        if novo_saldo_dp > 0:
+                            meses_rest_dp = int(novo_saldo_dp/parcela_dp) + (1 if novo_saldo_dp % parcela_dp > 0 else 0)
+                            enviar_mensagem(phone_raw,
+                                f"✅ Pago {valor_pago_dp:.0f}€ à {pessoa_paga}\n💳 Saldo restante: {novo_saldo_dp:.0f}€\n📅 ~{meses_rest_dp} mes(es) para terminar")
+                            notificar_parceiro(usuario.phone,
+                                f"💸 {meu_nome_dp} pagou {valor_pago_dp:.0f}€ da dívida\n💳 Falta: {novo_saldo_dp:.0f}€\n📅 ~{meses_rest_dp} mes(es) para terminar")
+                        else:
+                            enviar_mensagem(phone_raw, f"🎉 Dívida à {pessoa_paga} paga! Zero euros em dívida 💪")
+                            notificar_parceiro(usuario.phone, f"🎉 {meu_nome_dp} pagou a dívida toda! Estão quites 💪")
+                    else:
+                        enviar_mensagem(phone_raw, f"Não encontrei nenhuma dívida tua ao {pessoa_paga} em aberto 🤔\nSe queres só registar o gasto, diz o valor de outra forma.")
             except Exception as e:
                 log.error(f"ja_paguei: {e}"); enviar_mensagem(phone_raw, "Erro")
             return
