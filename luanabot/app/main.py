@@ -6750,8 +6750,9 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
     # Usar saldo real do Revolut se disponível, senão o calculado
     # Formato completo com todas as contas
     import datetime as _dt
-    saldo_variavel = saldo_rev_real if saldo_rev_real is not None else disp
-    msg = f"💳 *Tens {saldo_variavel:.0f}€ para gastar*"
+    # Usar o DISPONÍVEL CALCULADO para "para gastar" — nunca substituir pelo saldo real
+    # (o saldo real é mostrado à parte, são dois números com significados diferentes)
+    saldo_variavel = disp
     is_ruben = usuario.phone == PHONE_RUBEN
 
     msg = ""
