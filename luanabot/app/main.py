@@ -879,6 +879,7 @@ def criar_tabelas():
     sqls = [
         "CREATE TABLE IF NOT EXISTS aprendizagem (chave VARCHAR(100) PRIMARY KEY, categoria VARCHAR(50) NOT NULL)",
         "CREATE TABLE IF NOT EXISTS estado_utilizador (phone VARCHAR(50) PRIMARY KEY, estado VARCHAR(100), dados TEXT, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS fila_perguntas (id SERIAL PRIMARY KEY, phone VARCHAR(50) NOT NULL, estado VARCHAR(100) NOT NULL, dados TEXT, mensagem TEXT, criado_em TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS badges (id SERIAL PRIMARY KEY, usuario_id INTEGER, badge VARCHAR(100), obtido_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
@@ -987,6 +988,50 @@ def set_estado(phone, estado, dados=None):
 
 def limpar_estado(phone):
     set_estado(phone, None, {})
+    _avancar_fila_perguntas(phone)
+
+def _avancar_fila_perguntas(phone):
+    """Depois de uma pergunta ser respondida (ou limpa), verifica se há outra
+    pergunta em espera na fila para esta pessoa e ativa-a (define o estado e
+    envia a mensagem guardada). Evita que duas perguntas proativas (recibo,
+    aniversário, conjunta, etc.) se atropelem uma à outra."""
+    try:
+        prox = db.session.execute(text(
+            "SELECT id, estado, dados, mensagem FROM fila_perguntas WHERE phone=:p ORDER BY id ASC LIMIT 1"),
+            {'p': phone}).fetchone()
+        if not prox:
+            return
+        fid, est_p, dados_p, msg_p = prox
+        db.session.execute(text("DELETE FROM fila_perguntas WHERE id=:i"), {'i': fid})
+        db.session.commit()
+        set_estado(phone, est_p, json.loads(dados_p) if dados_p else {})
+        if msg_p:
+            enviar_mensagem(f"{phone}@lid", msg_p)
+    except Exception as e:
+        log.error(f"_avancar_fila_perguntas: {e}")
+        try: db.session.rollback()
+        except Exception: pass
+
+def perguntar_ou_enfileirar(phone, novo_estado, novos_dados, mensagem):
+    """Usar para PERGUNTAS PROATIVAS do bot (scheduler, notificações ao parceiro, etc.)
+    em vez de set_estado+enviar_mensagem diretos. Se a pessoa já tem uma pergunta
+    pendente, esta nova fica em fila e só é enviada quando a anterior for respondida
+    — em vez de a substituir silenciosamente (o que confundia as respostas)."""
+    try:
+        estado_atual, _ = get_estado(phone)
+        if not estado_atual or estado_atual in ('normal', 'None'):
+            set_estado(phone, novo_estado, novos_dados)
+            enviar_mensagem(f"{phone}@lid", mensagem)
+        else:
+            db.session.execute(text(
+                "INSERT INTO fila_perguntas (phone, estado, dados, mensagem) VALUES (:p,:e,:d,:m)"),
+                {'p': phone, 'e': novo_estado, 'd': json.dumps(novos_dados or {}), 'm': mensagem})
+            db.session.commit()
+            log.info(f"Pergunta enfileirada para {phone} (estado atual: {estado_atual})")
+    except Exception as e:
+        log.error(f"perguntar_ou_enfileirar: {e}")
+        try: db.session.rollback()
+        except Exception: pass
 
 def get_modo(usuario_id):
     try:
@@ -3044,8 +3089,7 @@ def _avancar_fila_aniversarios(phone_raw, phone, fila):
         return
     proximo = fila[0]
     resto = fila[1:]
-    set_estado(phone, 'aniv_apartar', {'nome': proximo['nome'], 'dias': proximo['dias'], 'fila': resto})
-    enviar_mensagem(phone_raw,
+    perguntar_ou_enfileirar(phone, 'aniv_apartar', {'nome': proximo['nome'], 'dias': proximo['dias'], 'fila': resto},
         f"🎂 E o(a) *{proximo['nome']}*? Faz anos daqui a {proximo['dias']} dias!\n"
         f"Queres apartar dinheiro para a prenda? (sim/não)")
 
@@ -3084,17 +3128,16 @@ def verificar_aniversarios_proximo_mes(phone_raw, usuario, salario):
         # Guardar TODOS na fila — não sobrescreve, processa um a um
         primeiro = fila_aniv[0]
         resto = fila_aniv[1:]
-        set_estado(phone, 'aniv_apartar', {'nome': primeiro['nome'], 'dias': primeiro['dias'], 'fila': resto})
         if len(fila_aniv) == 1:
-            enviar_mensagem(phone_raw,
-                f"🎂 Lembrete: {primeiro['nome']} faz anos daqui a {primeiro['dias']} dias!\n"
-                f"Queres apartar dinheiro para a prenda? (sim/não)")
+            msg_aniv = (f"🎂 Lembrete: {primeiro['nome']} faz anos daqui a {primeiro['dias']} dias!\n"
+                        f"Queres apartar dinheiro para a prenda? (sim/não)")
         else:
             nomes = ', '.join(f"{a['nome']} ({a['dias']}d)" for a in fila_aniv)
-            enviar_mensagem(phone_raw,
-                f"🎂 Aniversários a chegar: {nomes}\n\n"
-                f"Vamos um de cada vez — *{primeiro['nome']}* faz anos daqui a {primeiro['dias']} dias!\n"
-                f"Queres apartar dinheiro para a prenda? (sim/não)")
+            msg_aniv = (f"🎂 Aniversários a chegar: {nomes}\n\n"
+                        f"Vamos um de cada vez — *{primeiro['nome']}* faz anos daqui a {primeiro['dias']} dias!\n"
+                        f"Queres apartar dinheiro para a prenda? (sim/não)")
+        perguntar_ou_enfileirar(phone, 'aniv_apartar',
+            {'nome': primeiro['nome'], 'dias': primeiro['dias'], 'fila': resto}, msg_aniv)
 
 
 # ─── OBJETIVOS CASAL COM CONTRIBUIÇÕES ───────────────────────
@@ -4727,8 +4770,7 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
             db.session.add(despesa_pend)
             db.session.commit()
             phone_clean_tx = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-            set_estado(phone_clean_tx, 'aguardar_categoria_revolut', {'despesa_id': despesa_pend.id})
-            enviar_mensagem(phone_raw,
+            perguntar_ou_enfileirar(phone_clean_tx, 'aguardar_categoria_revolut', {'despesa_id': despesa_pend.id},
                 f"💜 Vi uma transação no Revolut: *{valor:.2f}€* — \"{desc[:40]}\"\n"
                 f"O que foi isto? (já registei como 'outros', podes corrigir)")
         except Exception as e:
@@ -7034,15 +7076,18 @@ def registar_deposito_conjunta(phone_raw, usuario, texto):
     
     # Notificar parceiro
     if is_fixo:
-        notificar_parceiro(usuario.phone,
-            f"💑 *{meu_nome_curto} já meteu os {valor:.0f}€ na conjunta!*\n"
-            f"Já meteste os teus? 😊")
         try:
             parceiro_phone_conj = get_parceiro_phone(usuario.phone)
             if parceiro_phone_conj:
-                set_estado(parceiro_phone_conj, 'confirmar_meti_conjunta', {'valor': valor})
+                perguntar_ou_enfileirar(parceiro_phone_conj, 'confirmar_meti_conjunta', {'valor': valor},
+                    f"💑 *{meu_nome_curto} já meteu os {valor:.0f}€ na conjunta!*\n"
+                    f"Já meteste os teus? 😊")
+            else:
+                notificar_parceiro(usuario.phone,
+                    f"💑 *{meu_nome_curto} já meteu os {valor:.0f}€ na conjunta!*\n"
+                    f"Já meteste os teus? 😊")
         except Exception as e:
-            log.error(f"set_estado parceiro conjunta: {e}")
+            log.error(f"perguntar conjunta parceiro: {e}")
     else:
         notificar_parceiro(usuario.phone,
             f"💑 {meu_nome_curto} adicionou {valor:.0f}€ à conjunta\n"
@@ -8859,8 +8904,7 @@ def processar_salarios_pendentes():
                     {'u': u.id}).fetchone()
                 if pendente: continue
                 # Não respondeu — perguntar agora
-                set_estado(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')})
-                enviar_mensagem(f"{u.phone}@lid",
+                perguntar_ou_enfileirar(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')},
                     f"Bom dia! 💰 Hoje é dia de receber o salário!\n"
                     f"Já caiu na conta? Manda o valor ou o recibo 📄")
                 log.info(f"Fallback recibo enviado para {u.phone}")
@@ -9085,8 +9129,7 @@ def lembrete_recibo():
             pag = dia_pagamento_usuario(u, hoje.year, hoje.month)
             vespera = dia_util_anterior(pag)
             if hoje.date() == vespera.date():
-                set_estado(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')})
-                enviar_mensagem(f"{u.phone}@lid",
+                perguntar_ou_enfileirar(u.phone, 'aguardar_recibo', {'data_pagamento': pag.strftime('%Y-%m-%d')},
                     f"Olá! 📄 Amanhã deves receber o salário!\n"
                     f"Já chegou o recibo? Manda o PDF/foto ou diz o valor 😊")
 
@@ -9235,8 +9278,7 @@ def aviso_pagamentos_agendados():
                             # Fallback: perguntar manualmente
                             if not api_ok:
                                 media_txt = f" (média: {media:.0f}€)" if media > 0 else ""
-                                set_estado(u.phone, 'confirmar_debito_variavel', {'pid': pid, 'nome': nome, 'cat': cat})
-                                enviar_mensagem(f"{u.phone}@lid",
+                                perguntar_ou_enfileirar(u.phone, 'confirmar_debito_variavel', {'pid': pid, 'nome': nome, 'cat': cat},
                                     f"📅 *Hoje sai o {nome}!*{media_txt}\n\nSabes quanto foi? Diz só o valor (ex: _24_)\nou _média_ para usar a estimativa")
                             continue
                         db.session.add(Despesa(usuario_id=u.id, valor=valor,
