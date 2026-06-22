@@ -2333,15 +2333,27 @@ def api_dashboard():
     futuras = DespesaFutura.query.filter(DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).all()
     total_fut = sum(d.valor_reserva_mensal for d in futuras)
     mes_atual_str = f"{ano}-{mes:02d}"
-    ja_recebeu = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
-    salario_efetivo = (usuario.salario_liquido or 0) if ja_recebeu else 0
-    p = calcular_plano(salario_efetivo, modo, total_fut, phone=usuario.phone)
+    ja_recebeu_flag = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
+    # Cross-check robusto: se já há receitas lançadas este mês que cobrem o salário
+    # (ex: registado como "Extra" em vez de "Salario"), conta como recebido mesmo sem a flag.
+    try:
+        _receitas_check = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
+            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+            {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
+        _receitas_check = float(_receitas_check)
+    except Exception:
+        _receitas_check = 0.0
+    sal_liq = usuario.salario_liquido or 0
+    ja_recebeu = ja_recebeu_flag or (sal_liq > 0 and _receitas_check >= sal_liq * 0.9)
+    salario_efetivo = sal_liq if ja_recebeu else 0
+    p = calcular_plano(salario_efetivo, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
     gastos_mes = sum(v for _, v in por_cat)
     disp = p['gastar'] - gastos_mes
     reserva = get_reserva(usuario.id)
 
-    # Despesas fixas previstas (sempre, independente de salário)
-    p_fixos = calcular_plano(usuario.salario_liquido or 0, modo, total_fut, phone=usuario.phone)
+    # Despesas fixas previstas (sempre, independente de salário) — inclui dívida à Luana (usuario_id necessário)
+    p_fixos = calcular_plano(usuario.salario_liquido or 0, modo, total_fut, phone=usuario.phone, usuario_id=usuario.id)
     NOMES_FIXOS = {
         'mae':'Mãe','credito1':'Crédito 1','credito2':'Crédito 2','carro':'Carro',
         'conjunta':'Conjunta','combustivel':'Combustível','divida_luana':'Dívida à Luana',
@@ -2352,14 +2364,7 @@ def api_dashboard():
                    for k, v in p_fixos.items() if k not in chaves_excluir and isinstance(v,(int,float)) and v]
 
     # ─── RECEBIDO / A RECEBER / PAGO / A PAGAR (valores REAIS da BD) ───
-    try:
-        receitas_mes_v = db.session.execute(text(
-            "SELECT COALESCE(SUM(valor),0) FROM receitas WHERE usuario_id=:u "
-            "AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
-            {'u':usuario.id,'m':mes,'y':ano}).scalar() or 0
-        recebido_mes = round(float(receitas_mes_v), 2)
-    except Exception:
-        recebido_mes = 0.0
+    recebido_mes = round(_receitas_check, 2)  # já calculado acima (cross-check do salário)
     try:
         sal_pend = db.session.execute(text(
             "SELECT COALESCE(SUM(valor),0) FROM salarios_pendentes WHERE usuario_id=:u AND processado=FALSE"),
@@ -2373,8 +2378,11 @@ def api_dashboard():
     except Exception:
         split_receber = 0
     a_receber = round(float(sal_pend) + float(split_receber), 2)
-    if not ja_recebeu and (usuario.salario_liquido or 0) > 0 and sal_pend == 0:
-        a_receber = round(a_receber + (usuario.salario_liquido or 0), 2)
+    # Só soma o salário a "a receber" se realmente ainda não entrou nada que o cubra
+    # (evita duplicar quando o salário já foi lançado por outra via, ex: "dinheiro extra")
+    if not ja_recebeu and sal_liq > 0 and sal_pend == 0:
+        falta_receber = max(0, sal_liq - recebido_mes)
+        a_receber = round(a_receber + falta_receber, 2)
     pago_mes = round(float(gastos_mes), 2)
     try:
         a_pagar = db.session.execute(text(
