@@ -6774,10 +6774,10 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
             cor = "😊" if saldo_variavel > 200 else ("😬" if saldo_variavel < 50 else "👍")
             msg += f"💳 Para gastar: *{saldo_variavel:.0f}€* {cor}\n"
 
-    # Conjunta — saldo real Revolut
-    if saldo_conj_real is not None and saldo_conj_real > 0:
+    # Conjunta — saldo real Revolut (mostra sempre, mesmo a 0€, para nunca desaparecer)
+    if saldo_conj_real is not None:
         msg += f"💑 Conjunta: *{saldo_conj_real:.2f}€*\n"
-    elif total_dep_q > 0:
+    else:
         msg += f"💑 Conjunta: *{resta_conj:.0f}€*\n"
 
     # Reserva
