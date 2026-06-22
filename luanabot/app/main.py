@@ -916,6 +916,7 @@ def criar_tabelas():
         "ALTER TABLE objetivos_poupanca ADD COLUMN IF NOT EXISTS por_mes_sugerido FLOAT",
         "ALTER TABLE despesas ADD COLUMN IF NOT EXISTS tags VARCHAR(200)",
         "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS lembrar_nif BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS poupanca_automatica FLOAT DEFAULT 0",
         # Semear valores atuais SO se ainda estiver NULL (nao sobrescreve edicoes futuras)
         "UPDATE usuarios SET fixo_mae=100, fixo_credito1=50, fixo_credito2=50, fixo_carro=200, "
         "fixo_conjunta=50, fixo_combustivel=50, fixo_carro_fim_mes=7 "
@@ -2759,7 +2760,7 @@ def mostrar_grupo(phone_raw, usuario, grupo_key):
     # Últimos gastos
     msg += "\n\nÚltimos:\n"
     for d in rows[:5]:
-        desc = d.descricao.replace('[conjunta] ','')[:25]
+        desc = d.descricao.replace('[conjunta] ','').replace('[divida_fixa] ','')[:25]
         msg += f"• {d.valor:.0f}€ — {desc}\n"
 
     enviar_mensagem(phone_raw, msg)
@@ -3883,7 +3884,7 @@ def ver_transacoes(phone_raw, usuario, limite=15):
                 mes_atual = mes_label
             emoji_c = EMOJI_CAT.get(cat, '💳')
             cod = id_para_codigo(tid)
-            desc_curta = (desc or cat).replace('[conjunta] ','').replace('[reserva] ','')[:24]
+            desc_curta = (desc or cat).replace('[conjunta] ','').replace('[reserva] ','').replace('[divida_fixa] ','')[:24]
             dia_txt = f"{data.strftime('%d/%m')}"
             msg += f"• {dia_txt} {emoji_c} {desc_curta} — *{valor:.0f}€*  `{cod}`\n"
             total_listado += valor
@@ -4927,7 +4928,7 @@ def processar_texto(phone_raw, phone, texto):
                     nomes_m = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
                     msg = f"{EMOJI_CAT.get(cat_sel,'💳')} {cat_sel.capitalize()} — {nomes_m[mes_r-1]}\n\n"
                     for d in rows[:15]:
-                        desc = d.descricao.replace('[conjunta] ','').replace('[reserva] ','')[:30]
+                        desc = d.descricao.replace('[conjunta] ','').replace('[reserva] ','').replace('[divida_fixa] ','')[:30]
                         msg += f"• {d.valor:.2f}€ — {desc}\n"
                     msg += f"\n💰 Total: {total:.2f}€"
                     enviar_mensagem(phone_raw, msg)
@@ -5784,13 +5785,25 @@ def processar_texto(phone_raw, phone, texto):
                     {'u':usuario.id,'p':pessoa_pagou}).fetchone()
                 db.session.commit()
                 if r:
-                    enviar_mensagem(phone_raw, f"OK {pessoa_pagou} pagou {r[1]:.2f}EUR -- {r[0]}!")
+                    enviar_mensagem(phone_raw, f"OK {pessoa_pagou} pagou {r[1]:.2f}€ — {r[0]}!")
                     meu_nome_p = NOMES_CASAL.get(usuario.phone, 'Alguem')
                     parceiro_phone_p = get_parceiro_phone(usuario.phone)
                     nome_parceiro_p = NOMES_CASAL.get(parceiro_phone_p, '').lower() if parceiro_phone_p else ''
                     if parceiro_phone_p and pessoa_pagou.lower() == nome_parceiro_p:
-                        notificar_parceiro(usuario.phone, f"{meu_nome_p} confirmou que recebeu os {r[1]:.2f}EUR! Divida fechada.")
-                else: enviar_mensagem(phone_raw, f"Nao encontrei splits pendentes com {pessoa_pagou}")
+                        # Dinheiro real mudou de mãos: eu recebo, o parceiro paga
+                        try:
+                            db.session.add(Receita(usuario_id=usuario.id, valor=r[1], descricao='Extra',
+                                data=agora().replace(tzinfo=None)))
+                            parceiro_obj_p = Usuario.query.filter_by(phone=parceiro_phone_p).first()
+                            if parceiro_obj_p:
+                                db.session.add(Despesa(usuario_id=parceiro_obj_p.id, valor=r[1],
+                                    descricao=f'Pagamento a {meu_nome_p}', categoria='outros',
+                                    data=agora().replace(tzinfo=None)))
+                            db.session.commit()
+                        except Exception as e:
+                            log.error(f"pagou movimento dinheiro: {e}"); db.session.rollback()
+                        notificar_parceiro(usuario.phone, f"{meu_nome_p} confirmou que recebeu os {r[1]:.2f}€! Dívida fechada.")
+                else: enviar_mensagem(phone_raw, f"Não encontrei splits pendentes com {pessoa_pagou}")
             except Exception as e:
                 log.error(f"pagou: {e}"); enviar_mensagem(phone_raw, "Erro")
             return
@@ -5824,6 +5837,18 @@ def processar_texto(phone_raw, phone, texto):
                     parceiro_phone_jp = get_parceiro_phone(usuario.phone)
                     nome_parceiro_jp = NOMES_CASAL.get(parceiro_phone_jp, '').lower() if parceiro_phone_jp else ''
                     if parceiro_phone_jp and pessoa_paga.lower() == nome_parceiro_jp:
+                        # Dinheiro real mudou de mãos: eu pago, o parceiro recebe
+                        try:
+                            db.session.add(Despesa(usuario_id=usuario.id, valor=r[1],
+                                descricao=f'Pagamento a {pessoa_paga} ({desc_limpa})',
+                                categoria='outros', data=agora().replace(tzinfo=None)))
+                            parceiro_obj_jp = Usuario.query.filter_by(phone=parceiro_phone_jp).first()
+                            if parceiro_obj_jp:
+                                db.session.add(Receita(usuario_id=parceiro_obj_jp.id, valor=r[1],
+                                    descricao='Extra', data=agora().replace(tzinfo=None)))
+                            db.session.commit()
+                        except Exception as e:
+                            log.error(f"ja_paguei movimento dinheiro: {e}"); db.session.rollback()
                         notificar_parceiro(usuario.phone, f"{meu_nome_jp} pagou-te os {r[1]:.2f}€ que devia! Dívida fechada.")
                 else:
                     # Fallback: dívida grande tipo carro (tabela dividas_pessoais, com saldo+parcela)
@@ -5882,6 +5907,20 @@ def processar_texto(phone_raw, phone, texto):
             m_dividir = re.search(r'dividir\s+(\d+(?:[.,]\d+)?)\s*(?:€|eur|euros)?\s*(?:por|entre)\s+(\d+)', t)
         if m_dividir:
             processar_dividir_conta(phone_raw, usuario, m_dividir.group(1), m_dividir.group(2)); return
+
+        m_poup_auto = re.search(r'(?:poupan[çc]a automatica|poupan[çc]a autom[áa]tica|debito poupanca|d[ée]bito poupan[çc]a)\s+(?:de\s+|para\s+)?(\d+(?:[.,]\d+)?)', t)
+        if m_poup_auto:
+            try:
+                valor_pa = float(m_poup_auto.group(1).replace(',', '.'))
+                db.session.execute(text("UPDATE usuarios SET poupanca_automatica=:v WHERE id=:u"),
+                                    {'v': valor_pa, 'u': usuario.id})
+                db.session.commit()
+                enviar_mensagem(phone_raw,
+                    f"✅ Poupança automática definida em {valor_pa:.0f}€!\n"
+                    f"A partir de agora o plano mostra isto já incluído na poupança 💎")
+            except Exception as e:
+                log.error(f"poupanca_automatica: {e}"); db.session.rollback()
+            return
 
         m_fixo_set = re.search(r'(?:mudar |alterar |trocar )?fixo\s+([a-zà-ú0-9]+(?:\s+[a-zà-ú0-9]+)?)\s+(?:para\s+)?([\d]+(?:[.,]\d+)?)', t)
         if m_fixo_set:
@@ -6530,7 +6569,18 @@ def enviar_plano_salario(phone_raw, usuario, salario):
         for d in futuras: msg += f"\n     {d.descricao}: {d.valor_reserva_mensal:.0f}€"
     msg += f"\n🛡️ Fundo: {p['fundo']:.2f}€ (Revolut!)\n"
     msg += f"💳 Para gastar: {p['gastar']:.0f}€\n"
-    msg += f"💎 Poupanca: {p['poupanca']:.0f}€"
+    try:
+        poup_auto = db.session.execute(text(
+            "SELECT poupanca_automatica FROM usuarios WHERE id=:u"), {'u': usuario.id}).scalar() or 0
+    except Exception:
+        poup_auto = 0
+    if poup_auto > 0:
+        falta_guardar = max(p['poupanca'] - poup_auto, 0)
+        msg += f"💎 Poupança: {p['poupanca']:.0f}€\n"
+        msg += f"   🏦 {poup_auto:.0f}€ já vai automático\n"
+        msg += f"   💰 Falta guardar: {falta_guardar:.0f}€"
+    else:
+        msg += f"💎 Poupanca: {p['poupanca']:.0f}€"
     if p['subsidio']:
         mes_sub = agora().month
         if mes_sub == 6:
@@ -6919,7 +6969,7 @@ def enviar_conjunta(phone_raw, usuario):
             Despesa.descricao.like('[conjunta]%')
         ).order_by(Despesa.data.desc()).all()
         for d in rows:
-            desc = d.descricao.replace('[conjunta] ','').replace('[conjunta]','').strip()
+            desc = d.descricao.replace('[conjunta] ','').replace('[conjunta]','').replace('[divida_fixa] ','').strip()
             emoji_c = EMOJI_CAT.get(d.categoria,'💳')
             gastos_rows.append(f"  {emoji_c} {desc[:25]} — {d.valor:.2f}€ ({nome_u})")
             gasto_total += d.valor
@@ -7153,7 +7203,7 @@ def corrigir_ultimo(phone_raw, usuario, nova_cat):
     if not ultima:
         enviar_mensagem(phone_raw, "Nao tenho nenhum gasto p/ corrigir 🤔"); return
     cat_antiga = ultima.categoria; ultima.categoria = nova_cat; db.session.commit()
-    desc = ultima.descricao.replace('[conjunta] ','').replace('[reserva] ','').lower()
+    desc = ultima.descricao.replace('[conjunta] ','').replace('[reserva] ','').replace('[divida_fixa] ','').lower()
     stop = {'gastei','paguei','comprei','almocei','jantei','euros','euro','no','na','em',
             'da','do','de','reserva','conjunta','num','uma','uns','umas','com'}
     palavras = [w for w in re.findall(r"[a-zà-ú&']+", desc) if len(w)>2 and w not in stop]
