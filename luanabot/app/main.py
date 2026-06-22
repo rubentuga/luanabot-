@@ -832,6 +832,28 @@ def verificar_fixos_completos(usuario, p):
         return False
     return True
 
+def categorizar_conhecido(texto):
+    """Como categorizar(), mas devolve None se não encontrar nada conhecido
+    (não usa o fallback de IA). Útil para decidir se vale a pena perguntar ao
+    utilizador em vez de adivinhar."""
+    t = texto.lower()
+    aprendidas = carregar_aprendidas()
+    for chave, cat in aprendidas.items():
+        if chave in t:
+            return cat, EMOJI_CAT.get(cat,'💳'), chave.capitalize()
+    tokens = re.findall(r"[a-zà-ú&']+", t)
+    for chave, cat in LOJAS.items():
+        if ' ' in chave and chave in t:
+            return cat, EMOJI_CAT.get(cat,'💳'), LOJAS_NOME.get(chave, chave.capitalize())
+    for tok in tokens:
+        if tok in LOJAS:
+            cat = LOJAS[tok]
+            return cat, EMOJI_CAT.get(cat,'💳'), LOJAS_NOME.get(tok, tok.capitalize())
+    for chave, cat in LOJAS.items():
+        if ' ' not in chave and len(chave) > 3 and chave in t:
+            return cat, EMOJI_CAT.get(cat,'💳'), LOJAS_NOME.get(chave, chave.capitalize())
+    return None
+
 def categorizar(texto):
     t = texto.lower()
     aprendidas = carregar_aprendidas()
@@ -2290,7 +2312,7 @@ def api_dashboard():
 
     # Objetivos
     objetivos = db.session.execute(text(
-        "SELECT descricao, valor_objetivo, valor_atual, data_meta FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
+        "SELECT descricao, valor_objetivo, valor_atual, data_meta FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE AND LOWER(descricao) NOT IN ('coisasnossas','coisasminhas')"),
         {'id':usuario.id}).fetchall()
 
     # Transações recentes (últimos 30 registos)
@@ -4168,6 +4190,7 @@ BANCOS_ENABLE = {
     'credito agricola': 'Credito Agricola', 'crédito agrícola': 'Credito Agricola',
     'ing': 'ING', 'deutsche': 'Deutsche Bank', 'unicre': 'Unicre',
     'edenred': 'Edenred', 'paypal': 'PayPal',
+    'trade republic': 'Trade Republic', 'traderepublic': 'Trade Republic', 'trade': 'Trade Republic',
 }
 
 BANCOS_ENABLE_SEARCH = {
@@ -4182,6 +4205,7 @@ BANCOS_ENABLE_SEARCH = {
     'credito agricola': 'agricola', 'crédito agrícola': 'agricola',
     'ing': 'ing', 'deutsche': 'deutsche', 'unicre': 'unicre',
     'edenred': 'edenred', 'paypal': 'paypal',
+    'trade republic': 'trade republic', 'traderepublic': 'trade republic', 'trade': 'trade republic',
 }
 
 def _buscar_nome_aspsp_real(banco_chave):
@@ -4646,27 +4670,27 @@ def enable_buscar_transacoes_recentes(usuario, minutos=35):
         return []
 
 def tx_ja_registada(usuario_id, tx_id, valor, desc, data_tx):
-    """Verifica se esta transação já foi registada (por ID externo ou por match desc+valor+data)."""
+    """Verifica se esta transação já foi registada (por ID externo ou por valor+data próximos).
+    NÃO depende de o texto da descrição coincidir — o Revolut e o que a pessoa escreve
+    manualmente raramente usam as mesmas palavras (ex: 'pingo doce' vs 'PINGO DOCE LISBOA 4521').
+    Valor exato + janela de tempo é o sinal mais fiável para evitar duplicados."""
     try:
-        # Verificar por transaction_id externo
+        # Verificar por transaction_id externo (sync repetido da mesma transação)
         if tx_id:
             existe = db.session.execute(text(
                 "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u AND descricao LIKE :tid"),
                 {'u': usuario_id, 'tid': f'%[txid:{tx_id}]%'}).scalar()
             if existe:
                 return True
-        # Verificar por match desc+valor dentro de ±2h
-        from datetime import timezone as _tz
+        # Verificar por valor exato dentro de ±3h (já registado manualmente ou por outra via)
         data_dt = datetime.fromisoformat(data_tx.replace('Z','')) if isinstance(data_tx, str) else data_tx
         existe2 = db.session.execute(text(
             "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u "
             "AND ABS(valor - :v) < 0.01 "
-            "AND data BETWEEN :d1 AND :d2 "
-            "AND descricao ILIKE :desc"),
+            "AND data BETWEEN :d1 AND :d2"),
             {'u': usuario_id, 'v': abs(valor),
-             'd1': data_dt - timedelta(hours=2),
-             'd2': data_dt + timedelta(hours=2),
-             'desc': f'%{desc[:15]}%' if desc else '%'}).scalar()
+             'd1': data_dt - timedelta(hours=3),
+             'd2': data_dt + timedelta(hours=3)}).scalar()
         return bool(existe2)
     except Exception as e:
         log.error(f"tx_ja_registada: {e}")
@@ -4691,7 +4715,28 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
     if tx_ja_registada(usuario.id, tx_id, valor, desc, data_tx):
         return
 
-    # Categorizar
+    # Tentar reconhecer SEM cair na IA — se não conhecer, pergunta em vez de adivinhar
+    conhecido = categorizar_conhecido(desc)
+
+    if conhecido is None and not eh_conjunta:
+        # Desconhecido: regista com categoria neutra e pergunta o que é
+        try:
+            desc_bd_pend = f"[aguardar_categoria] {desc[:60]} [txid:{tx_id}]" if tx_id else f"[aguardar_categoria] {desc[:60]}"
+            despesa_pend = Despesa(usuario_id=usuario.id, valor=valor,
+                descricao=desc_bd_pend, categoria='outros', data=agora().replace(tzinfo=None))
+            db.session.add(despesa_pend)
+            db.session.commit()
+            phone_clean_tx = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+            set_estado(phone_clean_tx, 'aguardar_categoria_revolut', {'despesa_id': despesa_pend.id})
+            enviar_mensagem(phone_raw,
+                f"💜 Vi uma transação no Revolut: *{valor:.2f}€* — \"{desc[:40]}\"\n"
+                f"O que foi isto? (já registei como 'outros', podes corrigir)")
+        except Exception as e:
+            log.error(f"registar tx pendente: {e}")
+            db.session.rollback()
+        return
+
+    # Conhecido (ou conjunta) — categorizar normalmente e registar
     cat, loja, _ = categorizar(desc)
     loja_n = loja or desc[:30]
     em = EMOJI_CAT.get(cat, '💳')
@@ -4956,6 +5001,50 @@ def processar_texto(phone_raw, phone, texto):
                 processar_despesa(phone_raw, usuario, f"{desc_w} {preco_w}€")
             else:
                 enviar_mensagem(phone_raw, "Adicionar à wishlist? Responde sim ou não")
+            return
+
+        if estado == 'confirmar_meti_conjunta':
+            d_cj = dados_estado
+            limpar_estado(phone)
+            palavras_cj = t.strip().split()
+            tem_sim_cj = any(p in ['sim','s','yes','claro','ja','já'] for p in palavras_cj)
+            tem_nao_cj = any(p in ['nao','não','n','no'] for p in palavras_cj) and not tem_sim_cj
+            if tem_sim_cj:
+                try:
+                    fixos_cj = get_fixos_usuario(usuario.phone, agora().month, usuario.id)
+                    valor_cj = fixos_cj.get('conjunta', 0) or d_cj.get('valor', 50)
+                    db.session.execute(text(
+                        "INSERT INTO conjunta_depositos (usuario_id, valor, descricao) VALUES (:u, :v, 'Confirmado por sim')"),
+                        {'u': usuario.id, 'v': valor_cj})
+                    db.session.commit()
+                    enviar_mensagem(phone_raw, f"💑 Boa! Registei os {valor_cj:.0f}€ na conjunta também ✅")
+                    meu_nome_cj = NOMES_CASAL.get(usuario.phone, 'O parceiro')
+                    notificar_parceiro(usuario.phone, f"💑 {meu_nome_cj} confirmou que também meteu na conjunta! Estão em dia 🎉")
+                except Exception as e:
+                    log.error(f"confirmar_meti_conjunta: {e}"); db.session.rollback()
+                    enviar_mensagem(phone_raw, "Erro ao registar 😕")
+            elif tem_nao_cj:
+                enviar_mensagem(phone_raw, "Ok! Quando puderes, diz 'meti os 50 da conjunta' 💪")
+            else:
+                processar_texto(phone_raw, phone, texto)
+            return
+
+        if estado == 'aguardar_categoria_revolut':
+            d_rv = dados_estado
+            despesa_id_rv = d_rv.get('despesa_id')
+            limpar_estado(phone)
+            try:
+                cat_rv, _, nome_rv = categorizar(texto)
+                nova_desc_rv = nome_rv or texto[:50].capitalize()
+                db.session.execute(text(
+                    "UPDATE despesas SET categoria=:c, descricao=:d WHERE id=:i AND usuario_id=:u"),
+                    {'c': cat_rv, 'd': nova_desc_rv, 'i': despesa_id_rv, 'u': usuario.id})
+                db.session.commit()
+                em_rv = EMOJI_CAT.get(cat_rv, '💳')
+                enviar_mensagem(phone_raw, f"{em_rv} Corrigido! *{nova_desc_rv}* — {cat_rv.capitalize()} ✅")
+            except Exception as e:
+                log.error(f"aguardar_categoria_revolut: {e}")
+                enviar_mensagem(phone_raw, "Erro ao corrigir 😕")
             return
 
         if estado == 'confirmar_pessoal_conjunta':
@@ -5922,6 +6011,19 @@ def processar_texto(phone_raw, phone, texto):
                 log.error(f"poupanca_automatica: {e}"); db.session.rollback()
             return
 
+        if any(p in t for p in ['coisasminhas','coisas minhas','coisasnossas','coisas nossas']):
+            nome_acc = 'coisasminhas' if 'minhas' in t else 'coisasnossas'
+            try:
+                v_acc = db.session.execute(text(
+                    "SELECT valor_atual FROM objetivos_poupanca WHERE usuario_id=:u AND LOWER(descricao)=:d AND concluido=FALSE"),
+                    {'u': usuario.id, 'd': nome_acc}).scalar() or 0
+                emoji_acc = '🪙' if nome_acc == 'coisasminhas' else '💑'
+                label_acc = 'Coisas minhas' if nome_acc == 'coisasminhas' else 'Coisas nossas'
+                enviar_mensagem(phone_raw, f"{emoji_acc} *{label_acc}:* {v_acc:.2f}€\n_Arredondamentos acumulados de cada gasto_")
+            except Exception as e:
+                log.error(f"ver coisas: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
+            return
+
         m_fixo_set = re.search(r'(?:mudar |alterar |trocar )?fixo\s+([a-zà-ú0-9]+(?:\s+[a-zà-ú0-9]+)?)\s+(?:para\s+)?([\d]+(?:[.,]\d+)?)', t)
         if m_fixo_set:
             processar_alterar_fixo(phone_raw, usuario, m_fixo_set.group(1), m_fixo_set.group(2)); return
@@ -6406,6 +6508,28 @@ def processar_despesa(phone_raw, usuario, texto):
             msg += f"\n⚠️ Passaste o orçamento em {abs(disp):.0f}€"
         elif pct_usado >= 80:
             msg += f"\n🔔 Usaste {pct_usado:.0f}% do orçamento"
+
+    # Round up → coisasminhas (igual à conjunta, mas para gastos pessoais)
+    import math
+    arredondado_pm = math.ceil(valor)
+    diferenca_pm = round(arredondado_pm - valor, 2)
+    if diferenca_pm > 0:
+        try:
+            r_obj_pm = db.session.execute(text(
+                "SELECT id FROM objetivos_poupanca WHERE usuario_id=:u AND LOWER(descricao)='coisasminhas' AND concluido=FALSE"
+            ), {'u': usuario.id}).fetchone()
+            if r_obj_pm:
+                db.session.execute(text(
+                    "UPDATE objetivos_poupanca SET valor_atual=valor_atual+:d WHERE id=:id"
+                ), {'d': diferenca_pm, 'id': r_obj_pm[0]})
+            else:
+                db.session.execute(text(
+                    "INSERT INTO objetivos_poupanca (usuario_id, descricao, valor_objetivo, valor_atual) VALUES (:u, 'coisasminhas', 9999, :d)"
+                ), {'u': usuario.id, 'd': diferenca_pm})
+            db.session.commit()
+            msg += f"\n🪙 +{diferenca_pm:.2f}€ → coisasminhas"
+        except Exception as e:
+            log.error(f"roundup pessoal: {e}"); db.session.rollback()
 
     enviar_mensagem(phone_raw, msg)
     verificar_badges(usuario, phone_raw)
@@ -6913,6 +7037,12 @@ def registar_deposito_conjunta(phone_raw, usuario, texto):
         notificar_parceiro(usuario.phone,
             f"💑 *{meu_nome_curto} já meteu os {valor:.0f}€ na conjunta!*\n"
             f"Já meteste os teus? 😊")
+        try:
+            parceiro_phone_conj = get_parceiro_phone(usuario.phone)
+            if parceiro_phone_conj:
+                set_estado(parceiro_phone_conj, 'confirmar_meti_conjunta', {'valor': valor})
+        except Exception as e:
+            log.error(f"set_estado parceiro conjunta: {e}")
     else:
         notificar_parceiro(usuario.phone,
             f"💑 {meu_nome_curto} adicionou {valor:.0f}€ à conjunta\n"
@@ -8379,7 +8509,7 @@ def processar_objetivo_poupanca(phone_raw, usuario, texto):
     if any(p in t for p in ['ver','lista','objetivos','metas','mostrar']):
         try:
             rows = db.session.execute(text(
-                "SELECT descricao, valor_objetivo, valor_atual, data_meta FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE"),
+                "SELECT descricao, valor_objetivo, valor_atual, data_meta FROM objetivos_poupanca WHERE usuario_id=:id AND concluido=FALSE AND LOWER(descricao) NOT IN ('coisasnossas','coisasminhas')"),
                 {'id':usuario.id}).fetchall()
             if not rows:
                 enviar_mensagem(phone_raw, "Nao tens objetivos ainda 🎯\nCria: 'quero poupar 500€ para ferias'"); return
