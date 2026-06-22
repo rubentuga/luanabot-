@@ -2416,7 +2416,10 @@ def api_dashboard():
     por_cat = db.session.query(Despesa.categoria, db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes,
-        db.extract('year',Despesa.data)==ano
+        db.extract('year',Despesa.data)==ano,
+        ~Despesa.descricao.like('[conjunta]%'),
+        ~Despesa.descricao.like('[reserva]%'),
+        ~Despesa.descricao.like('[divida_fixa]%')
     ).group_by(Despesa.categoria).all()
 
     # Gastos últimos 6 meses
