@@ -1186,7 +1186,7 @@ def calcular_disponivel(usuario):
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%'),
-        ~Despesa.descricao.like('[reserva]%'),
+        ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%'),
     ).scalar() or 0
     # Fixos já deduzidos no plano — só conta o EXCESSO acima do orçamento
     # Ex: gasolina orçamento=50€, gastou 70€ → só conta 20€ no disponível
@@ -1579,7 +1579,7 @@ def api_saude():
         gasto_mes = db.session.query(db.func.sum(Despesa.valor)).filter(
             Despesa.usuario_id==usuario.id,
             db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
-            ~Despesa.descricao.like('[conjunta]%'), ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+            ~Despesa.descricao.like('[conjunta]%'), ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
         reserva = get_reserva(usuario.id)
 
         # Score
@@ -2523,7 +2523,7 @@ def como_estou(phone_raw, usuario):
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%'),
-        ~Despesa.descricao.like('[reserva]%'),
+        ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%'),
     ).scalar() or 0
 
     # Gastos mês anterior (para comparação)
@@ -2847,7 +2847,7 @@ def previsao_fim_mes(phone_raw, usuario):
         db.extract('month',Despesa.data)==mes,
         db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%'),
-        ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+        ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
 
     disp, p = calcular_disponivel(usuario)
     gastar = p['gastar']
@@ -5508,7 +5508,7 @@ def processar_texto(phone_raw, phone, texto):
                 set_saldo_divida(usuario.id, credor, novo_saldo, parcela)
                 # Registar como gasto
                 despesa = Despesa(usuario_id=usuario.id, valor=valor_pago, categoria='outros',
-                    descricao=f'Pagamento divida {credor}', data=agora().replace(tzinfo=None))
+                    descricao=f'[divida_fixa] Pagamento divida {credor}', data=agora().replace(tzinfo=None))
                 db.session.add(despesa); db.session.commit()
                 meu_nome = NOMES_CASAL.get(usuario.phone, 'Parceiro')
                 if novo_saldo > 0:
@@ -5834,7 +5834,7 @@ def processar_texto(phone_raw, phone, texto):
                         set_saldo_divida(usuario.id, pessoa_paga, novo_saldo_dp, parcela_dp)
                         try:
                             db.session.add(Despesa(usuario_id=usuario.id, valor=valor_pago_dp, categoria='outros',
-                                descricao=f'Pagamento dívida {pessoa_paga}', data=agora().replace(tzinfo=None)))
+                                descricao=f'[divida_fixa] Pagamento dívida {pessoa_paga}', data=agora().replace(tzinfo=None)))
                             db.session.commit()
                         except Exception:
                             db.session.rollback()
@@ -6032,7 +6032,7 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['ver transacoes','ver transações','extrato','ultimas transacoes','últimas transações','ver gastos todos','todas as transacoes','todas as transações','historico de gastos','lista de gastos','ver despesas']):
             ver_transacoes(phone_raw, usuario); return
         # ── APAGAR POR CÓDIGO: "apaga G4X" / "excluir G4X" ───────────
-        m_cod = re.search(r'(?:apaga|apagar|elimina|eliminar|exclui|excluir|remove|remover)\s+(?:a\s+|o\s+|transa[çc][ãa]o\s+|gasto\s+)?([0-9a-zA-Z]{2,4})\b', texto, re.IGNORECASE)
+        m_cod = re.search(r'(?:apaga|apagar|elimina|eliminar|exclui|excluir|remove|remover|anula|anular)\s+(?:a\s+|o\s+|transa[çc][ãa]o\s+|gasto\s+)?([0-9a-zA-Z]{2,4})\b', texto, re.IGNORECASE)
         if m_cod and not any(p in t for p in ['ultimo','último','isso']):
             cod = m_cod.group(1).upper()
             tx_id = codigo_para_id(cod)
@@ -6666,7 +6666,7 @@ def verificar_sobra_mes(phone_raw, usuario, mes, ano):
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%'),
-        ~Despesa.descricao.like('[reserva]%'),
+        ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%'),
     ).scalar() or 0
     sobrou = p['gastar'] - gastos_mes
     if sobrou > 5:
@@ -6699,7 +6699,7 @@ def enviar_orcamento_hoje(phone_raw, usuario):
         gasto_hoje = db.session.query(db.func.sum(Despesa.valor)).filter(
             Despesa.usuario_id==usuario.id, Despesa.data >= hoje_inicio,
             ~Despesa.descricao.like('[conjunta]%'),
-            ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+            ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
         resta_hoje = por_dia - gasto_hoje
 
         msg = f"📅 *Orcamento de hoje, {nome}:*\n\n"
@@ -9213,7 +9213,7 @@ def fecho_mes():
                             db.extract('month',Despesa.data)==mes_ant,
                             db.extract('year',Despesa.data)==ano_ant,
                             ~Despesa.descricao.like('[conjunta]%'),
-                            ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+                            ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
                         _, p_ant = calcular_disponivel(u)
                         orcamento = p_ant.get('gastar', 0)
                         if orcamento > 0 and gasto_ant < orcamento:
@@ -9386,7 +9386,7 @@ def resumo_domingo_noite():
                 gasto_semana = db.session.query(db.func.sum(Despesa.valor)).filter(
                     Despesa.usuario_id==u.id, Despesa.data >= ha_7_dias,
                     ~Despesa.descricao.like('[conjunta]%'),
-                    ~Despesa.descricao.like('[reserva]%')).scalar() or 0
+                    ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
                 # Quantos dias sem gastar esta semana
                 dias_com_gasto = db.session.execute(text(
                     "SELECT COUNT(DISTINCT DATE(data)) FROM despesas WHERE usuario_id=:u "
