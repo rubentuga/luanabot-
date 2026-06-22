@@ -1174,7 +1174,12 @@ def calcular_disponivel(usuario):
         DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False).scalar() or 0
     # Só conta o salário se já foi recebido ESTE mês (senão disponível = 0)
     mes_atual_str = f"{ano}-{mes:02d}"
-    ja_recebeu = getattr(usuario, 'ultimo_salario_mes', '') == mes_atual_str
+    try:
+        ultimo_mes_real_disp = db.session.execute(text(
+            "SELECT ultimo_salario_mes FROM usuarios WHERE id=:u"), {'u': usuario.id}).scalar()
+    except Exception:
+        ultimo_mes_real_disp = None
+    ja_recebeu = ultimo_mes_real_disp == mes_atual_str
     salario_efetivo = (usuario.salario_liquido or 0) if ja_recebeu else 0
     p = calcular_plano(salario_efetivo, modo, futuras, phone=usuario.phone, usuario_id=usuario.id)
     gastos_raw = db.session.query(db.func.sum(Despesa.valor)).filter(
@@ -6375,9 +6380,12 @@ def processar_receita(phone_raw, usuario, texto):
     usuario.salario_liquido = valor
     # Marcar que recebeu salário ESTE mês (para o disponível contar)
     try:
-        usuario.ultimo_salario_mes = f"{agora().year}-{agora().month:02d}"
-    except Exception:
-        pass
+        mes_atual_pr = f"{agora().year}-{agora().month:02d}"
+        usuario.ultimo_salario_mes = mes_atual_pr
+        db.session.execute(text("UPDATE usuarios SET ultimo_salario_mes=:m WHERE id=:u"),
+                            {'m': mes_atual_pr, 'u': usuario.id})
+    except Exception as e:
+        log.error(f"ultimo_salario_mes write: {e}")
     db.session.add(Receita(usuario_id=usuario.id, valor=valor, descricao='Salario', data=agora().replace(tzinfo=None)))
     db.session.commit()
     enviar_plano_salario(phone_raw, usuario, valor)
@@ -8622,7 +8630,12 @@ def processar_salarios_pendentes():
                 if pag.date() != hoje.date(): continue
                 # Verificar se já processámos este mês
                 mes_atual = f"{hoje.year}-{hoje.month:02d}"
-                if u.ultimo_salario_mes == mes_atual: continue
+                try:
+                    ultimo_mes_real = db.session.execute(text(
+                        "SELECT ultimo_salario_mes FROM usuarios WHERE id=:u"), {'u': u.id}).scalar()
+                except Exception:
+                    ultimo_mes_real = None
+                if ultimo_mes_real == mes_atual: continue
                 # Verificar se tem salário pendente (já respondeu)
                 pendente = db.session.execute(text(
                     "SELECT id FROM salarios_pendentes WHERE usuario_id=:u AND processado=FALSE"),
