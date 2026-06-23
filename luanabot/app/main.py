@@ -2478,6 +2478,28 @@ def api_dashboard():
         fixos_pagos_set = {r[0] for r in fixos_pagos_rows}
     except Exception:
         fixos_pagos_set = set()
+    # Deteção automática: se já existe despesa real lançada este mês que cobre o fixo,
+    # considera-o pago mesmo sem toque manual (evita "1000€ a pagar" quando já pagaste a dívida, etc.)
+    try:
+        if p_fixos.get('divida_luana', 0) > 0:
+            pago_divida = db.session.execute(text(
+                "SELECT COALESCE(SUM(valor),0) FROM despesas WHERE usuario_id=:u "
+                "AND descricao LIKE '[divida_fixa]%%' AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+                {'u': usuario.id, 'm': mes, 'y': ano}).scalar() or 0
+            if float(pago_divida) >= p_fixos['divida_luana'] * 0.9:
+                fixos_pagos_set.add('divida_luana')
+        FIXO_CATEGORIA_AUTO = {'combustivel': 'combustivel', 'unhas': 'pessoal'}
+        for chave_fixo, cat_desp in FIXO_CATEGORIA_AUTO.items():
+            orcamento = p_fixos.get(chave_fixo, 0)
+            if orcamento > 0:
+                real = db.session.query(db.func.sum(Despesa.valor)).filter(
+                    Despesa.usuario_id==usuario.id, Despesa.categoria==cat_desp,
+                    db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+                ).scalar() or 0
+                if float(real) >= orcamento * 0.9:
+                    fixos_pagos_set.add(chave_fixo)
+    except Exception as e:
+        log.warning(f"deteção automática fixos pagos: {e}")
     fixos_lista = [{'nome': NOMES_FIXOS.get(k, k.replace('_',' ').capitalize()), 'valor': round(v, 2),
                      'chave': k, 'pago': k in fixos_pagos_set}
                    for k, v in p_fixos.items() if k not in chaves_excluir and isinstance(v,(int,float)) and v]
@@ -2606,6 +2628,24 @@ def api_dashboard():
     except Exception:
         combustivel = None
 
+    # Próximos pagamentos avisados ("dia 25 do próximo mês tenho seguro carro 200€")
+    proximos_pagamentos = []
+    try:
+        futuras_rows = DespesaFutura.query.filter(
+            DespesaFutura.usuario_id==usuario.id, DespesaFutura.pago==False
+        ).order_by(DespesaFutura.data_prevista.asc()).all()
+        hoje_pp = agora().replace(tzinfo=None).date()
+        for f in futuras_rows:
+            dp = f.data_prevista.date() if hasattr(f.data_prevista, 'date') else f.data_prevista
+            proximos_pagamentos.append({
+                'desc': f.descricao, 'valor': round(float(f.valor_total or 0), 2),
+                'reserva_mensal': round(float(f.valor_reserva_mensal or 0), 2),
+                'data': dp.strftime('%d/%m/%Y') if dp else '',
+                'dias': (dp - hoje_pp).days if dp else None,
+            })
+    except Exception as e:
+        log.warning(f"proximos_pagamentos dashboard: {e}")
+
     # Conjunta — dados PARTILHADOS entre Ruben e Luana (ambos veem o mesmo)
     conjunta_info = None
     try:
@@ -2686,6 +2726,7 @@ def api_dashboard():
         'previsao': previsao,
         'combustivel': combustivel,
         'conjunta_info': conjunta_info,
+        'proximos_pagamentos': proximos_pagamentos,
         'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
