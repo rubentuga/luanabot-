@@ -1743,7 +1743,6 @@ def api_saude():
             "SELECT conta, valor FROM saldos_contas WHERE usuario_id=:u ORDER BY valor DESC"),
             {'u': usuario.id}).fetchall()
         contas_lista = [{'conta': s[0], 'valor': round(s[1] or 0, 2)} for s in saldos]
-        # Fallback: contas ligadas via banco (bancos_ligados) que ainda não estão em saldos_contas
         NOMES_BANCO_DISPLAY = {
             'revolut_pessoal':'Revolut','revolut':'Revolut','revolut_conjunta':'Conta Conjunta',
             'revolut_cofre_casa':'Cofre Casa','revolut_cofre_pc':'Cofre PC novo',
@@ -2412,7 +2411,7 @@ def api_dashboard():
     mes = agora().month; ano = agora().year
     mes_ant = mes-1 if mes>1 else 12; ano_ant = ano if mes>1 else ano-1
 
-    # Gastos por categoria este mês
+    # Gastos por categoria este mês (exclui conjunta/reserva/dívida_fixa — já contados nos fixos)
     por_cat = db.session.query(Despesa.categoria, db.func.sum(Despesa.valor)).filter(
         Despesa.usuario_id==usuario.id,
         db.extract('month',Despesa.data)==mes,
@@ -2502,7 +2501,6 @@ def api_dashboard():
     a_receber = round(float(sal_pend) + float(split_receber), 2)
     if not ja_recebeu and sal_liq > 0 and sal_pend == 0:
         a_receber = round(a_receber + max(0, sal_liq - recebido_mes), 2)
-    pago_mes = round(float(gastos_mes) + total_fixos_pago, 2)
     try:
         a_pagar_compromissos = db.session.execute(text(
             "SELECT COALESCE(SUM(COALESCE(valor,valor_medio,0)),0) FROM pagamentos_agendados "
@@ -2511,6 +2509,7 @@ def api_dashboard():
         a_pagar_compromissos = round(float(a_pagar_compromissos), 2)
     except Exception:
         a_pagar_compromissos = 0.0
+    pago_mes = round(float(gastos_mes) + total_fixos_pago, 2)
     a_pagar = round(a_pagar_compromissos + total_fixos_pendente, 2)
     receitas_total = round(recebido_mes + a_receber, 2)
     try:
@@ -2518,7 +2517,6 @@ def api_dashboard():
             "SELECT COALESCE(SUM(valor),0) FROM saldos_contas WHERE usuario_id=:u"),
             {'u':usuario.id}).scalar() or 0
         saldo_bancario = round(float(saldo_bancario), 2)
-        # Fallback bancos_ligados se saldos_contas vazio
         if saldo_bancario == 0:
             _bl = db.session.execute(text(
                 "SELECT COALESCE(SUM(saldo),0) FROM bancos_ligados WHERE usuario_id=:u AND ativo=TRUE"),
@@ -2608,6 +2606,49 @@ def api_dashboard():
     except Exception:
         combustivel = None
 
+    # Conjunta — dados PARTILHADOS entre Ruben e Luana (ambos veem o mesmo)
+    conjunta_info = None
+    try:
+        parceiro_phone = get_parceiro_phone(usuario.phone)
+        parceiro = Usuario.query.filter_by(phone=parceiro_phone).first() if parceiro_phone else None
+        u1 = usuario.id
+        u2 = parceiro.id if parceiro else usuario.id
+
+        saldo_conjunta_banco = db.session.execute(text(
+            "SELECT COALESCE(valor,0) FROM saldos_contas WHERE usuario_id=:u AND LOWER(conta) LIKE '%conjunta%' LIMIT 1"),
+            {'u': usuario.id}).scalar()
+        if saldo_conjunta_banco is None:
+            saldo_conjunta_banco = db.session.execute(text(
+                "SELECT COALESCE(saldo,0) FROM bancos_ligados WHERE usuario_id=:u AND banco LIKE '%conjunta%' AND ativo=TRUE LIMIT 1"),
+                {'u': usuario.id}).scalar() or 0
+
+        total_depositado = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u1 OR usuario_id=:u2"),
+            {'u1': u1, 'u2': u2}).scalar() or 0
+
+        gastos_conjunta_mes = db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM despesas WHERE (usuario_id=:u1 OR usuario_id=:u2) "
+            "AND descricao LIKE '[conjunta]%%' AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
+            {'u1': u1, 'u2': u2, 'm': mes, 'y': ano}).scalar() or 0
+
+        conj_rows = db.session.execute(text(
+            "SELECT descricao, valor, data, usuario_id FROM despesas "
+            "WHERE (usuario_id=:u1 OR usuario_id=:u2) AND descricao LIKE '[conjunta]%%' ORDER BY data DESC LIMIT 15"),
+            {'u1': u1, 'u2': u2}).fetchall()
+        nome_por_id = {usuario.id: (usuario.nome or 'Tu')}
+        if parceiro:
+            nome_por_id[parceiro.id] = (parceiro.nome or 'Parceiro')
+        conjunta_info = {
+            'saldo': round(float(saldo_conjunta_banco or 0), 2),
+            'total_depositado': round(float(total_depositado), 2),
+            'gastos_mes': round(float(gastos_conjunta_mes), 2),
+            'transacoes': [{'desc': (r[0] or '').replace('[conjunta] ', ''), 'valor': round(float(r[1] or 0), 2),
+                             'data': r[2].strftime('%d/%m') if r[2] else '', 'quem': nome_por_id.get(r[3], '')} for r in conj_rows],
+        }
+    except Exception as e:
+        log.warning(f"conjunta_info dashboard: {e}")
+        conjunta_info = None
+
     # Transações recentes (últimos 30 registos)
     transacoes = db.session.execute(text(
         "SELECT descricao, valor, categoria, data, id FROM despesas WHERE usuario_id=:id ORDER BY data DESC LIMIT 30"),
@@ -2644,6 +2685,7 @@ def api_dashboard():
         'saldo_bancario': saldo_bancario,
         'previsao': previsao,
         'combustivel': combustivel,
+        'conjunta_info': conjunta_info,
         'dias_salario': dias_para_salario(usuario),
         'transacoes': [{'desc': r[0], 'valor': round(r[1],2), 'cat': r[2], 'data': r[3].strftime('%d/%m %H:%M') if r[3] else '', 'id': r[4]} for r in transacoes],
     })
@@ -4954,13 +4996,23 @@ def enable_buscar_transacoes_recentes(usuario, minutos=35):
         todas_txs = []
         agora_utc = agora()
         desde = agora_utc - timedelta(minutes=minutos)
+        # IMPORTANTE: converter para UTC explicitamente. agora() devolve hora de
+        # Lisboa (UTC+1 no verão) — sem esta conversão, a janela enviada ao Enable
+        # Banking fica desalinhada (interpretada como UTC quando é hora local),
+        # fazendo a busca perder transações recentes.
+        try:
+            desde_utc_real = desde.astimezone(ZoneInfo('UTC'))
+            agora_utc_real = agora_utc.astimezone(ZoneInfo('UTC'))
+        except Exception:
+            desde_utc_real = desde
+            agora_utc_real = agora_utc
         for acc_id, banco in contas:
             try:
                 r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
                     headers=headers,
                     params={
-                        'date_from': desde.strftime('%Y-%m-%dT%H:%M:%S'),
-                        'date_to': agora_utc.strftime('%Y-%m-%dT%H:%M:%S'),
+                        'date_from': desde_utc_real.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'date_to': agora_utc_real.strftime('%Y-%m-%dT%H:%M:%SZ'),
                     }, timeout=15)
                 if r.status_code == 200:
                     txs = r.json().get('transactions', [])
@@ -9459,9 +9511,15 @@ def enable_verificar_debitos_variaveis(usuario):
         if not acc:
             return []
         acc_id = acc[0]
-        # Ler transações de hoje
-        data_ini = hoje.strftime('%Y-%m-%dT00:00:00')
-        data_fim = hoje.strftime('%Y-%m-%dT23:59:59')
+        # Ler transações de hoje (convertido para UTC, evita desalinhamento)
+        try:
+            ini_local = hoje.replace(hour=0, minute=0, second=0, microsecond=0)
+            fim_local = hoje.replace(hour=23, minute=59, second=59, microsecond=0)
+            data_ini = ini_local.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+            data_fim = fim_local.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+        except Exception:
+            data_ini = hoje.strftime('%Y-%m-%dT00:00:00')
+            data_fim = hoje.strftime('%Y-%m-%dT23:59:59')
         r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
             headers=headers, params={'date_from': data_ini, 'date_to': data_fim}, timeout=20)
         if r.status_code != 200:
