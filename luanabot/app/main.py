@@ -4799,17 +4799,65 @@ def tx_ja_registada(usuario_id, tx_id, valor, desc, data_tx):
         log.error(f"tx_ja_registada: {e}")
         return False
 
+def ja_perguntando_sobre_tx(phone, tx_id):
+    """Verifica se já há uma pergunta pendente (ativa ou em fila) sobre esta
+    transação específica — evita perguntar de novo a cada sync de 30 min
+    enquanto a pessoa ainda não respondeu à primeira vez."""
+    if not tx_id:
+        return False
+    try:
+        estado_atual, dados_atuais = get_estado(phone)
+        if estado_atual == 'aguardar_categoria_revolut' and dados_atuais.get('tx_id') == tx_id:
+            return True
+        pendentes = db.session.execute(text(
+            "SELECT dados FROM fila_perguntas WHERE phone=:p AND estado='aguardar_categoria_revolut'"),
+            {'p': phone}).fetchall()
+        for (dados_str,) in pendentes:
+            try:
+                if json.loads(dados_str or '{}').get('tx_id') == tx_id:
+                    return True
+            except Exception:
+                continue
+    except Exception as e:
+        log.error(f"ja_perguntando_sobre_tx: {e}")
+    return False
+
 def processar_tx_revolut_auto(phone_raw, usuario, tx):
-    """Processa uma transação Revolut detetada automaticamente."""
-    valor_raw = tx.get('transaction_amount', {}).get('amount', 0)
-    valor = float(valor_raw) if valor_raw else 0
-    # Só despesas (valores negativos ou créditos de lojas)
-    if valor >= 0:
-        return  # receita ou transferência positiva — ignorar
-    valor = abs(valor)
-    desc = (tx.get('creditor_name') or tx.get('remittance_information') or
-            tx.get('additional_information') or 'Pagamento Revolut').strip()
-    tx_id = tx.get('transaction_id') or tx.get('internal_transaction_id') or ''
+    """Processa uma transação Revolut detetada automaticamente.
+    NOTA IMPORTANTE sobre o formato real do Enable Banking (confirmado em produção):
+    - transaction_amount.amount é SEMPRE positivo (string); a direção vem de
+      credit_debit_indicator ('DBIT'=saiu, 'CRDT'=entrou) — NÃO do sinal do valor.
+    - creditor/debtor.name está aninhado (não existe 'creditor_name' direto).
+    - remittance_information é uma LISTA de strings, não uma string.
+    - transaction_id vem sempre None nesta API — usar entry_reference como ID único.
+    - Só processamos CARD_PAYMENT (compras reais) — TRANSFER fica de fora porque
+      são movimentos entre as próprias contas (conjunta, 'coisas minhas', etc.)
+      já tratados por comandos dedicados, não despesas novas a perguntar."""
+    # Só transações finalizadas (ignora pendentes — aparecem de novo quando BOOK)
+    if tx.get('status') != 'BOOK':
+        return
+    # Só compras com cartão — transferências entre contas próprias ficam de fora
+    cod_tx = (tx.get('bank_transaction_code') or {}).get('code', '')
+    if cod_tx != 'CARD_PAYMENT':
+        return
+    # Direção: só DBIT (dinheiro a sair) interessa como despesa
+    if tx.get('credit_debit_indicator') != 'DBIT':
+        return
+
+    valor_raw = (tx.get('transaction_amount') or {}).get('amount', 0)
+    try:
+        valor = abs(float(valor_raw)) if valor_raw else 0
+    except (ValueError, TypeError):
+        valor = 0
+    if valor <= 0:
+        return
+
+    creditor_nome = (tx.get('creditor') or {}).get('name') or ''
+    remit_lista = tx.get('remittance_information') or []
+    remit_txt = ' '.join(remit_lista) if isinstance(remit_lista, list) else str(remit_lista)
+    desc = (creditor_nome or remit_txt or 'Pagamento Revolut').strip()
+
+    tx_id = tx.get('entry_reference') or tx.get('transaction_id') or ''
     data_tx = tx.get('booking_date') or tx.get('value_date') or agora().isoformat()
     banco_origem = tx.get('_banco', '')
     eh_conjunta = 'conjunta' in banco_origem
@@ -4822,20 +4870,17 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
     conhecido = categorizar_conhecido(desc)
 
     if conhecido is None and not eh_conjunta:
-        # Desconhecido: regista com categoria neutra e pergunta o que é
+        # Desconhecido: NÃO regista nada ainda — só pergunta e espera a resposta
+        if ja_perguntando_sobre_tx(phone_raw.replace('@lid','').replace('@c.us','').split('@')[0], tx_id):
+            return  # já perguntámos sobre esta transação, está à espera de resposta
         try:
-            desc_bd_pend = f"[aguardar_categoria] {desc[:60]} [txid:{tx_id}]" if tx_id else f"[aguardar_categoria] {desc[:60]}"
-            despesa_pend = Despesa(usuario_id=usuario.id, valor=valor,
-                descricao=desc_bd_pend, categoria='outros', data=agora().replace(tzinfo=None))
-            db.session.add(despesa_pend)
-            db.session.commit()
             phone_clean_tx = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
-            perguntar_ou_enfileirar(phone_clean_tx, 'aguardar_categoria_revolut', {'despesa_id': despesa_pend.id},
+            perguntar_ou_enfileirar(phone_clean_tx, 'aguardar_categoria_revolut',
+                {'valor': valor, 'tx_id': tx_id, 'eh_conjunta': eh_conjunta},
                 f"💜 Vi uma transação no Revolut: *{valor:.2f}€* — \"{desc[:40]}\"\n"
-                f"O que foi isto? (já registei como 'outros', podes corrigir)")
+                f"O que foi isto?")
         except Exception as e:
-            log.error(f"registar tx pendente: {e}")
-            db.session.rollback()
+            log.error(f"perguntar tx desconhecida: {e}")
         return
 
     # Conhecido (ou conjunta) — categorizar normalmente e registar
@@ -5133,20 +5178,27 @@ def processar_texto(phone_raw, phone, texto):
 
         if estado == 'aguardar_categoria_revolut':
             d_rv = dados_estado
-            despesa_id_rv = d_rv.get('despesa_id')
+            valor_rv = d_rv.get('valor', 0)
+            tx_id_rv = d_rv.get('tx_id', '')
+            eh_conjunta_rv = d_rv.get('eh_conjunta', False)
             limpar_estado(phone)
             try:
                 cat_rv, _, nome_rv = categorizar(texto)
                 nova_desc_rv = nome_rv or texto[:50].capitalize()
-                db.session.execute(text(
-                    "UPDATE despesas SET categoria=:c, descricao=:d WHERE id=:i AND usuario_id=:u"),
-                    {'c': cat_rv, 'd': nova_desc_rv, 'i': despesa_id_rv, 'u': usuario.id})
+                prefixo_rv = '[conjunta] ' if eh_conjunta_rv else ''
+                desc_bd_rv = f"{prefixo_rv}{nova_desc_rv} [txid:{tx_id_rv}]" if tx_id_rv else f"{prefixo_rv}{nova_desc_rv}"
+                db.session.add(Despesa(usuario_id=usuario.id, valor=valor_rv,
+                    descricao=desc_bd_rv, categoria=cat_rv, data=agora().replace(tzinfo=None)))
                 db.session.commit()
                 em_rv = EMOJI_CAT.get(cat_rv, '💳')
-                enviar_mensagem(phone_raw, f"{em_rv} Corrigido! *{nova_desc_rv}* — {cat_rv.capitalize()} ✅")
+                if eh_conjunta_rv:
+                    enviar_mensagem(phone_raw, f"{em_rv} Registado! *{nova_desc_rv}* — {valor_rv:.2f}€ (conjunta) ✅")
+                    notificar_parceiro(usuario.phone, f"💑 {nova_desc_rv} — {valor_rv:.2f}€ (conjunta, categorizado)")
+                else:
+                    enviar_mensagem(phone_raw, f"{em_rv} Registado! *{nova_desc_rv}* — {valor_rv:.2f}€ — {cat_rv.capitalize()} ✅")
             except Exception as e:
                 log.error(f"aguardar_categoria_revolut: {e}")
-                enviar_mensagem(phone_raw, "Erro ao corrigir 😕")
+                enviar_mensagem(phone_raw, "Erro ao registar 😕")
             return
 
         if estado == 'confirmar_pessoal_conjunta':
