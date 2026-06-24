@@ -2140,12 +2140,12 @@ def api_banco_debug_tx():
     if token_acesso != 'zef2026':
         return jsonify({'error': 'acesso negado'}), 401
     phone_dbg = request.args.get('phone', '')
-    minutos_dbg = int(request.args.get('minutos', 120))
+    dias_dbg = int(request.args.get('dias', 2))
     usuario_dbg = Usuario.query.filter_by(phone=phone_dbg).first()
     if not usuario_dbg:
         return jsonify({'error': 'utilizador não encontrado'}), 404
 
-    resultado = {'minutos_pesquisados': minutos_dbg}
+    resultado = {'dias_pesquisados': dias_dbg}
     try:
         headers_dbg = _enable_headers()
         resultado['headers_ok'] = bool(headers_dbg)
@@ -2159,14 +2159,11 @@ def api_banco_debug_tx():
         resultado['contas_encontradas'] = [{'banco': b, 'account_id': a} for a, b in contas_dbg]
 
         import requests as _r_dbg
-        agora_dbg = agora()
-        desde_dbg = agora_dbg - timedelta(minutes=minutos_dbg)
-        desde_utc_dbg = desde_dbg.astimezone(ZoneInfo('UTC'))
-        agora_utc_dbg = agora_dbg.astimezone(ZoneInfo('UTC'))
-        resultado['janela_pesquisada'] = {
-            'date_from': desde_utc_dbg.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'date_to': agora_utc_dbg.strftime('%Y-%m-%dT%H:%M:%SZ'),
-        }
+        hoje_civil_dbg = agora().date()
+        desde_civil_dbg = hoje_civil_dbg - timedelta(days=dias_dbg)
+        date_from_dbg = desde_civil_dbg.strftime('%Y-%m-%dT00:00:00Z')
+        date_to_dbg = hoje_civil_dbg.strftime('%Y-%m-%dT00:00:00Z')
+        resultado['janela_pesquisada'] = {'date_from': date_from_dbg, 'date_to': date_to_dbg}
 
         resultado['por_conta'] = []
         for acc_id, banco in contas_dbg:
@@ -2174,10 +2171,7 @@ def api_banco_debug_tx():
             try:
                 r_dbg = _r_dbg.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
                     headers=headers_dbg,
-                    params={
-                        'date_from': desde_utc_dbg.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                        'date_to': agora_utc_dbg.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    }, timeout=15)
+                    params={'date_from': date_from_dbg, 'date_to': date_to_dbg}, timeout=15)
                 info_conta['status_code'] = r_dbg.status_code
                 if r_dbg.status_code == 200:
                     txs_dbg = r_dbg.json().get('transactions', [])
@@ -4735,9 +4729,11 @@ def saldo_cofre_objetivo(usuario_id, desc_objetivo):
 
 # ─── DETEÇÃO AUTOMÁTICA DE TRANSAÇÕES REVOLUT ──────────────────────────
 def enable_buscar_transacoes_recentes(usuario, minutos=35):
-    """Busca transações do Revolut dos últimos N minutos."""
+    """Busca transações do Revolut de hoje (e ontem, para cobrir a fronteira da meia-noite).
+    NOTA: o Enable Banking só aceita datas exatas (00:00:00) em date_from/date_to —
+    não aceita horas/minutos. Por isso pedimos o dia completo e confiamos na
+    deteção de duplicados (tx_ja_registada) para filtrar o que já foi processado."""
     import requests as _r
-    from datetime import timezone as _tz
     headers = _enable_headers()
     if not headers:
         return []
@@ -4751,31 +4747,24 @@ def enable_buscar_transacoes_recentes(usuario, minutos=35):
         if not contas:
             return []
         todas_txs = []
-        agora_utc = agora()
-        desde = agora_utc - timedelta(minutes=minutos)
-        # IMPORTANTE: converter para UTC explicitamente. agora() devolve hora de
-        # Lisboa (UTC+1 no verão) — sem esta conversão, a janela enviada ao Enable
-        # Banking fica desalinhada (interpretada como UTC quando é hora local),
-        # fazendo a busca perder transações recentes.
-        try:
-            desde_utc_real = desde.astimezone(ZoneInfo('UTC'))
-            agora_utc_real = agora_utc.astimezone(ZoneInfo('UTC'))
-        except Exception:
-            desde_utc_real = desde
-            agora_utc_real = agora_utc
+        hoje_civil = agora().date()
+        ontem_civil = hoje_civil - timedelta(days=1)
+        # A API quer DATA CIVIL (sem hora) — não converter fuso horário aqui,
+        # isso desalinharia o dia (ex: meia-noite Lisboa = 23h UTC do dia anterior)
+        date_from_str = ontem_civil.strftime('%Y-%m-%dT00:00:00Z')
+        date_to_str = hoje_civil.strftime('%Y-%m-%dT00:00:00Z')
         for acc_id, banco in contas:
             try:
                 r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
                     headers=headers,
-                    params={
-                        'date_from': desde_utc_real.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                        'date_to': agora_utc_real.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    }, timeout=15)
+                    params={'date_from': date_from_str, 'date_to': date_to_str}, timeout=15)
                 if r.status_code == 200:
                     txs = r.json().get('transactions', [])
                     for tx in txs:
                         tx['_banco'] = banco
                     todas_txs.extend(txs)
+                else:
+                    log.error(f"enable_txs {banco}: status {r.status_code} — {r.text[:300]}")
             except Exception as e:
                 log.error(f"enable_txs {banco}: {e}")
         return todas_txs
@@ -9268,15 +9257,11 @@ def enable_verificar_debitos_variaveis(usuario):
         if not acc:
             return []
         acc_id = acc[0]
-        # Ler transações de hoje (convertido para UTC, evita desalinhamento)
-        try:
-            ini_local = hoje.replace(hour=0, minute=0, second=0, microsecond=0)
-            fim_local = hoje.replace(hour=23, minute=59, second=59, microsecond=0)
-            data_ini = ini_local.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
-            data_fim = fim_local.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
-        except Exception:
-            data_ini = hoje.strftime('%Y-%m-%dT00:00:00')
-            data_fim = hoje.strftime('%Y-%m-%dT23:59:59')
+        # Ler transações de hoje (data exata, 00:00:00 — o Enable Banking não aceita horas)
+        hoje_civil_dv = hoje.date() if hasattr(hoje, 'date') else hoje
+        amanha_civil_dv = hoje_civil_dv + timedelta(days=1)
+        data_ini = hoje_civil_dv.strftime('%Y-%m-%dT00:00:00Z')
+        data_fim = amanha_civil_dv.strftime('%Y-%m-%dT00:00:00Z')
         r = _r.get(f"{ENABLE_BASE}/accounts/{acc_id}/transactions",
             headers=headers, params={'date_from': data_ini, 'date_to': data_fim}, timeout=20)
         if r.status_code != 200:
