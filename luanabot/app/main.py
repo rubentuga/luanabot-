@@ -2159,11 +2159,13 @@ def api_banco_debug_tx():
         resultado['contas_encontradas'] = [{'banco': b, 'account_id': a} for a, b in contas_dbg]
 
         import requests as _r_dbg
+        forcar_dbg = request.args.get('processar', '') == '1'
         hoje_civil_dbg = agora().date()
         desde_civil_dbg = hoje_civil_dbg - timedelta(days=dias_dbg)
         date_from_dbg = desde_civil_dbg.strftime('%Y-%m-%dT00:00:00Z')
         date_to_dbg = hoje_civil_dbg.strftime('%Y-%m-%dT00:00:00Z')
         resultado['janela_pesquisada'] = {'date_from': date_from_dbg, 'date_to': date_to_dbg}
+        resultado['modo'] = 'PROCESSAMENTO REAL (vai notificar/registar)' if forcar_dbg else 'só visualização (nada é alterado)'
 
         resultado['por_conta'] = []
         for acc_id, banco in contas_dbg:
@@ -2176,7 +2178,29 @@ def api_banco_debug_tx():
                 if r_dbg.status_code == 200:
                     txs_dbg = r_dbg.json().get('transactions', [])
                     info_conta['num_transacoes'] = len(txs_dbg)
-                    info_conta['transacoes_raw'] = txs_dbg[:5]  # primeiras 5, sem cortar nada
+                    classificadas = []
+                    for tx_d in txs_dbg:
+                        valor_d = (tx_d.get('transaction_amount') or {}).get('amount', '?')
+                        cod_d = (tx_d.get('bank_transaction_code') or {}).get('code', '?')
+                        nome_d = ((tx_d.get('creditor') or {}).get('name') or
+                                  ' '.join(tx_d.get('remittance_information') or []) or '?')
+                        decisao = []
+                        if tx_d.get('status') != 'BOOK':
+                            decisao = f"IGNORADA (status={tx_d.get('status')}, ainda não fechou)"
+                        elif cod_d != 'CARD_PAYMENT':
+                            decisao = f"IGNORADA (é {cod_d}, não é compra com cartão)"
+                        elif tx_d.get('credit_debit_indicator') != 'DBIT':
+                            decisao = "IGNORADA (é crédito, não débito)"
+                        else:
+                            decisao = "SERIA PROCESSADA como despesa real ✅"
+                        classificadas.append({'valor': valor_d, 'nome': nome_d, 'tipo': cod_d, 'decisao': decisao})
+                        if forcar_dbg:
+                            try:
+                                tx_d['_banco'] = banco
+                                processar_tx_revolut_auto(f"{usuario_dbg.phone}@lid", usuario_dbg, tx_d)
+                            except Exception as e_proc:
+                                log.error(f"forcar processar tx debug: {e_proc}")
+                    info_conta['transacoes_classificadas'] = classificadas
                 else:
                     info_conta['erro_resposta'] = r_dbg.text[:500]
             except Exception as e:
