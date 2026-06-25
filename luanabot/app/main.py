@@ -9907,16 +9907,22 @@ def fecho_mes():
                         if orcamento > 0 and gasto_ant < orcamento:
                             poupou_extra = orcamento - gasto_ant
                             if poupou_extra >= 30:
+                                # Move automaticamente a sobra do mês para a reserva de emergência
+                                nova_res = get_reserva(u.id) + poupou_extra
+                                set_reserva(u.id, nova_res)
                                 nome_u = NOMES_CASAL.get(u.phone, '')
                                 msg_fecho = (f"🎉 *Boa, {nome_u}!* Em {nomes[mes_ant-1]} gastaste "
                                              f"{gasto_ant:.0f}€ dos {orcamento:.0f}€ que tinhas — "
                                              f"sobraram *{poupou_extra:.0f}€*! 💪\n\n"
-                                             f"Isso é dinheiro a mais para a poupança ou um miminho. "
+                                             f"🛡️ Já meti na reserva de emergência! Total: *{nova_res:.0f}€*\n"
                                              f"Diz 'resumo anterior' para os detalhes 📊")
                 except Exception as e:
                     log.error(f"fecho_mes celebracao: {e}")
 
                 enviar_mensagem(f"{u.phone}@lid", msg_fecho)
+                set_estado(u.phone, 'fecho_feito', {'mes': hoje.month, 'ano': hoje.year})
+
+
 
 
 def aviso_fim_subsidio():
