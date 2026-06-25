@@ -1678,6 +1678,39 @@ def api_sync_saldos():
         log.error(f"sync-saldos {phone}: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/reforcar-reserva', methods=['GET'])
+def api_reforcar_reserva():
+    """Calcula a sobra do mês anterior (orçamento - gasto real) e move já para a reserva,
+    sem esperar pelo fecho automático no dia de pagamento."""
+    token = request.args.get('token',''); phone = request.args.get('phone','')
+    expected = (phone[:8] + 'zef') if phone else ''
+    if not token or token != expected:
+        return jsonify({'error':'unauthorized'}), 401
+    try:
+        usuario = Usuario.query.filter_by(phone=phone).first()
+        if not usuario or not usuario.salario_liquido:
+            return jsonify({'error':'sem salário definido'}), 400
+        hoje = agora()
+        mes_ant = hoje.month-1 if hoje.month>1 else 12
+        ano_ant = hoje.year if hoje.month>1 else hoje.year-1
+        gasto_ant = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id==usuario.id,
+            db.extract('month',Despesa.data)==mes_ant,
+            db.extract('year',Despesa.data)==ano_ant,
+            ~Despesa.descricao.like('[conjunta]%'),
+            ~Despesa.descricao.like('[reserva]%'), ~Despesa.descricao.like('[divida_fixa]%')).scalar() or 0
+        _, p_ant = calcular_disponivel(usuario)
+        orcamento = p_ant.get('gastar', 0)
+        sobra = round(max(0, orcamento - float(gasto_ant)), 2)
+        if sobra < 1:
+            return jsonify({'ok': True, 'sobra': 0, 'reserva': round(get_reserva(usuario.id),2), 'msg': 'Não há sobra do mês anterior para guardar.'})
+        nova_reserva = round(get_reserva(usuario.id) + sobra, 2)
+        set_reserva(usuario.id, nova_reserva)
+        return jsonify({'ok': True, 'sobra': sobra, 'reserva': nova_reserva})
+    except Exception as e:
+        log.error(f"reforcar-reserva {phone}: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/marcar-fixo', methods=['GET'])
 def api_marcar_fixo():
     """Marca/desmarca uma despesa fixa como paga este mês."""
