@@ -438,6 +438,7 @@ LOJAS = {
     'zen':'restaurante','sushi':'restaurante','alcochete':'restaurante',
     'cafe':'cafe','café':'cafe','cafézinho':'cafe','bica':'cafe','galao':'cafe','galão':'cafe','expresso':'cafe','cappuccino':'cafe','pastelaria':'cafe','kebab':'restaurante',
     'tasca':'restaurante','pizza':'restaurante','restaurante':'restaurante',
+    'bifana':'restaurante','bifanas':'restaurante','prego':'restaurante','sandes':'restaurante',
     'jantar':'restaurante','almoco':'restaurante','almoço':'restaurante',
     'lanche':'restaurante','snack':'restaurante','pastelaria':'restaurante',
     # Roupa
@@ -4809,15 +4810,19 @@ def tx_ja_registada(usuario_id, tx_id, valor, desc, data_tx):
                 {'u': usuario_id, 'tid': f'%[txid:{tx_id}]%'}).scalar()
             if existe:
                 return True
-        # Verificar por valor exato dentro de ±3h (já registado manualmente ou por outra via)
+        # Verificar por valor exato no MESMO DIA (booking_date do Revolut não tem hora —
+        # comparar ±3h à meia-noite quase nunca apanha o que a pessoa registou manualmente
+        # de tarde/noite. O dia inteiro é a precisão real que os dados do banco dão.)
         data_dt = datetime.fromisoformat(data_tx.replace('Z','')) if isinstance(data_tx, str) else data_tx
+        dia_inicio = data_dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        dia_fim = data_dt.replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(days=1)
         existe2 = db.session.execute(text(
             "SELECT COUNT(*) FROM despesas WHERE usuario_id=:u "
             "AND ABS(valor - :v) < 0.01 "
             "AND data BETWEEN :d1 AND :d2"),
             {'u': usuario_id, 'v': abs(valor),
-             'd1': data_dt - timedelta(hours=3),
-             'd2': data_dt + timedelta(hours=3)}).scalar()
+             'd1': dia_inicio,
+             'd2': dia_fim}).scalar()
         return bool(existe2)
     except Exception as e:
         log.error(f"tx_ja_registada: {e}")
@@ -4829,12 +4834,14 @@ def ja_perguntando_sobre_tx(phone, tx_id):
     enquanto a pessoa ainda não respondeu à primeira vez."""
     if not tx_id:
         return False
+    estados_tx = ('aguardar_categoria_revolut', 'confirmar_tx_revolut_conhecida')
     try:
         estado_atual, dados_atuais = get_estado(phone)
-        if estado_atual == 'aguardar_categoria_revolut' and dados_atuais.get('tx_id') == tx_id:
+        if estado_atual in estados_tx and dados_atuais.get('tx_id') == tx_id:
             return True
         pendentes = db.session.execute(text(
-            "SELECT dados FROM fila_perguntas WHERE phone=:p AND estado='aguardar_categoria_revolut'"),
+            "SELECT dados FROM fila_perguntas WHERE phone=:p "
+            "AND (estado='aguardar_categoria_revolut' OR estado='confirmar_tx_revolut_conhecida')"),
             {'p': phone}).fetchall()
         for (dados_str,) in pendentes:
             try:
@@ -4890,61 +4897,44 @@ def processar_tx_revolut_auto(phone_raw, usuario, tx):
     if tx_ja_registada(usuario.id, tx_id, valor, desc, data_tx):
         return
 
-    # Tentar reconhecer SEM cair na IA — se não conhecer, pergunta em vez de adivinhar
+    phone_clean_tx = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
+    if ja_perguntando_sobre_tx(phone_clean_tx, tx_id):
+        return  # já perguntámos sobre esta transação, está à espera de resposta
+
+    # Tentar reconhecer SEM cair na IA — se conhecer, já sabemos a categoria;
+    # se não, vamos perguntar o que é. Em AMBOS os casos perguntamos primeiro
+    # antes de adicionar à lista — nunca regista sem confirmar.
     conhecido = categorizar_conhecido(desc)
 
     if conhecido is None and not eh_conjunta:
-        # Desconhecido: NÃO regista nada ainda — só pergunta e espera a resposta
-        if ja_perguntando_sobre_tx(phone_raw.replace('@lid','').replace('@c.us','').split('@')[0], tx_id):
-            return  # já perguntámos sobre esta transação, está à espera de resposta
         try:
-            phone_clean_tx = phone_raw.replace('@lid','').replace('@c.us','').split('@')[0]
             perguntar_ou_enfileirar(phone_clean_tx, 'aguardar_categoria_revolut',
                 {'valor': valor, 'tx_id': tx_id, 'eh_conjunta': eh_conjunta},
                 f"💜 Vi uma transação no Revolut: *{valor:.2f}€* — \"{desc[:40]}\"\n"
-                f"O que foi isto?")
+                f"O que foi isto? (ou diz 'não é meu' se não for teu gasto)")
         except Exception as e:
             log.error(f"perguntar tx desconhecida: {e}")
         return
 
-    # Conhecido (ou conjunta) — categorizar normalmente e registar
-    cat, loja, _ = categorizar(desc)
+    # Conhecido (ou conjunta) — já sabemos a categoria, mas PERGUNTAMOS antes de adicionar
+    cat, _, loja = categorizar(desc)
     loja_n = loja or desc[:30]
     em = EMOJI_CAT.get(cat, '💳')
-
-    # Registar automaticamente — gastos da conjunta marcados [conjunta] (não afetam o para gastar pessoal)
     try:
-        prefixo = '[conjunta] ' if eh_conjunta else ''
-        desc_bd = f"{prefixo}{loja_n} [txid:{tx_id}]" if tx_id else f"{prefixo}{loja_n}"
-        db.session.add(Despesa(
-            usuario_id=usuario.id, valor=valor,
-            descricao=desc_bd, categoria=cat,
-            data=agora().replace(tzinfo=None)))
-        db.session.commit()
-        log.info(f"Tx Revolut auto: {loja_n} {valor}€ → {cat} (conjunta={eh_conjunta})")
+        perguntar_ou_enfileirar(phone_clean_tx, 'confirmar_tx_revolut_conhecida',
+            {'valor': valor, 'tx_id': tx_id, 'eh_conjunta': eh_conjunta, 'cat': cat, 'loja': loja_n},
+            f"💜 Entrou este pagamento no Revolut: *{valor:.2f}€* em *{loja_n}* {em}\n"
+            f"Queres meter na lista? (sim/não)")
     except Exception as e:
-        log.error(f"registar tx auto: {e}")
-        db.session.rollback()
-        return
-
-    if eh_conjunta:
-        # Avisar OS DOIS — gasto saiu da conta conjunta, não afeta o disponível pessoal
-        meu_nome_tx = NOMES_CASAL.get(usuario.phone, 'Alguém')
-        msg_tx = (f"{em} *{loja_n}* — {valor:.2f}€\n"
-                  f"💑 Saiu da conta conjunta (detetado automaticamente)")
-        enviar_mensagem(phone_raw, msg_tx)
-        notificar_parceiro(usuario.phone, msg_tx)
-    else:
-        # Notificar utilizador (despesa pessoal)
-        enviar_mensagem(phone_raw,
-            f"{em} *{loja_n}* — {valor:.2f}€\n"
-            f"💜 Detetado no Revolut e registado automaticamente!\n"
-            f"_Diz 'corrige' se a categoria estiver errada_")
+        log.error(f"perguntar tx conhecida: {e}")
 
 def sincronizar_revolut():
     """Job a cada 30 min: deteta novas transações Revolut e regista automaticamente.
     Também atualiza o saldo real e verifica saldo baixo em tempo real (não só às 8h)."""
     with app.app_context():
+        hoje_sync = agora()
+        if hoje_sync.hour >= 23 or hoje_sync.hour < 8:
+            return  # silêncio noturno — não acordar ninguém por uma transação; o sync de 2 dias apanha depois
         for u in Usuario.query.all():
             if not u.phone: continue
             try:
@@ -5243,6 +5233,10 @@ def processar_texto(phone_raw, phone, texto):
             tx_id_rv = d_rv.get('tx_id', '')
             eh_conjunta_rv = d_rv.get('eh_conjunta', False)
             limpar_estado(phone)
+            t_rv_check = texto.lower()
+            if any(p in t_rv_check for p in ['nao e meu','não é meu','nao sou eu','não sou eu','nao e minha','não é minha','nao pago','não pago']):
+                enviar_mensagem(phone_raw, "Ok, não registei! 👍")
+                return
             try:
                 cat_rv, _, nome_rv = categorizar(texto)
                 nova_desc_rv = nome_rv or texto[:50].capitalize()
@@ -5262,6 +5256,41 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, "Erro ao registar 😕")
             return
 
+        if estado == 'confirmar_tx_revolut_conhecida':
+            d_tc = dados_estado
+            valor_tc = d_tc.get('valor', 0)
+            tx_id_tc = d_tc.get('tx_id', '')
+            eh_conjunta_tc = d_tc.get('eh_conjunta', False)
+            cat_tc = d_tc.get('cat', 'outros')
+            loja_tc = d_tc.get('loja', 'Gasto')
+            limpar_estado(phone)
+            palavras_tc = texto.lower().strip().split()
+            tem_sim_tc = any(p in ['sim','s','yes','claro','ja','já'] for p in palavras_tc)
+            tem_nao_tc = any(p in ['nao','não','n','no'] for p in palavras_tc) and not tem_sim_tc
+            if tem_nao_tc:
+                enviar_mensagem(phone_raw, "Ok, não meti na lista! 👍")
+                return
+            if not tem_sim_tc:
+                processar_texto(phone_raw, phone, texto)
+                return
+            try:
+                prefixo_tc = '[conjunta] ' if eh_conjunta_tc else ''
+                desc_bd_tc = f"{prefixo_tc}{loja_tc} [txid:{tx_id_tc}]" if tx_id_tc else f"{prefixo_tc}{loja_tc}"
+                db.session.add(Despesa(usuario_id=usuario.id, valor=valor_tc,
+                    descricao=desc_bd_tc, categoria=cat_tc, data=agora().replace(tzinfo=None)))
+                db.session.commit()
+                em_tc = EMOJI_CAT.get(cat_tc, '💳')
+                if eh_conjunta_tc:
+                    meu_nome_tc = NOMES_CASAL.get(usuario.phone, 'Alguém')
+                    enviar_mensagem(phone_raw, f"{em_tc} Adicionado! *{loja_tc}* — {valor_tc:.2f}€ (conjunta) ✅")
+                    notificar_parceiro(usuario.phone, f"💑 {meu_nome_tc} adicionou {loja_tc} — {valor_tc:.2f}€ (conjunta)")
+                else:
+                    enviar_mensagem(phone_raw, f"{em_tc} Adicionado! *{loja_tc}* — {valor_tc:.2f}€ ✅")
+            except Exception as e:
+                log.error(f"confirmar_tx_revolut_conhecida: {e}")
+                enviar_mensagem(phone_raw, "Erro ao registar 😕")
+            return
+
         if estado == 'confirmar_pessoal_conjunta':
             d = dados_estado
             txt_orig = d.get('texto','')
@@ -5273,7 +5302,7 @@ def processar_texto(phone_raw, phone, texto):
                 # Registar na conjunta
                 val = extrair_valor(txt_orig)
                 if val > 0:
-                    cat, loja, _ = categorizar(txt_orig)
+                    cat, _, loja = categorizar(txt_orig)
                     loja_n = loja or txt_orig[:30]
                     try:
                         db.session.add(Despesa(usuario_id=usuario.id, valor=val,
@@ -5311,7 +5340,7 @@ def processar_texto(phone_raw, phone, texto):
                     desc_div = re.sub(rf'\b{p}\b', '', desc_div, flags=re.IGNORECASE).strip()
                 desc_div = desc_div or 'Conta dividida'
                 try:
-                    cat_div, loja_div, _ = categorizar(desc_div)
+                    cat_div, _, loja_div = categorizar(desc_div)
                     db.session.add(Despesa(usuario_id=usuario.id, valor=parte_div,
                         descricao=desc_div[:90], categoria=cat_div, data=agora().replace(tzinfo=None)))
                     db.session.commit()
@@ -5941,7 +5970,7 @@ def processar_texto(phone_raw, phone, texto):
         if any(p in t for p in ['posso gastar hoje','quanto hoje','quanto posso gastar','gastar hoje','quanto por dia','orcamento de hoje','orçamento de hoje']):
             enviar_orcamento_hoje(phone_raw, usuario); return
 
-        if any(p in t for p in ['quanto tenho','quanto me resta','quanto sobra']):
+        if any(p in t for p in ['quanto tenho','quanto dinheiro tenho','quanto e que tenho','quanto é que tenho','quanto me resta','quanto sobra','quanto dinheiro me resta']):
             foco_qt = None
             if 'conjunta' in t: foco_qt = 'conjunta'
             elif 'reserva' in t or 'emergencia' in t or 'emergência' in t: foco_qt = 'reserva'
@@ -6548,14 +6577,14 @@ def processar_despesa(phone_raw, usuario, texto):
 
     # Gasto na conjunta — mostra dados da conjunta, não do orçamento principal
     if na_conjunta:
-        gc = db.session.query(db.func.sum(Despesa.valor)).filter(
-            Despesa.usuario_id==usuario.id,
-            db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
-            Despesa.descricao.like('[conjunta]%')).scalar() or 0
-        # Total depositado na conjunta este mês (ambos os utilizadores)
+        # Total depositado E gasto na conjunta este mês (ambos os utilizadores)
         parceiro_phone_c = get_parceiro_phone(usuario.phone)
         parceiro_c = Usuario.query.filter_by(phone=parceiro_phone_c).first() if parceiro_phone_c else None
         ids_c = [usuario.id] + ([parceiro_c.id] if parceiro_c else [])
+        gc = db.session.query(db.func.sum(Despesa.valor)).filter(
+            Despesa.usuario_id.in_(ids_c),
+            db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+            Despesa.descricao.like('[conjunta]%')).scalar() or 0
         total_dep = 0
         for uid_c in ids_c:
             total_dep += db.session.execute(text(
@@ -6564,12 +6593,31 @@ def processar_despesa(phone_raw, usuario, texto):
             ), {'u': uid_c, 'm': mes, 'y': ano}).scalar() or 0
         # Se não há depósitos usa 0 como referência
         resta_conj = total_dep - gc
+        # Saldo real do Revolut conjunta (mais fiável que o orçamento por depósitos)
+        saldo_real_conj_msg = None
+        try:
+            import requests as _r_cj
+            h_cj = _enable_headers()
+            if h_cj:
+                acc_cj = db.session.execute(text(
+                    "SELECT account_id FROM bancos_ligados WHERE usuario_id=:u AND banco='revolut_conjunta' AND ativo=TRUE LIMIT 1"),
+                    {'u': usuario.id}).scalar()
+                if acc_cj:
+                    r_cj = _r_cj.get(f"{ENABLE_BASE}/accounts/{acc_cj}/balances", headers=h_cj, timeout=8)
+                    if r_cj.status_code == 200:
+                        bals_cj = r_cj.json().get('balances', [])
+                        if bals_cj:
+                            saldo_real_conj_msg = float(bals_cj[0].get('balance_amount',{}).get('amount', 0))
+        except Exception as e:
+            log.error(f"saldo real conjunta msg: {e}")
         pessoa_txt = f" (com {pessoa})" if pessoa else ""
         msg = f"{emoji} {nome_loja} — {valor:.2f}€ 💑{pessoa_txt}\n"
+        if saldo_real_conj_msg is not None:
+            msg += f"💜 Saldo real da conjunta: {saldo_real_conj_msg:.2f}€\n"
         if total_dep > 0:
-            msg += f"📊 Conjunta: {gc:.2f}€ gastos de {total_dep:.0f}€\n"
+            msg += f"📊 Orçamento: {gc:.2f}€ gastos de {total_dep:.0f}€ depositados\n"
             if resta_conj >= 0:
-                msg += f"💚 Resta: {resta_conj:.2f}€"
+                msg += f"💚 Resta do orçamento: {resta_conj:.2f}€"
             else:
                 msg += f"⚠️ Passaram {abs(resta_conj):.2f}€ do que meteram!"
         else:
@@ -7142,13 +7190,13 @@ def enviar_quanto_tenho(phone_raw, usuario, foco=None):
         log.error(f"quanto_tenho API: {e}")
 
     # Conjunta
-    gc = db.session.query(db.func.sum(Despesa.valor)).filter(
-        Despesa.usuario_id==usuario.id,
-        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
-        Despesa.descricao.like('[conjunta]%')).scalar() or 0
     parceiro_phone_q = get_parceiro_phone(usuario.phone)
     parceiro_q = Usuario.query.filter_by(phone=parceiro_phone_q).first() if parceiro_phone_q else None
     ids_q = [usuario.id] + ([parceiro_q.id] if parceiro_q else [])
+    gc = db.session.query(db.func.sum(Despesa.valor)).filter(
+        Despesa.usuario_id.in_(ids_q),
+        db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
+        Despesa.descricao.like('[conjunta]%')).scalar() or 0
     total_dep_q = sum(
         db.session.execute(text("SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"),
         {'u': uid_q, 'm': mes, 'y': ano}).scalar() or 0 for uid_q in ids_q)
@@ -7389,8 +7437,11 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         ~Despesa.descricao.like('[conjunta]%')).scalar() or 0
 
+    parceiro_phone_res = get_parceiro_phone(usuario.phone)
+    parceiro_res = Usuario.query.filter_by(phone=parceiro_phone_res).first() if parceiro_phone_res else None
+    ids_res = [usuario.id] + ([parceiro_res.id] if parceiro_res else [])
     gc = db.session.query(db.func.sum(Despesa.valor)).filter(
-        Despesa.usuario_id==usuario.id,
+        Despesa.usuario_id.in_(ids_res),
         db.extract('month',Despesa.data)==mes, db.extract('year',Despesa.data)==ano,
         Despesa.descricao.like('[conjunta]%')).scalar() or 0
 
@@ -8543,11 +8594,16 @@ def enviar_resumo_casal(phone_raw, usuario):
     minha_poupa = p_m.get('poupanca', 0)
 
     conj_total = 0
+    conj_depositado = 0
     for u in ([usuario, parceiro] if parceiro else [usuario]):
         conj_total += db.session.query(db.func.sum(Despesa.valor)).filter(
             Despesa.usuario_id==u.id, db.extract('month',Despesa.data)==mes,
             db.extract('year',Despesa.data)==ano,
             Despesa.descricao.like('[conjunta]%')).scalar() or 0
+        conj_depositado += db.session.execute(text(
+            "SELECT COALESCE(SUM(valor),0) FROM conjunta_depositos "
+            "WHERE usuario_id=:u AND EXTRACT(month FROM data)=:m AND EXTRACT(year FROM data)=:y"
+        ), {'u': u.id, 'm': mes, 'y': ano}).scalar() or 0
 
     msg = f"💑 Resumo do Casal — {['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'][mes-1]}\n\n"
     msg += f"👤 {meu_nome}\n  💸 Gastos: {meus_gastos:.0f}€  💚 Poupança: {minha_poupa:.0f}€\n"
@@ -8557,7 +8613,10 @@ def enviar_resumo_casal(phone_raw, usuario):
         disp_p, p_p = calcular_disponivel(parceiro)
         par_poupa = p_p.get('poupanca', 0)
         msg += f"\n👤 {par_nome}\n  💸 Gastos: {par_gastos:.0f}€  💚 Poupança: {par_poupa:.0f}€\n"
-        msg += f"\n💑 Conjunta: {conj_total:.0f}€ de 100€\n"
+        if conj_depositado > 0:
+            msg += f"\n💑 Conjunta: {conj_total:.0f}€ gastos de {conj_depositado:.0f}€ depositados\n"
+        else:
+            msg += f"\n💑 Conjunta: {conj_total:.0f}€ gastos este mês\n"
         msg += f"💎 Poupança total do casal: {minha_poupa+par_poupa:.0f}€\n"
         if minha_poupa > par_poupa: msg += f"\n🏆 {meu_nome} está a poupar mais!"
         elif par_poupa > minha_poupa: msg += f"\n🏆 {par_nome} está a poupar mais!"
