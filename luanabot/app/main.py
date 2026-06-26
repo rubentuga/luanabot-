@@ -881,6 +881,7 @@ def criar_tabelas():
         "CREATE TABLE IF NOT EXISTS aprendizagem (chave VARCHAR(100) PRIMARY KEY, categoria VARCHAR(50) NOT NULL)",
         "CREATE TABLE IF NOT EXISTS estado_utilizador (phone VARCHAR(50) PRIMARY KEY, estado VARCHAR(100), dados TEXT, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS fila_perguntas (id SERIAL PRIMARY KEY, phone VARCHAR(50) NOT NULL, estado VARCHAR(100) NOT NULL, dados TEXT, mensagem TEXT, criado_em TIMESTAMP DEFAULT NOW())",
+        "CREATE TABLE IF NOT EXISTS ultima_atividade (phone VARCHAR(50) PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())",
         "CREATE TABLE IF NOT EXISTS badges (id SERIAL PRIMARY KEY, usuario_id INTEGER, badge VARCHAR(100), obtido_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS pessoas_gastos (id SERIAL PRIMARY KEY, usuario_id INTEGER, despesa_id INTEGER, pessoa VARCHAR(100))",
         "CREATE TABLE IF NOT EXISTS reserva_emergencia (usuario_id INTEGER PRIMARY KEY, saldo FLOAT DEFAULT 0, atualizado TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
@@ -995,42 +996,150 @@ def _avancar_fila_perguntas(phone):
     """Depois de uma pergunta ser respondida (ou limpa), verifica se há outra
     pergunta em espera na fila para esta pessoa e ativa-a (define o estado e
     envia a mensagem guardada). Evita que duas perguntas proativas (recibo,
-    aniversário, conjunta, etc.) se atropelem uma à outra."""
+    aniversário, conjunta, etc.) se atropelem uma à outra.
+
+    ATÓMICO: o mesmo lock por telefone usado em perguntar_ou_enfileirar, para
+    não haver duas activações em simultâneo nem corrida com um produtor."""
+    msg_enviar = None
     try:
+        db.session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:p))"), {'p': str(phone)})
+        # Só ativa o próximo se o estado estiver mesmo livre
+        row = db.session.execute(text(
+            "SELECT estado FROM estado_utilizador WHERE phone=:p"), {'p': phone}).fetchone()
+        est_atual = row[0] if row else None
+        if est_atual and est_atual not in ('normal', 'None'):
+            db.session.commit(); return
         prox = db.session.execute(text(
             "SELECT id, estado, dados, mensagem FROM fila_perguntas WHERE phone=:p ORDER BY id ASC LIMIT 1"),
             {'p': phone}).fetchone()
         if not prox:
-            return
+            db.session.commit(); return
         fid, est_p, dados_p, msg_p = prox
         db.session.execute(text("DELETE FROM fila_perguntas WHERE id=:i"), {'i': fid})
-        db.session.commit()
-        set_estado(phone, est_p, json.loads(dados_p) if dados_p else {})
-        if msg_p:
-            enviar_mensagem(f"{phone}@lid", msg_p)
+        db.session.execute(text(
+            "INSERT INTO estado_utilizador (phone,estado,dados,atualizado) "
+            "VALUES (:p,:e,:d,NOW()) ON CONFLICT (phone) DO UPDATE SET estado=:e,dados=:d,atualizado=NOW()"),
+            {'p': phone, 'e': est_p, 'd': dados_p or '{}'})
+        db.session.commit()  # liberta o lock
+        msg_enviar = msg_p
     except Exception as e:
         log.error(f"_avancar_fila_perguntas: {e}")
         try: db.session.rollback()
         except Exception: pass
+        return
+    if msg_enviar:
+        enviar_mensagem(f"{phone}@lid", msg_enviar)
 
 def perguntar_ou_enfileirar(phone, novo_estado, novos_dados, mensagem):
     """Usar para PERGUNTAS PROATIVAS do bot (scheduler, notificações ao parceiro, etc.)
     em vez de set_estado+enviar_mensagem diretos. Se a pessoa já tem uma pergunta
     pendente, esta nova fica em fila e só é enviada quando a anterior for respondida
-    — em vez de a substituir silenciosamente (o que confundia as respostas)."""
+    — em vez de a substituir silenciosamente (o que confundia as respostas).
+
+    ATÓMICO: usa um lock por telefone (pg_advisory_xact_lock) para que duas perguntas
+    que disparem no mesmo instante (ex: conjunta + aniversário) não leiam ambas
+    'estado vazio' e se enviem as duas, pisando-se uma à outra."""
+    enviar_agora = False
     try:
-        estado_atual, _ = get_estado(phone)
-        if not estado_atual or estado_atual in ('normal', 'None'):
-            set_estado(phone, novo_estado, novos_dados)
-            enviar_mensagem(f"{phone}@lid", mensagem)
+        # Lock por telefone — serializa quem produz/consome perguntas em simultâneo
+        db.session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:p))"), {'p': str(phone)})
+        row = db.session.execute(text(
+            "SELECT estado FROM estado_utilizador WHERE phone=:p"), {'p': phone}).fetchone()
+        estado_atual = row[0] if row else None
+        ra = db.session.execute(text(
+            "SELECT EXTRACT(EPOCH FROM (NOW()-ts)) FROM ultima_atividade WHERE phone=:p"),
+            {'p': phone}).fetchone()
+        ativo = bool(ra and ra[0] is not None and float(ra[0]) < 90)
+        livre = (not estado_atual or estado_atual in ('normal', 'None'))
+        if livre and not ativo:
+            db.session.execute(text(
+                "INSERT INTO estado_utilizador (phone,estado,dados,atualizado) "
+                "VALUES (:p,:e,:d,NOW()) ON CONFLICT (phone) DO UPDATE SET estado=:e,dados=:d,atualizado=NOW()"),
+                {'p': phone, 'e': novo_estado, 'd': json.dumps(novos_dados or {})})
+            enviar_agora = True
         else:
             db.session.execute(text(
                 "INSERT INTO fila_perguntas (phone, estado, dados, mensagem) VALUES (:p,:e,:d,:m)"),
                 {'p': phone, 'e': novo_estado, 'd': json.dumps(novos_dados or {}), 'm': mensagem})
-            db.session.commit()
-            log.info(f"Pergunta enfileirada para {phone} (estado atual: {estado_atual})")
+            motivo = 'a meio de conversa' if ativo else f'estado: {estado_atual}'
+            log.info(f"Pergunta enfileirada para {phone} ({motivo})")
+        db.session.commit()  # liberta o advisory lock
     except Exception as e:
         log.error(f"perguntar_ou_enfileirar: {e}")
+        try: db.session.rollback()
+        except Exception: pass
+        return
+    # Envio fora da transação (não segura o lock durante o HTTP)
+    if enviar_agora:
+        enviar_mensagem(f"{phone}@lid", mensagem)
+
+def marcar_atividade(phone):
+    """Regista o instante da última mensagem recebida desta pessoa.
+    Serve para sabermos se está a meio de uma conversa e, nesse caso, adiar
+    mensagens proativas (conjunta, recibo, aniversários, etc.)."""
+    try:
+        db.session.execute(text(
+            "INSERT INTO ultima_atividade (phone, ts) VALUES (:p, NOW()) "
+            "ON CONFLICT (phone) DO UPDATE SET ts=NOW()"), {'p': phone})
+        db.session.commit()
+    except Exception as e:
+        log.error(f"marcar_atividade: {e}"); db.session.rollback()
+
+def esta_ativo(phone, segundos=90):
+    """True se a pessoa enviou uma mensagem nos últimos `segundos`."""
+    try:
+        r = db.session.execute(text(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - ts)) FROM ultima_atividade WHERE phone=:p"),
+            {'p': phone}).fetchone()
+        return bool(r and r[0] is not None and float(r[0]) < segundos)
+    except Exception:
+        db.session.rollback(); return False
+
+# Estados que são PERGUNTAS PROATIVAS do bot (à espera de sim/não/valor).
+# Usados para: (1) expirar perguntas esquecidas; (2) interpretar respostas de
+# forma centralizada e estrita, evitando que um sim/não vá parar ao sítio errado.
+ESTADOS_PROATIVOS = {
+    'confirmar_meti_conjunta', 'aniv_apartar', 'aviso_aniversario_leve',
+    'confirmar_aviso_divida', 'aguardar_recibo', 'recibo_repergunta',
+    'confirmar_tx_revolut_conhecida', 'aguardar_categoria_revolut',
+    'confirmar_debito_variavel', 'confirmar_pessoal_conjunta', 'confirmar_divisao_conta',
+}
+TTL_PROATIVO_MIN = 720  # 12h: passado isto, uma pergunta proativa esquecida é descartada
+
+_SIM_TOKENS = {'sim','s','yes','ya','sip','claro','quero','bora','ok','okay','okey','certo','simbora','yep','yup'}
+_NAO_TOKENS = {'nao','não','n','no','nope','nah','negativo'}
+
+def interpretar_sim_nao(t):
+    """Lê uma resposta como 'sim'/'nao'/None de forma ESTRITA: só decide quando a
+    mensagem é essencialmente uma confirmação/negação curta. Assim 'sim' no meio de
+    'sim quero para os aniversários' não conta como um sim solto para outra pergunta."""
+    p = (t or '').strip().lower().split()
+    if not p or len(p) > 3:
+        return None
+    if p[0] in _SIM_TOKENS:
+        return 'sim'
+    if p[0] in _NAO_TOKENS:
+        return 'nao'
+    return None
+
+def flush_filas_proativas():
+    """Entrega perguntas proativas que ficaram em fila quando a pessoa estava
+    a meio de uma conversa. Só entrega quando ela já parou de escrever (sem
+    atividade recente) e não tem nenhuma pergunta pendente — assim a mensagem
+    não se perde nem interrompe. Corre no scheduler de minuto a minuto."""
+    try:
+        with app.app_context():
+            phones = db.session.execute(text(
+                "SELECT DISTINCT phone FROM fila_perguntas")).fetchall()
+            for (ph,) in phones:
+                est, _ = get_estado(ph)
+                if est and est not in ('normal', 'None'):
+                    continue  # tem pergunta ativa — espera que seja respondida
+                if esta_ativo(ph, 90):
+                    continue  # ainda a escrever — espera mais um bocado
+                _avancar_fila_perguntas(ph)
+    except Exception as e:
+        log.error(f"flush_filas_proativas: {e}")
         try: db.session.rollback()
         except Exception: pass
 
@@ -4043,6 +4152,39 @@ def ver_transacoes(phone_raw, usuario, limite=15):
         enviar_mensagem(phone_raw, "Erro ao listar 😕")
 
 
+def mostrar_detalhe_categoria(phone_raw, usuario, cat):
+    """Drill-down do relatório: lista os gastos de UMA categoria no mês atual."""
+    try:
+        ag = agora()
+        inicio = ag.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        rows = db.session.execute(text(
+            "SELECT id, descricao, valor, data FROM despesas "
+            "WHERE usuario_id=:u AND categoria=:c AND data>=:d "
+            "AND descricao NOT LIKE '[conjunta]%' AND descricao NOT LIKE '[reserva]%' "
+            "AND descricao NOT LIKE '[divida_fixa]%' "
+            "ORDER BY data DESC, id DESC LIMIT 20"),
+            {'u': usuario.id, 'c': cat, 'd': inicio}).fetchall()
+        emoji = EMOJI_CAT.get(cat, '💳')
+        nome_cat = cat.capitalize()
+        nomes_m = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho',
+                   'Agosto','Setembro','Outubro','Novembro','Dezembro']
+        mes_nome = nomes_m[ag.month - 1]
+        if not rows:
+            enviar_mensagem(phone_raw, f"{emoji} Ainda não gastaste nada em *{nome_cat}* em {mes_nome} 👌")
+            return
+        total = sum(float(r[2]) for r in rows)
+        msg = f"{emoji} *{nome_cat}* · {mes_nome}\n━━━━━━━━━━━━\n"
+        for tid, desc, valor, data in rows:
+            cod = id_para_codigo(tid)
+            d_curta = (desc or nome_cat).replace('[conjunta] ', '')[:24]
+            msg += f"• {data.strftime('%d/%m')} {d_curta} — *{valor:.0f}€*  `{cod}`\n"
+        msg += f"━━━━━━━━━━━━\n💰 Total: *{total:.0f}€* em {len(rows)} gasto(s)\n🗑️ Apagar: *apaga CÓDIGO*"
+        enviar_mensagem(phone_raw, msg)
+    except Exception as e:
+        log.error(f"mostrar_detalhe_categoria: {e}"); db.session.rollback()
+        enviar_mensagem(phone_raw, "Erro ao detalhar a categoria 😕")
+
+
 def eh_objetivo_poupanca(texto):
     """Deteta intenção de criar objetivo de poupança (muitas variações)."""
     t = texto.lower()
@@ -4963,22 +5105,35 @@ def processar_texto(phone_raw, phone, texto):
 
         t = texto.lower().strip()
 
+        # Regista atividade — para adiar mensagens proativas enquanto há conversa
+        marcar_atividade(phone)
+
         # ── ESTADOS (tratados antes de tudo) ──
         estado, dados_estado = get_estado(phone)
 
-        if estado == 'aniv_apartar':
+        # Expira perguntas proativas esquecidas: se a pergunta ativa é proativa e já
+        # tem muitas horas, descarta-a para não "roubar" a resposta à mensagem atual.
+        if estado in ESTADOS_PROATIVOS:
+            try:
+                ri = db.session.execute(text(
+                    "SELECT EXTRACT(EPOCH FROM (NOW()-atualizado))/60 FROM estado_utilizador WHERE phone=:p"),
+                    {'p': phone}).fetchone()
+                if ri and ri[0] is not None and float(ri[0]) > TTL_PROATIVO_MIN:
+                    set_estado(phone, None, {})
+                    estado, dados_estado = None, {}
+            except Exception:
+                db.session.rollback()
+
+
             nome_aniv = dados_estado.get('nome','')
             dias_aniv = dados_estado.get('dias', 0)
             fila_aniv = dados_estado.get('fila', [])
             limpar_estado(phone)
-            palavras = t.strip().split()
-            # Deteta "sim" em qualquer posição da frase (mais flexível)
-            tem_sim = any(p in ['sim','s','yes','claro','quero'] for p in palavras)
-            tem_nao = any(p in ['nao','não','n','no'] for p in palavras) and not tem_sim
-            if tem_nao:
+            resp = interpretar_sim_nao(t)
+            if resp == 'nao':
                 enviar_mensagem(phone_raw, f"Ok! Podes sempre apartar depois dizendo 'prenda {nome_aniv} 50€' 💪")
                 _avancar_fila_aniversarios(phone_raw, phone, fila_aniv)
-            elif tem_sim:
+            elif resp == 'sim':
                 set_estado(phone, 'aniv_apartar_valor', {'nome': nome_aniv, 'fila': fila_aniv})
                 enviar_mensagem(phone_raw, f"💝 Quanto queres apartar para a prenda do(a) {nome_aniv}?")
             else:
@@ -5120,8 +5275,16 @@ def processar_texto(phone_raw, phone, texto):
             cats = dados_estado.get('cats', {})
             mes_r = dados_estado.get('mes', agora().month)
             ano_r = dados_estado.get('ano', agora().year)
-            if t.strip() in cats:
-                cat_sel = cats[t.strip()]
+            # Selecionável por NÚMERO ("2") ou por NOME ("fastfood", "fast food")
+            cat_sel = None
+            chave = t.strip()
+            if chave in cats:
+                cat_sel = cats[chave]
+            else:
+                cat_norm = normalizar_categoria(chave)
+                if cat_norm in cats.values():
+                    cat_sel = cat_norm
+            if cat_sel:
                 limpar_estado(phone)
                 try:
                     rows = db.session.query(Despesa).filter(
@@ -5167,10 +5330,8 @@ def processar_texto(phone_raw, phone, texto):
         if estado == 'confirmar_meti_conjunta':
             d_cj = dados_estado
             limpar_estado(phone)
-            palavras_cj = t.strip().split()
-            tem_sim_cj = any(p in ['sim','s','yes','claro','ja','já'] for p in palavras_cj)
-            tem_nao_cj = any(p in ['nao','não','n','no'] for p in palavras_cj) and not tem_sim_cj
-            if tem_sim_cj:
+            resp_cj = interpretar_sim_nao(t)
+            if resp_cj == 'sim':
                 try:
                     fixos_cj = get_fixos_usuario(usuario.phone, agora().month, usuario.id)
                     valor_cj = fixos_cj.get('conjunta', 0) or d_cj.get('valor', 50)
@@ -5184,7 +5345,7 @@ def processar_texto(phone_raw, phone, texto):
                 except Exception as e:
                     log.error(f"confirmar_meti_conjunta: {e}"); db.session.rollback()
                     enviar_mensagem(phone_raw, "Erro ao registar 😕")
-            elif tem_nao_cj:
+            elif resp_cj == 'nao':
                 enviar_mensagem(phone_raw, "Ok! Quando puderes, diz 'meti os 50 da conjunta' 💪")
             else:
                 processar_texto(phone_raw, phone, texto)
@@ -5195,9 +5356,8 @@ def processar_texto(phone_raw, phone, texto):
             pessoa_ad = d_ad.get('pessoa', 'a pessoa')
             total_ad = d_ad.get('total', 0)
             limpar_estado(phone)
-            palavras_ad = t.strip().split()
-            tem_sim_ad = any(p in ['sim','s','yes','claro'] for p in palavras_ad)
-            if tem_sim_ad:
+            resp_ad = interpretar_sim_nao(t)
+            if resp_ad == 'sim':
                 parceiro_phone_ad = get_parceiro_phone(usuario.phone)
                 nome_parceiro_ad = NOMES_CASAL.get(parceiro_phone_ad, '').lower() if parceiro_phone_ad else ''
                 if parceiro_phone_ad and pessoa_ad.lower() == nome_parceiro_ad:
@@ -5206,19 +5366,17 @@ def processar_texto(phone_raw, phone, texto):
                     enviar_mensagem(phone_raw, f"✅ Avisei {pessoa_ad}!")
                 else:
                     enviar_mensagem(phone_raw, f"Não consigo avisar {pessoa_ad} diretamente — fala com ele(a) 😊")
-            else:
+            elif resp_ad == 'nao':
                 enviar_mensagem(phone_raw, "Ok, sem problema! 👍")
+            else:
+                processar_texto(phone_raw, phone, texto)
             return
 
         if estado == 'aviso_aniversario_leve':
             d_av = dados_estado
             nome_av = d_av.get('nome', 'a pessoa')
             limpar_estado(phone)
-            t_av = t.strip()
-            palavras_av = t_av.split()
-            tem_sim_av = any(p in ['sim','s','yes','claro','ja','já'] for p in palavras_av)
-            tem_nao_av = any(p in ['nao','não','n','no'] for p in palavras_av) and not tem_sim_av
-            if tem_nao_av or tem_sim_av:
+            if interpretar_sim_nao(t) is not None:
                 # Resposta curta a um aviso informativo — só reconhecer com calma, sem forçar nada
                 enviar_mensagem(phone_raw,
                     f"Tudo bem! 😊 Se quiseres apartar dinheiro para a prenda do(a) {nome_av}, "
@@ -5627,7 +5785,11 @@ def processar_texto(phone_raw, phone, texto):
             estado = 'aguardar_recibo'
         if estado == 'aguardar_recibo':
             data_pag_str = dados_estado.get('data_pagamento','')
-            if any(p in t for p in ['sim','yes','quero','manda','envia']):
+            palavras_r = t.strip().split()
+            # Só conta como "sim" se for uma resposta curta e SEM referência a outro tema
+            quer_recibo = (any(p in palavras_r for p in ['sim','yes','quero','manda','envia'])
+                           and not any(w in t for w in ['aniversár','prenda','apartar','conjunta','objetivo']))
+            if quer_recibo:
                 # mantém estado para apanhar o PDF/valor a seguir
                 enviar_mensagem(phone_raw, "Manda o PDF ou foto do recibo 📄")
             elif tem_numero(texto):
@@ -6466,6 +6628,29 @@ def processar_texto(phone_raw, phone, texto):
                 enviar_mensagem(phone_raw, f"⚠️ Já tinhas {valor_hoje_cat:.2f}€ em {nome_check} hoje — é outro gasto?")
                 return
             processar_despesa(phone_raw, usuario, texto); return
+
+        # ── DRILL-DOWN DE CATEGORIA: "fastfood", "supermercado", "roupa"... ──
+        # Se a mensagem inteira for o nome de uma categoria (sem número), mostra
+        # o detalhe dessa categoria em vez de mandar para a IA.
+        t_cat = t.strip()
+        if t_cat and not tem_numero(texto) and 1 <= len(t_cat.split()) <= 2:
+            cat_alvo = normalizar_categoria(t_cat)
+            if cat_alvo in CATEGORIAS_VALIDAS:
+                mostrar_detalhe_categoria(phone_raw, usuario, cat_alvo)
+                return
+
+        # ── RESPOSTA SOLTA (sim/não/ok) SEM PERGUNTA ATIVA ──
+        # Evita que a IA invente respostas ("que se passa?", planos, etc.) a
+        # partir de um sim/não perdido que já não tem pergunta a que responder.
+        RESPOSTAS_SOLTAS = {
+            'sim','s','yes','ya','sip','claro','ok','okay','okey','certo','fixe',
+            'nao','não','n','no','nope','nah','talvez','quem sabe','depois','agora não','agora nao',
+        }
+        if t.strip() in RESPOSTAS_SOLTAS:
+            enviar_mensagem(phone_raw,
+                "Já não tinha nenhuma pergunta à espera 😅 Em que te posso ajudar? "
+                "Diz *ajuda* para veres tudo o que faço 💪")
+            return
 
         # ── IA FALLBACK ──
         enviar_mensagem(phone_raw, perguntar_ia(texto, usuario))
@@ -7471,10 +7656,10 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
 
     if por_cat_sorted:
         msg += f"*Para onde foi o dinheiro:*\n"
-        for cat, total in por_cat_sorted[:6]:
+        for i, (cat, total) in enumerate(por_cat_sorted[:6], 1):
             pct = round(total/gp*100) if gp > 0 else 0
             barra = '▓' * (pct // 10) + '░' * (10 - pct // 10)
-            msg += f"{EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}\n"
+            msg += f"*{i})* {EMOJI_CAT.get(cat,'💳')} {cat.capitalize()}\n"
             msg += f"   {barra} {total:.0f}€ · {pct}%\n"
 
     if not mes_override and agora().day > 3 and gp > 0:
@@ -7485,7 +7670,7 @@ def enviar_resumo(phone_raw, usuario, mes_override=None, ano_override=None):
             if top_val > 50:
                 msg += f"\n💡 Cortar 30% em {top_cat} = +{top_val*0.3*12:.0f}€/ano"
 
-    msg += "\n\n💡 Diz o *número* da categoria para detalhes\n📊 zedasfinancas.netlify.app"
+    msg += "\n\n💡 Diz o *número* ou o *nome* da categoria para detalhes\n📊 zedasfinancas.netlify.app"
 
     # Guarda as categorias no estado para o utilizador poder selecionar
     cats_estado = {str(i+1): cat for i, (cat, _) in enumerate(por_cat_sorted)}
@@ -8524,8 +8709,15 @@ def processar_dividas(phone_raw, usuario, texto):
     pessoa = m_pessoa.group(1).capitalize() if m_pessoa else 'Alguem'
 
     stop = {'devo','deve','me','ao','à','a','euros','euro','pagar','tenho','preciso','para'}
+    stop.add(pessoa.lower())  # não meter o nome da pessoa no motivo
     palavras = [w for w in texto.split() if not re.match(r'[0-9€,.]',w) and len(w)>2 and w.lower() not in stop]
     desc = ' '.join(palavras[:2]).capitalize() if palavras else 'Dívida'
+
+    # Preposição e nome corretos para o parceiro (à Luana / ao Ruben)
+    def _ref_parceiro(ph):
+        prf = get_perfil(ph or '')
+        prep = 'à' if prf.get('genero') == 'F' else 'ao'
+        return prep, prf.get('nome', 'parceiro')
 
     try:
         if eu_devo:
@@ -8539,10 +8731,11 @@ def processar_dividas(phone_raw, usuario, texto):
             parceiro_phone_d2 = get_parceiro_phone(usuario.phone)
             nome_parceiro_d2 = NOMES_CASAL.get(parceiro_phone_d2, '').lower() if parceiro_phone_d2 else ''
             if parceiro_phone_d2 and pessoa.lower() == nome_parceiro_d2:
+                prep_d2, nome_d2 = _ref_parceiro(parceiro_phone_d2)
                 notificar_parceiro(usuario.phone,
                     f"💸 {meu_nome_d2} deve-te {valor:.2f}€!\n"
                     f"📝 Motivo: {desc}\n\n"
-                    f"Quando ele(a) pagar, ele(a) diz 'já paguei ao {nome_parceiro_d2}' 😉")
+                    f"Quando pagar, diz 'já paguei {prep_d2} {nome_d2}' 😉")
         else:
             db.session.execute(text("INSERT INTO splitting (usuario_id,descricao,valor_total,valor_cada,pessoa,pago) VALUES (:u,:d,:vt,:vc,:p,FALSE)"),
                 {'u':usuario.id,'d':desc,'vt':valor,'vc':valor,'p':pessoa})
@@ -8553,10 +8746,11 @@ def processar_dividas(phone_raw, usuario, texto):
             parceiro_phone_d = get_parceiro_phone(usuario.phone)
             nome_parceiro_d = NOMES_CASAL.get(parceiro_phone_d, '').lower() if parceiro_phone_d else ''
             if parceiro_phone_d and pessoa.lower() == nome_parceiro_d:
+                prep_d, nome_d = _ref_parceiro(usuario.phone)
                 notificar_parceiro(usuario.phone,
-                    f"💸 Deves {valor:.2f}€ ao(à) {meu_nome_d}!\n"
+                    f"💸 Deves {valor:.2f}€ {prep_d} {nome_d}!\n"
                     f"📝 Motivo: {desc}\n\n"
-                    f"Quando pagares diz 'já paguei ao {meu_nome_d.lower()}' 😉")
+                    f"Quando pagares diz 'já paguei {prep_d} {nome_d}' 😉")
     except Exception as e:
         log.error(f"dividas: {e}"); enviar_mensagem(phone_raw, "Erro 😕")
 
@@ -10041,6 +10235,7 @@ else:
     scheduler.add_job(verificar_aniversarios,     'cron', hour=9,  minute=0)
     scheduler.add_job(wrapped_anual,              'cron', hour=20, minute=0)
     scheduler.add_job(sincronizar_revolut,        'interval', minutes=30)
+    scheduler.add_job(flush_filas_proativas,      'interval', minutes=1)
     scheduler.add_job(watchdog_waha,              'interval', minutes=10)
     scheduler.start()
 log.info("Ze das Financas v7 iniciado")
